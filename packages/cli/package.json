@@ -1,0 +1,15 @@
+{
+  "name": "@ker/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": { "ker": "./dist/cli.js" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "engines": { "node": ">=24.0.0" },
+  "dependencies": { "@ker/protocol": "^0.0.0", "@ker/daemon": "^0.0.0" },
+  "scripts": {
+    "build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
+    "clean": "shx rm -rf dist"
+  }
+}

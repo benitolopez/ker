@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "paths": {
+      "@ker/protocol": ["./packages/protocol/src/index.ts"],
+      "@ker/protocol/*": ["./packages/protocol/src/*"],
+      "@ker/config": ["./packages/config/src/index.ts"],
+      "@ker/config/*": ["./packages/config/src/*"],
+      "@ker/ai": ["./packages/ai/src/index.ts"],
+      "@ker/ai/*": ["./packages/ai/src/*"],
+      "@ker/engine": ["./packages/engine/src/index.ts"],
+      "@ker/engine/*": ["./packages/engine/src/*"],
+      "@ker/daemon": ["./packages/daemon/src/index.ts"],
+      "@ker/daemon/*": ["./packages/daemon/src/*"],
+      "@ker/cli": ["./packages/cli/src/index.ts"],
+      "@ker/cli/*": ["./packages/cli/src/*"]
+    }
+  },
+  "include": ["packages/*/src/**/*", "packages/*/test/**/*"],
+  "exclude": ["reference", "node_modules", "dist"]
+}
