@@ -8,7 +8,8 @@
   "scripts": {
     "clean": "npm run clean --workspaces --if-present",
     "build": "cd packages/protocol && npm run build && cd ../config && npm run build && cd ../llm && npm run build && cd ../engine && npm run build && cd ../daemon && npm run build && cd ../cli && npm run build",
-    "check": "biome check --write --error-on-warnings packages && tsgo --noEmit",
+    "check": "biome check --error-on-warnings packages && tsgo --noEmit",
+    "fix": "biome check --write packages",
     "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
