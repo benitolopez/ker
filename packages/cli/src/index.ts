@@ -1,7 +1,7 @@
 import type { ReadableStream } from "node:stream/web";
-import * as Daemon from "@ker/daemon";
-import type * as Protocol from "@ker/protocol";
-import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker/protocol";
+import * as Daemon from "@ker-ai/daemon";
+import type * as Protocol from "@ker-ai/protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
 
 const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
 

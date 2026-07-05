@@ -123,14 +123,14 @@ Name a type for what it is; let the import path say where it's from. Don't prefi
 - `import type` for identifiers used only in type positions; plain `import` for runtime values.
 
 ```ts
-// Good — @ker/protocol names the type for what it is
+// Good — @ker-ai/protocol names the type for what it is
 export type Event = MessageEvent | MessageDeltaEvent | UsageEvent
 
 // Good — the consumer disambiguates via the import path, not a prefix
-import * as Ai from "@ker/ai"
-import type * as Protocol from "@ker/protocol"
+import * as Llm from "@ker-ai/llm"
+import type * as Protocol from "@ker-ai/protocol"
 async function* send(): AsyncGenerator<Protocol.Event> {
-  for await (const event of Ai.stream(...)) { ... }
+  for await (const event of Llm.stream(...)) { ... }
 }
 
 // Bad — product/layer prefixes baked into the type names
@@ -192,7 +192,7 @@ Write like a terse human, not an AI. Say what changed and, only if it isn't obvi
 ```
 # Bad — slogans, "our", and a stack/caveat closer
 Send a prompt, stream back a reply, and remember the turn.
-- @ker/ai — streaming, normalized to our events + error classify
+- @ker-ai/llm — streaming, normalized to our events + error classify
 Node 24, npm workspaces, Biome + tsgo, no bundler. No tools or agent loop yet.
 
 # Good — plain and factual

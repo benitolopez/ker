@@ -1,5 +1,5 @@
-import * as Ai from "@ker/ai";
-import type * as Protocol from "@ker/protocol";
+import * as Llm from "@ker-ai/llm";
+import type * as Protocol from "@ker-ai/protocol";
 
 export interface EngineConfig {
 	apiKey: string;
@@ -13,7 +13,7 @@ const MAX_DELAY_MS = 30_000;
 // Holds the conversation in memory. On each send it streams the assistant reply as events, then
 // records the finished message so later turns have context.
 export function createHarness(config: EngineConfig) {
-	const messages: Ai.Message[] = [];
+	const messages: Llm.Message[] = [];
 
 	// Retries fire only before the first token — every transient failure is a connect-phase error, and
 	// once text has streamed to a raw stdout it can't be unprinted. A retryable error waits for the
@@ -27,7 +27,7 @@ export function createHarness(config: EngineConfig) {
 			let sawToken = false;
 			let pending: { delayMs: number; message: string } | undefined;
 
-			for await (const event of Ai.stream(config.model, messages, config.apiKey)) {
+			for await (const event of Llm.stream(config.model, messages, config.apiKey)) {
 				if (event.type === "delta") {
 					sawToken = true;
 					reply += event.text;

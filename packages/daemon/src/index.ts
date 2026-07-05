@@ -1,9 +1,9 @@
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import * as Config from "@ker/config";
-import * as Engine from "@ker/engine";
-import type * as Protocol from "@ker/protocol";
-import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker/protocol";
+import * as Config from "@ker-ai/config";
+import * as Engine from "@ker-ai/engine";
+import type * as Protocol from "@ker-ai/protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const HEARTBEAT_MS = 15_000;
