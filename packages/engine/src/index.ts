@@ -2,8 +2,8 @@ import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 
 export interface EngineConfig {
-	apiKey: string;
 	model: string;
+	getAuth: () => Promise<Llm.Auth>;
 }
 
 const MAX_RETRIES = 3;
@@ -18,16 +18,25 @@ export function createHarness(config: EngineConfig) {
 	// Retries fire only before the first token — every transient failure is a connect-phase error, and
 	// once text has streamed to a raw stdout it can't be unprinted. A retryable error waits for the
 	// server's Retry-After when given, else an exponential backoff (capped), announced as a retry event
-	// before sleeping.
+	// before sleeping. Credentials are resolved at the start of each attempt, so an OAuth token refreshed
+	// between retries is used; a resolution failure (no login, no key) ends the turn as an error event.
 	async function* send(userText: string): AsyncGenerator<Protocol.Event> {
 		messages.push({ role: "user", content: userText });
 
 		for (let attempt = 0; ; attempt++) {
+			let auth: Llm.Auth;
+			try {
+				auth = await config.getAuth();
+			} catch (err) {
+				yield { role: "assistant", type: "error", message: err instanceof Error ? err.message : String(err) };
+				return;
+			}
+			if (attempt === 0) yield { role: "assistant", type: "auth", mode: auth.kind };
 			let reply = "";
 			let sawToken = false;
 			let pending: { delayMs: number; message: string } | undefined;
 
-			for await (const event of Llm.stream(config.model, messages, config.apiKey)) {
+			for await (const event of Llm.stream(config.model, messages, auth)) {
 				if (event.type === "delta") {
 					sawToken = true;
 					reply += event.text;

@@ -9,6 +9,8 @@
       "@ker-ai/config/*": ["./packages/config/src/*"],
       "@ker-ai/llm": ["./packages/llm/src/index.ts"],
       "@ker-ai/llm/*": ["./packages/llm/src/*"],
+      "@ker-ai/auth": ["./packages/auth/src/index.ts"],
+      "@ker-ai/auth/*": ["./packages/auth/src/*"],
       "@ker-ai/engine": ["./packages/engine/src/index.ts"],
       "@ker-ai/engine/*": ["./packages/engine/src/*"],
       "@ker-ai/daemon": ["./packages/daemon/src/index.ts"],

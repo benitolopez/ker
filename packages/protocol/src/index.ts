@@ -37,7 +37,13 @@ export interface RetryEvent extends EventBase {
 	message: string;
 }
 
-export type Event = MessageEvent | MessageDeltaEvent | UsageEvent | ErrorEvent | RetryEvent;
+// Which credential the turn ran on: a plain API key, or a ChatGPT-subscription OAuth login.
+export interface AuthEvent extends EventBase {
+	type: "auth";
+	mode: "apikey" | "oauth";
+}
+
+export type Event = MessageEvent | MessageDeltaEvent | UsageEvent | ErrorEvent | RetryEvent | AuthEvent;
 
 export const PROTOCOL_VERSION = "0" as const;
 

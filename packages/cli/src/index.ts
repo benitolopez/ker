@@ -1,6 +1,7 @@
 import * as Daemon from "@ker-ai/daemon";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
+import { runLogin, runLogout } from "./login.ts";
 import { sseData } from "./sse.ts";
 
 const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
@@ -13,9 +14,17 @@ export async function run(): Promise<void> {
 		runDaemon();
 		return;
 	}
+	if (args.length === 1 && args[0] === "login") {
+		await runLogin();
+		return;
+	}
+	if (args.length === 1 && args[0] === "logout") {
+		runLogout();
+		return;
+	}
 	const prompt = args.join(" ").trim();
 	if (!prompt) {
-		process.stderr.write("usage: ker <prompt> | ker daemon\n");
+		process.stderr.write("usage: ker <prompt> | ker daemon | ker login | ker logout\n");
 		process.exitCode = 1;
 		return;
 	}
@@ -77,6 +86,11 @@ async function runPrompt(prompt: string): Promise<void> {
 	let terminal = false;
 	for await (const data of sseData(events.body)) {
 		const event = JSON.parse(data) as Protocol.Event;
+		if (event.type === "auth") {
+			process.stderr.write(
+				event.mode === "oauth" ? "ker: using ChatGPT subscription (OAuth)\n" : "ker: using API key\n",
+			);
+		}
 		if (event.type === "message_delta") {
 			streamed = true;
 			process.stdout.write(event.text);

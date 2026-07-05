@@ -79,6 +79,7 @@ Three kinds of comment earn their place: what a non-obvious function does, why t
 - Delete dead code; don't comment it out.
 - Never add `TODO`/`FIXME` unless asked, and never delete an existing one.
 - Write in a plain register. Cut the tells of machine prose: editorializing adjectives (`embryonic`, `robust`, `dumb`), coined nouns dressed up as standard terms (`turn pump`), first-person `we`/`our` (`our events` → name the events), and punchy taglines (`does one thing end to end`, `outlives any client` → state the mechanism instead).
+- Before finishing, make a separate pass over every comment you added or changed and check each against the rules above. The plain-register tells are easy to miss while writing and stand out on a re-read; rewrite the ones that fail.
 
 ```ts
 // Bad
@@ -166,6 +167,23 @@ const table = sqliteTable("session", {
 
 ## Git
 
+### Branches
+
+Branch off `main` and prefix the name by intent:
+
+| Prefix      | Use for                                         |
+| ----------- | ----------------------------------------------- |
+| `feat/`     | A new feature — `feat/chatgpt-oauth-login`      |
+| `fix/`      | A bug fix — `fix/login-hang`                    |
+| `refactor/` | Restructuring with no behavior change           |
+| `chore/`    | Tooling, config, dependencies, build, CI        |
+| `docs/`     | Documentation only                              |
+| `test/`     | Adding or fixing tests                          |
+
+Use a short, hyphenated description of *what the change is*.
+
+### Working alongside other sessions
+
 Multiple ker sessions may be running in this cwd at the same time, each modifying different files. Git operations that touch unstaged, staged, or untracked files outside your own changes will stomp on other sessions' work. Follow these rules:
 
 Never run (destroys other agents' work or bypasses checks):
@@ -188,6 +206,7 @@ Write like a terse human, not an AI. Say what changed and, only if it isn't obvi
 - Don't explain trivial details, list every touched file, or note that unrelated things stay unaffected.
 - No filler, no marketing tone, no exhaustive rationale.
 - Same plain voice as code comments (see above): no editorializing adjectives, coined jargon, first-person `we`/`our`, taglines, or a tech-stack / "not X yet" closer.
+- Before committing, re-read the message as a separate pass and check it against the rules above. The same tells slip into a subject or body while writing and stand out on a re-read; rewrite what fails.
 
 ```
 # Bad — slogans, "our", and a stack/caveat closer

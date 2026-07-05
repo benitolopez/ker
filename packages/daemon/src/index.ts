@@ -1,5 +1,6 @@
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
+import * as Auth from "@ker-ai/auth";
 import * as Config from "@ker-ai/config";
 import * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
@@ -14,7 +15,8 @@ const ALLOWED_HOSTS = new Set([`127.0.0.1:${DEFAULT_PORT}`, `localhost:${DEFAULT
 // subscribers — so a turn keeps going even if the client disconnects; POST /prompt only
 // acknowledges. Returns without listening: the bin owns process concerns (port, signals, bind errors).
 export function createDaemon(): Server {
-	const harness = Engine.createHarness(Config.loadConfig());
+	const config = Config.loadConfig();
+	const harness = Engine.createHarness({ model: config.model, getAuth: () => Auth.resolveAuth(config.apiKey) });
 	const log: Protocol.Event[] = [];
 	const subscribers = new Set<ServerResponse>();
 	let busy = false;
