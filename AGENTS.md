@@ -201,7 +201,7 @@ If rebase conflicts occur:
 Write like a terse human, not an AI. Say what changed and, only if it isn't obvious, why.
 
 - Subject line: imperative, concise, describes the change. Often this is the whole message.
-- Add a body only when it says something the subject doesn't. If the subject already covers it, stop there.
+- Add a body only when the change is non-obvious enough that the subject leaves a reader guessing — not just because there's a fact the subject omits. A "why" the diff already makes clear is filler.
 - Don't restate the subject in the body with more words.
 - Don't explain trivial details, list every touched file, or note that unrelated things stay unaffected.
 - No filler, no marketing tone, no exhaustive rationale.
