@@ -167,6 +167,23 @@ const table = sqliteTable("session", {
 
 ## Git
 
+### Branches
+
+Branch off `main` and prefix the name by intent:
+
+| Prefix      | Use for                                         |
+| ----------- | ----------------------------------------------- |
+| `feat/`     | A new feature — `feat/chatgpt-oauth-login`      |
+| `fix/`      | A bug fix — `fix/login-hang`                    |
+| `refactor/` | Restructuring with no behavior change           |
+| `chore/`    | Tooling, config, dependencies, build, CI        |
+| `docs/`     | Documentation only                              |
+| `test/`     | Adding or fixing tests                          |
+
+Use a short, hyphenated description of *what the change is*.
+
+### Working alongside other sessions
+
 Multiple ker sessions may be running in this cwd at the same time, each modifying different files. Git operations that touch unstaged, staged, or untracked files outside your own changes will stomp on other sessions' work. Follow these rules:
 
 Never run (destroys other agents' work or bypasses checks):
