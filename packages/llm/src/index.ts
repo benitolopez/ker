@@ -16,16 +16,44 @@ export type Event =
 	| { type: "done"; usage: Usage }
 	| { type: "error"; message: string; retryable: boolean; retryAfterMs?: number };
 
+// How stream() reaches OpenAI: a plain API key against the public API, or a ChatGPT-subscription
+// OAuth access token (with the account id decoded from it) against the Codex backend.
+export type Auth = { kind: "apikey"; key: string } | { kind: "oauth"; accessToken: string; accountId: string };
+
+const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+
 // Stream one OpenAI Responses call as `delta` / `done` / `error` events. Never throws: a pre-stream
 // reject, a mid-stream SDK error, an in-band `response.failed`, or a stream that ends without a
 // terminal event all come back as one `error` event, tagged with whether it's worth retrying and
 // any server Retry-After. SDK retries are off (`maxRetries: 0`) so the engine owns the single retry
-// policy. A `response.incomplete` (token cap) counts as a normal finish.
-export async function* stream(model: string, messages: Message[], apiKey: string): AsyncGenerator<Event> {
+// policy. A `response.incomplete` (token cap) counts as a normal finish. OAuth targets the Codex
+// backend, which rejects `store: true` and needs the encrypted reasoning sent back in the request.
+export async function* stream(model: string, messages: Message[], auth: Auth): AsyncGenerator<Event> {
 	try {
-		const client = new OpenAI({ apiKey, maxRetries: 0 });
+		const client =
+			auth.kind === "oauth"
+				? new OpenAI({
+						apiKey: auth.accessToken,
+						baseURL: CODEX_BASE_URL,
+						defaultHeaders: {
+							"chatgpt-account-id": auth.accountId,
+							originator: "ker",
+							"OpenAI-Beta": "responses=experimental",
+						},
+						maxRetries: 0,
+					})
+				: new OpenAI({ apiKey: auth.key, maxRetries: 0 });
 		const input = messages.map((m) => ({ role: m.role, content: m.content }));
-		const events = await client.responses.create({ model, input, stream: true });
+		const events =
+			auth.kind === "oauth"
+				? await client.responses.create({
+						model,
+						input,
+						stream: true,
+						store: false,
+						include: ["reasoning.encrypted_content"],
+					})
+				: await client.responses.create({ model, input, stream: true });
 		let sawTerminal = false;
 		for await (const event of events) {
 			if (event.type === "response.output_text.delta") {

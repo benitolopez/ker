@@ -10,8 +10,8 @@ code — that comes next. This repo is the skeleton the real agent gets built on
 
 - A long-lived **daemon** that holds the conversation, and a thin `ker` client that talks to
   it over HTTP.
-- One streaming model call per turn (OpenAI Responses API, bring your own key), with its own
-  retry/backoff on transient failures.
+- One streaming model call per turn (OpenAI Responses API, with an API key or your ChatGPT
+  subscription), with its own retry/backoff on transient failures.
 - Conversation memory that lives in the daemon: start a turn in one terminal, continue from
   another — it remembers, because the client is disposable and the daemon isn't.
 
@@ -21,7 +21,7 @@ provider other than OpenAI.
 ## Requirements
 
 - Node 24
-- An OpenAI API key
+- An OpenAI API key, or a ChatGPT Plus/Pro subscription
 
 ## Setup
 
@@ -30,7 +30,11 @@ npm install
 npm run build
 ```
 
-Then give it a key. Put a config file at `~/.config/ker/config.json`:
+## Authentication
+
+ker needs either an OpenAI API key or a ChatGPT Plus/Pro subscription.
+
+**API key.** Put a config file at `~/.config/ker/config.json`:
 
 ```json
 {
@@ -39,7 +43,29 @@ Then give it a key. Put a config file at `~/.config/ker/config.json`:
 }
 ```
 
-`model` is optional and defaults to `gpt-5.4-mini`.
+Or set `OPENAI_API_KEY` in the environment. `model` is optional and defaults to `gpt-5.4-mini`.
+
+**ChatGPT subscription.** Sign in with your OpenAI account instead of a key:
+
+```sh
+npx ker login
+```
+
+It opens the browser to authorize ker — on a remote box, paste the code (or the redirect URL)
+back into the terminal instead. The credential is stored at `~/.config/ker/auth.json` (mode
+0600), and turns then run through your subscription rather than a metered key. This uses
+OpenAI's Codex login flow; it is not an officially supported third-party integration, so the
+API key stays the sanctioned path.
+
+Forget the subscription login with:
+
+```sh
+npx ker logout
+```
+
+When both are configured the subscription wins; `ker logout` reverts to the key. Every turn
+reports which credential it used on stderr — `using ChatGPT subscription (OAuth)` or `using
+API key`.
 
 ## Usage
 
