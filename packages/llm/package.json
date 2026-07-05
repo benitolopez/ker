@@ -16,7 +16,8 @@
   },
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
-    "clean": "shx rm -rf dist"
+    "clean": "shx rm -rf dist",
+    "test": "node --test test/*.test.ts"
   },
   "dependencies": {
     "openai": "6.45.0"

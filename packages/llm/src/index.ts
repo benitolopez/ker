@@ -65,7 +65,7 @@ interface Classified {
 // failures and 408/409/429/5xx); auth, bad-request, and quota errors are terminal. The two in-band
 // throws land in the `Error` branch: the premature-stream-end guard is transient, and `response.failed`
 // exposes only a provider code string, matched against the same server/rate/overload codes.
-function classifyError(err: unknown): Classified {
+export function classifyError(err: unknown): Classified {
 	if (err instanceof APIConnectionTimeoutError) return { message: "OpenAI request timed out", retryable: true };
 	if (err instanceof APIConnectionError) {
 		return { message: "Could not reach OpenAI (connection error)", retryable: true };
@@ -86,7 +86,7 @@ function classifyError(err: unknown): Classified {
 
 // Server-requested backoff from the response headers, in ms: `retry-after-ms` wins, else `retry-after`
 // as seconds or an HTTP date. Clamped non-negative; undefined when absent or unparseable.
-function parseRetryAfterMs(headers: Headers | undefined): number | undefined {
+export function parseRetryAfterMs(headers: Headers | undefined): number | undefined {
 	if (!headers) return undefined;
 	const ms = headers.get("retry-after-ms");
 	if (ms !== null && Number.isFinite(Number(ms))) return Math.max(0, Number(ms));

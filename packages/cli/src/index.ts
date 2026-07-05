@@ -1,7 +1,7 @@
-import type { ReadableStream } from "node:stream/web";
 import * as Daemon from "@ker-ai/daemon";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
+import { sseData } from "./sse.ts";
 
 const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
 
@@ -128,26 +128,4 @@ async function checkHealth(): Promise<boolean> {
 	}
 	process.exitCode = 1;
 	return false;
-}
-
-// Parse an SSE byte stream into each event's data payload: buffer across chunk boundaries,
-// tolerate CRLF, join multi-`data:` lines, and let comments (heartbeats) and id fields fall
-// through. A consumer break propagates to the body's cancel via the generator's return().
-async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
-	const decoder = new TextDecoder();
-	let buffer = "";
-	let data: string[] = [];
-	for await (const chunk of body) {
-		buffer += decoder.decode(chunk, { stream: true });
-		for (let i = buffer.indexOf("\n"); i !== -1; i = buffer.indexOf("\n")) {
-			const line = buffer.slice(0, i).replace(/\r$/, "");
-			buffer = buffer.slice(i + 1);
-			if (line === "") {
-				if (data.length > 0) yield data.join("\n");
-				data = [];
-				continue;
-			}
-			if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
-		}
-	}
 }

@@ -10,6 +10,7 @@
   "dependencies": { "@ker-ai/protocol": "^0.0.0", "@ker-ai/daemon": "^0.0.0" },
   "scripts": {
     "build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
-    "clean": "shx rm -rf dist"
+    "clean": "shx rm -rf dist",
+    "test": "node --test test/*.test.ts"
   }
 }
