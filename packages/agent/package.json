@@ -1,5 +1,5 @@
 {
-  "name": "@ker-ai/daemon",
+  "name": "@ker-ai/agent",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -7,9 +7,10 @@
   "types": "./dist/index.d.ts",
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
   "engines": { "node": ">=24.0.0" },
-  "dependencies": { "@ker-ai/agent": "^0.0.0", "@ker-ai/auth": "^0.0.0", "@ker-ai/protocol": "^0.0.0", "@ker-ai/config": "^0.0.0", "@ker-ai/engine": "^0.0.0" },
+  "dependencies": { "@ker-ai/engine": "^0.0.0" },
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
-    "clean": "shx rm -rf dist"
+    "clean": "shx rm -rf dist",
+    "test": "node --test test/*.test.ts"
   }
 }

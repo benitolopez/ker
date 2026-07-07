@@ -1,5 +1,6 @@
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
+import * as Agent from "@ker-ai/agent";
 import * as Auth from "@ker-ai/auth";
 import * as Config from "@ker-ai/config";
 import * as Engine from "@ker-ai/engine";
@@ -16,7 +17,12 @@ const ALLOWED_HOSTS = new Set([`127.0.0.1:${DEFAULT_PORT}`, `localhost:${DEFAULT
 // acknowledges. Returns without listening: the bin owns process concerns (port, signals, bind errors).
 export function createDaemon(): Server {
 	const config = Config.loadConfig();
-	const harness = Engine.createHarness({ model: config.model, getAuth: () => Auth.resolveAuth(config.apiKey) });
+	const harness = Engine.createHarness({
+		model: config.model,
+		getAuth: () => Auth.resolveAuth(config.apiKey),
+		tools: Agent.tools,
+		systemPrompt: Agent.systemPrompt,
+	});
 	const log: Protocol.Event[] = [];
 	const subscribers = new Set<ServerResponse>();
 	let busy = false;

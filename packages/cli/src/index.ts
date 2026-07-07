@@ -95,14 +95,26 @@ async function runPrompt(prompt: string): Promise<void> {
 			streamed = true;
 			process.stdout.write(event.text);
 		}
+		if (event.type === "tool_call") {
+			process.stderr.write(`→ ${event.name} ${event.arguments}\n`);
+		}
+		if (event.type === "tool_result") {
+			process.stderr.write(
+				event.status === "error"
+					? `✗ ${event.name}: ${event.output}\n`
+					: `✓ ${event.name} → ${event.output.split("\n").length} lines\n`,
+			);
+		}
 		if (event.type === "usage") {
-			process.stderr.write(`\n[tokens] in=${event.input} out=${event.output} total=${event.total}\n`);
-			terminal = true;
+			process.stderr.write(`[tokens] in=${event.input} out=${event.output} total=${event.total}\n`);
 		}
 		// TODO: wire retry notices into the TUI when it lands.
 		if (event.type === "retry") {
 			const seconds = Math.ceil(event.delayMs / 1000);
 			process.stderr.write(`ker: retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s — ${event.message}\n`);
+		}
+		if (event.type === "end") {
+			terminal = true;
 		}
 		if (event.type === "error") {
 			process.stderr.write(`\nker: ${event.message}\n`);

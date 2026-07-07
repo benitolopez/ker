@@ -13,6 +13,8 @@
       "@ker-ai/auth/*": ["./packages/auth/src/*"],
       "@ker-ai/engine": ["./packages/engine/src/index.ts"],
       "@ker-ai/engine/*": ["./packages/engine/src/*"],
+      "@ker-ai/agent": ["./packages/agent/src/index.ts"],
+      "@ker-ai/agent/*": ["./packages/agent/src/*"],
       "@ker-ai/daemon": ["./packages/daemon/src/index.ts"],
       "@ker-ai/daemon/*": ["./packages/daemon/src/*"],
       "@ker-ai/cli": ["./packages/cli/src/index.ts"],
