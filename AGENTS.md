@@ -200,13 +200,13 @@ If rebase conflicts occur:
 
 Write like a terse human, not an AI. Say what changed and, only if it isn't obvious, why.
 
-- Subject line: imperative, concise, describes the change. Often this is the whole message.
-- Add a body only when the change is non-obvious enough that the subject leaves a reader guessing — not just because there's a fact the subject omits. A "why" the diff already makes clear is filler.
+- **Default to a subject-only message.** The subject is imperative, concise, and describes the change — and it is the whole commit message unless the subject genuinely cannot carry the change on its own.
+- **A body is the exception. Omit it by default.** Add one only when the subject leaves a reader of the diff genuinely stuck — never because you have a rationale to share, design context from the conversation, or a fact the subject happened to omit. A "why" the diff already makes clear is filler. When in doubt, no body.
 - Don't restate the subject in the body with more words.
 - Don't explain trivial details, list every touched file, or note that unrelated things stay unaffected.
 - No filler, no marketing tone, no exhaustive rationale.
 - Same plain voice as code comments (see above): no editorializing adjectives, coined jargon, first-person `we`/`our`, taglines, or a tech-stack / "not X yet" closer.
-- Before committing, re-read the message as a separate pass and check it against the rules above. The same tells slip into a subject or body while writing and stand out on a re-read; rewrite what fails.
+- Before committing, re-read the message as a separate pass. If you wrote a body, delete it unless you can name the exact thing in the subject a diff-reader would be stuck on. The plain-voice tells slip into a subject or body while writing too and stand out on a re-read; rewrite what fails.
 
 ```
 # Bad — slogans, "our", and a stack/caveat closer
@@ -217,6 +217,15 @@ Node 24, npm workspaces, Biome + tsgo, no bundler. No tools or agent loop yet.
 # Good — plain and factual
 Send a prompt, get one streamed model reply. The daemon keeps the conversation
 in memory, so the next prompt still has the context.
+
+# Bad — a self-explanatory change padded with a rationale body
+Print only the answer by default; --json dumps the raw event stream
+
+Rich per-tool rendering is the TUI's job; --json is the debug surface, so the
+default no longer prints tool lines.
+
+# Good — the subject already says it all, no body
+Print only the answer by default and add --json for the raw event stream
 ```
 
 ## User Override
