@@ -6,10 +6,13 @@ import { sseData } from "./sse.ts";
 
 const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
 
-// The `ker` bin: the sole argument `daemon` runs the daemon in the foreground; anything else is a
-// prompt sent to it.
+// The `ker` bin: a leading `--json` dumps each raw event as JSON; otherwise only the assistant's
+// answer streams to stdout. The sole argument `daemon`/`login`/`logout` runs that; anything else is
+// a prompt sent to the daemon.
 export async function run(): Promise<void> {
-	const args = process.argv.slice(2);
+	let args = process.argv.slice(2);
+	const json = args[0] === "--json";
+	if (json) args = args.slice(1);
 	if (args.length === 1 && args[0] === "daemon") {
 		runDaemon();
 		return;
@@ -24,11 +27,11 @@ export async function run(): Promise<void> {
 	}
 	const prompt = args.join(" ").trim();
 	if (!prompt) {
-		process.stderr.write("usage: ker <prompt> | ker daemon | ker login | ker logout\n");
+		process.stderr.write("usage: ker [--json] <prompt> | ker daemon | ker login | ker logout\n");
 		process.exitCode = 1;
 		return;
 	}
-	await runPrompt(prompt);
+	await runPrompt(prompt, json);
 }
 
 // Host the daemon in the foreground, bound to loopback only — a bare listen(port) would expose
@@ -53,10 +56,13 @@ function runDaemon(): void {
 	process.once("SIGTERM", shutdown);
 }
 
-// Drive one turn through the daemon: health-check, subscribe to /event *before* POSTing so no
-// events are missed, then print until a terminal event — `usage` or `error` ends the turn.
-// Breaking the loop cancels the stream; no process.exit.
-async function runPrompt(prompt: string): Promise<void> {
+// Drive one turn through the daemon: health-check, subscribe to /event *before* POSTing so no events
+// are missed, then consume the stream until the terminal `end` (or `error`) event. In the default mode
+// only the assistant answer streams to stdout and fatal errors go to stderr; the other events (tool
+// calls, usage, auth, retry) are intentionally left unrendered — the TUI and `--json` are their
+// surface. With `json`, each raw event is echoed as one JSON line on stdout. Breaking the loop cancels
+// the stream; no process.exit.
+async function runPrompt(prompt: string, json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
 
 	const events = await fetch(`${BASE}/event`);
@@ -86,32 +92,18 @@ async function runPrompt(prompt: string): Promise<void> {
 	let terminal = false;
 	for await (const data of sseData(events.body)) {
 		const event = JSON.parse(data) as Protocol.Event;
-		if (event.type === "auth") {
-			process.stderr.write(
-				event.mode === "oauth" ? "ker: using ChatGPT subscription (OAuth)\n" : "ker: using API key\n",
-			);
+		if (json) {
+			process.stdout.write(`${data}\n`);
+			if (event.type === "error") process.exitCode = 1;
+			if (event.type === "error" || event.type === "end") {
+				terminal = true;
+				break;
+			}
+			continue;
 		}
 		if (event.type === "message_delta") {
 			streamed = true;
 			process.stdout.write(event.text);
-		}
-		if (event.type === "tool_call") {
-			process.stderr.write(`→ ${event.name} ${event.arguments}\n`);
-		}
-		if (event.type === "tool_result") {
-			process.stderr.write(
-				event.status === "error"
-					? `✗ ${event.name}: ${event.output}\n`
-					: `✓ ${event.name} → ${event.output.split("\n").length} lines\n`,
-			);
-		}
-		if (event.type === "usage") {
-			process.stderr.write(`[tokens] in=${event.input} out=${event.output} total=${event.total}\n`);
-		}
-		// TODO: wire retry notices into the TUI when it lands.
-		if (event.type === "retry") {
-			const seconds = Math.ceil(event.delayMs / 1000);
-			process.stderr.write(`ker: retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s — ${event.message}\n`);
 		}
 		if (event.type === "end") {
 			terminal = true;
