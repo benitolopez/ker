@@ -1,0 +1,72 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+import { tools } from "../src/index.ts";
+
+function bashTool() {
+	const found = tools.find((t) => t.name === "bash");
+	if (!found) throw new Error("bash tool not registered");
+	return found;
+}
+const bash = bashTool();
+
+// Pids whose full command line matches the pattern. pgrep exits 1 when there are none, which
+// execFileSync turns into a throw — treat that (and a missing pgrep) as "no matches".
+function pidsMatching(pattern: string): string[] {
+	try {
+		return execFileSync("pgrep", ["-f", pattern]).toString().trim().split("\n").filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
+test("a non-zero exit comes back as data, not a throw", async () => {
+	assert.match(await bash.execute({ command: "exit 3" }), /\[exited with code 3\]/);
+});
+
+test("a command with no output returns the empty sentinel", async () => {
+	assert.equal(await bash.execute({ command: "true" }), "(no output)");
+});
+
+test("stdin is closed so a stdin-reader gets EOF instead of blocking", { timeout: 15000 }, async () => {
+	// `cat` with no file reads stdin; if stdin weren't "ignore" this would hang until the default timeout.
+	assert.equal(await bash.execute({ command: "cat" }), "(no output)");
+});
+
+test("large output is tail-truncated with the full log spilled to a temp file", async () => {
+	const out = await bash.execute({ command: "seq 1 100000" });
+	const path = out.match(/full output: ([^\]]+)\]/)?.[1];
+	assert.ok(path, "expected a temp-file path in the truncation notice");
+	const full = await readFile(path, "utf8");
+	const lines = full.split("\n").filter(Boolean);
+	assert.equal(lines.length, 100000);
+	assert.equal(lines[0], "1");
+	assert.equal(lines.at(-1), "100000");
+});
+
+test("a timed-out command throws and its whole process group is killed", { timeout: 20000 }, async (t) => {
+	// A distinctive sleep duration so pgrep can find an orphan without matching unrelated `sleep`s.
+	const marker = `sleep ${900000 + Math.floor(Math.random() * 90000)}`;
+	t.after(() => {
+		for (const pid of pidsMatching(marker)) {
+			try {
+				process.kill(Number(pid), "SIGKILL");
+			} catch {
+				// already reaped
+			}
+		}
+	});
+
+	// The backgrounded `&` sleep is a grandchild only a process-group kill reaches; the foreground sleep
+	// keeps the shell alive past the 1s timeout so there is something to kill.
+	await assert.rejects(bash.execute({ command: `${marker} & ${marker}`, timeout: 1 }), /\[timed out after 1s\]/);
+
+	// SIGTERM kills `sleep` at once; poll briefly to let the OS reap before asserting no survivors.
+	let survivors = pidsMatching(marker);
+	for (let i = 0; i < 30 && survivors.length > 0; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		survivors = pidsMatching(marker);
+	}
+	assert.deepEqual(survivors, [], "a backgrounded grandchild outlived the group kill");
+});
