@@ -58,9 +58,9 @@ function runDaemon(): void {
 
 // Drive one turn through the daemon: health-check, subscribe to /event *before* POSTing so no events
 // are missed, then consume the stream until the terminal `end` (or `error`) event. In the default mode
-// only the assistant answer streams to stdout and fatal errors go to stderr; the other events (tool
-// calls, usage, auth, retry) are intentionally left unrendered — the TUI and `--json` are their
-// surface. With `json`, each raw event is echoed as one JSON line on stdout. Breaking the loop cancels
+// only the assistant answer streams to stdout and fatal errors go to stderr; the other events
+// (reasoning, tool calls, usage, auth, retry) are intentionally left unrendered — the TUI and `--json`
+// are their surface. With `json`, each raw event is echoed as one JSON line on stdout. Breaking the loop cancels
 // the stream; no process.exit.
 async function runPrompt(prompt: string, json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;

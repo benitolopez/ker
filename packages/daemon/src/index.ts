@@ -22,6 +22,7 @@ export function createDaemon(): Server {
 		getAuth: () => Auth.resolveAuth(config.apiKey),
 		tools: Agent.tools,
 		systemPrompt: Agent.systemPrompt,
+		reasoningEffort: config.reasoningEffort,
 	});
 	const log: Protocol.Event[] = [];
 	const subscribers = new Set<ServerResponse>();

@@ -20,9 +20,14 @@ export interface Tool {
 	parameters: Record<string, unknown>;
 }
 
+// OpenAI's reasoning-effort levels. Unset omits `effort` from the request, so the model uses its server
+// default, which is none on gpt-5.x.
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export interface StreamOptions {
 	tools?: Tool[];
 	instructions?: string;
+	reasoningEffort?: ReasoningEffort;
 }
 
 export interface Usage {
@@ -33,6 +38,7 @@ export interface Usage {
 
 export type Event =
 	| { type: "delta"; text: string }
+	| { type: "reasoning_delta"; text: string }
 	| { type: "tool_call"; callId: string; itemId?: string; name: string; arguments: string }
 	| { type: "reasoning"; item: unknown }
 	| { type: "done"; usage: Usage }
@@ -44,13 +50,15 @@ export type Auth = { kind: "apikey"; key: string } | { kind: "oauth"; accessToke
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
-// Stream one OpenAI Responses call as `delta` / `tool_call` / `reasoning` / `done` / `error` events. Never
-// throws: a pre-stream reject, a mid-stream SDK error, an in-band `response.failed`, or a stream that ends
-// without a terminal event all come back as one `error` event, tagged with whether it's worth retrying and
-// any server Retry-After. SDK retries are off (`maxRetries: 0`) so the engine owns the single retry policy.
-// A `response.incomplete` (token cap) counts as a normal finish. Both auth paths run stateless (`store:
-// false`) and ask for the encrypted reasoning back, so the reasoning items surfaced here can be replayed in
-// `input` next turn — required for a reasoning model to keep its chain of thought across tool calls.
+// Stream one OpenAI Responses call as `delta`, `reasoning_delta`, `tool_call`, `reasoning`, `done`, and
+// `error` events. It never throws. Every failure comes back as one `error` event that says whether a
+// retry is worth it and carries any server Retry-After: a pre-stream reject, a mid-stream SDK error, an
+// in-band `response.failed`, or a stream that ends before a terminal event. SDK retries are off
+// (`maxRetries: 0`) so the engine runs the one retry policy, and a `response.incomplete` (token cap) is a
+// normal finish. Reasoning comes back two ways: a summary (`summary: "auto"`) streamed as
+// `reasoning_delta`, and the encrypted item (a `reasoning` event) kept in history. Both auth paths run
+// stateless (`store: false`) and replay the encrypted item next turn, so a reasoning model keeps its
+// chain of thought across tool calls. The encrypted item never goes on the wire.
 export async function* stream(
 	model: string,
 	messages: Message[],
@@ -84,6 +92,7 @@ export async function* stream(
 			stream: true,
 			store: false,
 			include: ["reasoning.encrypted_content"],
+			reasoning: { effort: opts?.reasoningEffort, summary: "auto" },
 			tools,
 			instructions: opts?.instructions,
 		});
@@ -91,6 +100,12 @@ export async function* stream(
 		for await (const event of events) {
 			if (event.type === "response.output_text.delta") {
 				yield { type: "delta", text: event.delta };
+			}
+			if (event.type === "response.reasoning_summary_text.delta") {
+				yield { type: "reasoning_delta", text: event.delta };
+			}
+			if (event.type === "response.reasoning_summary_part.done") {
+				yield { type: "reasoning_delta", text: "\n\n" };
 			}
 			if (event.type === "response.output_item.done") {
 				const item = event.item;

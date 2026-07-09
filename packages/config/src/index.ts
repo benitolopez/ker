@@ -4,22 +4,33 @@ import { join } from "node:path";
 
 export const DEFAULT_MODEL = "gpt-5.4-mini";
 
+// The model's reasoning effort. Left unset, no effort is sent, so the model does no reasoning and
+// returns no summary; set a level to turn thinking on.
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export interface Config {
 	apiKey?: string;
 	model: string;
+	reasoningEffort?: ReasoningEffort;
 }
 
-// Load the user-owned config: the model and an optional API key (file value, then OPENAI_API_KEY).
-// A missing key is not an error here, because an OAuth login may cover it. resolveAuth raises the
-// no-credentials error later, since it is the only place that sees both the key and the login.
+// Load the user-owned config: the model, an optional API key (file value, then OPENAI_API_KEY), and an
+// optional reasoning effort. A missing key is not an error here, because an OAuth login may cover it.
+// resolveAuth raises the no-credentials error later, since it is the only place that sees both the key
+// and the login.
 export function loadConfig(): Config {
 	const file = readConfigFile();
-	return { apiKey: file.apiKey ?? process.env.OPENAI_API_KEY, model: file.model ?? DEFAULT_MODEL };
+	return {
+		apiKey: file.apiKey ?? process.env.OPENAI_API_KEY,
+		model: file.model ?? DEFAULT_MODEL,
+		reasoningEffort: file.reasoningEffort,
+	};
 }
 
 interface ConfigFile {
 	apiKey?: string;
 	model?: string;
+	reasoningEffort?: ReasoningEffort;
 }
 
 // A missing file returns an empty object, so env and defaults apply. Malformed JSON throws.

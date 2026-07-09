@@ -11,6 +11,7 @@ export interface EngineConfig {
 	getAuth: () => Promise<Llm.Auth>;
 	tools: Tool[];
 	systemPrompt: string;
+	reasoningEffort?: Llm.ReasoningEffort;
 }
 
 const MAX_RETRIES = 3;
@@ -81,6 +82,7 @@ async function* streamTurn(
 		for await (const event of Llm.stream(config.model, messages, auth, {
 			tools: config.tools,
 			instructions: config.systemPrompt,
+			reasoningEffort: config.reasoningEffort,
 		})) {
 			if (event.type === "delta") {
 				sawToken = true;
@@ -90,6 +92,9 @@ async function* streamTurn(
 			if (event.type === "tool_call") {
 				toolCalls.push({ callId: event.callId, itemId: event.itemId, name: event.name, arguments: event.arguments });
 				yield { role: "tool", type: "tool_call", id: event.callId, name: event.name, arguments: event.arguments };
+			}
+			if (event.type === "reasoning_delta") {
+				yield { role: "assistant", type: "reasoning_delta", text: event.text };
 			}
 			if (event.type === "reasoning") reasoning.push(event.item);
 			if (event.type === "done") {

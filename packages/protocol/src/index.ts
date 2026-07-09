@@ -17,6 +17,12 @@ export interface MessageDeltaEvent extends EventBase {
 	text: string;
 }
 
+// The model's reasoning summary, streamed in pieces. Only the summary text, not the encrypted reasoning.
+export interface ReasoningDeltaEvent extends EventBase {
+	type: "reasoning_delta";
+	text: string;
+}
+
 export interface UsageEvent extends EventBase {
 	type: "usage";
 	input: number;
@@ -73,6 +79,7 @@ export interface ToolResultEvent extends EventBase {
 export type Event =
 	| MessageEvent
 	| MessageDeltaEvent
+	| ReasoningDeltaEvent
 	| UsageEvent
 	| ErrorEvent
 	| RetryEvent
