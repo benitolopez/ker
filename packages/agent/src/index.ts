@@ -1,9 +1,9 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Tool } from "@ker-ai/engine";
 
 const MAX_LINES = 2000;
@@ -52,6 +52,33 @@ const read: Tool = {
 	},
 };
 
+const write: Tool = {
+	name: "write",
+	description:
+		"Write a UTF-8 text file to disk. Creates the file if it doesn't exist, or overwrites it in full " +
+		"if it does; parent directories are created as needed. Content is written verbatim, so pass the " +
+		"complete file.",
+	parameters: {
+		type: "object",
+		properties: {
+			path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
+			content: { type: "string", description: "The full file contents to write, verbatim." },
+		},
+		required: ["path", "content"],
+		additionalProperties: false,
+	},
+	async execute(args: unknown): Promise<string> {
+		const { path, content } = args as { path?: unknown; content?: unknown };
+		if (typeof path !== "string" || path.trim() === "") throw new Error("write: 'path' must be a non-empty string");
+		if (typeof content !== "string") throw new Error("write: 'content' must be a string");
+		const resolved = resolve(path);
+		const existed = existsSync(resolved);
+		await mkdir(dirname(resolved), { recursive: true });
+		await writeFile(resolved, content, "utf8");
+		return `${existed ? "Wrote" : "Created"} ${path} (${Buffer.byteLength(content, "utf8")} bytes)`;
+	},
+};
+
 const bash: Tool = {
 	name: "bash",
 	description:
@@ -81,7 +108,7 @@ const bash: Tool = {
 	},
 };
 
-export const tools: Tool[] = [read, bash];
+export const tools: Tool[] = [read, write, bash];
 
 // Number every line, then keep whole lines until the 2000-line or 50KB cap trips (the first line is always
 // kept, even if it alone exceeds the byte cap). When lines remain past what's shown, append a notice with
