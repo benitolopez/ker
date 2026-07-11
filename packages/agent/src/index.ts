@@ -57,7 +57,8 @@ const write: Tool = {
 	description:
 		"Write a UTF-8 text file to disk. Creates the file if it doesn't exist, or overwrites it in full " +
 		"if it does; parent directories are created as needed. Content is written verbatim, so pass the " +
-		"complete file.",
+		"complete file. Use write to create a new file or replace one in full; to change part of an " +
+		"existing file, use edit instead.",
 	parameters: {
 		type: "object",
 		properties: {
@@ -76,6 +77,54 @@ const write: Tool = {
 		await mkdir(dirname(resolved), { recursive: true });
 		await writeFile(resolved, content, "utf8");
 		return `${existed ? "Wrote" : "Created"} ${path} (${Buffer.byteLength(content, "utf8")} bytes)`;
+	},
+};
+
+const edit: Tool = {
+	name: "edit",
+	description:
+		"Edit a UTF-8 text file by replacing an exact substring. old_string must match the file verbatim — " +
+		"including whitespace and indentation — and must be unique; keep it as small as possible while still " +
+		"unique. If it is missing or appears more than once the edit is rejected, so add surrounding context " +
+		"to make it unique, or pass replaceAll to change every occurrence. When copying text the read tool " +
+		"showed you, match only the content after its `N: ` line-number prefix, never the number itself. Use " +
+		"edit to change part of an existing file; use write to create a new file or replace one in full.",
+	parameters: {
+		type: "object",
+		properties: {
+			path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
+			old_string: {
+				type: "string",
+				description: "The exact text to replace. Must match the file verbatim and be unique unless replaceAll is set.",
+			},
+			new_string: { type: "string", description: "The text to replace it with." },
+			replaceAll: {
+				type: "boolean",
+				description: "Replace every occurrence of old_string instead of requiring a unique match. Defaults to false.",
+			},
+		},
+		required: ["path", "old_string", "new_string"],
+		additionalProperties: false,
+	},
+	async execute(args: unknown): Promise<string> {
+		const { path, old_string, new_string, replaceAll } = args as {
+			path?: unknown;
+			old_string?: unknown;
+			new_string?: unknown;
+			replaceAll?: unknown;
+		};
+		if (typeof path !== "string" || path.trim() === "") throw new Error("edit: 'path' must be a non-empty string");
+		if (typeof old_string !== "string") throw new Error("edit: 'old_string' must be a string");
+		if (typeof new_string !== "string") throw new Error("edit: 'new_string' must be a string");
+		if (replaceAll !== undefined && typeof replaceAll !== "boolean") {
+			throw new Error("edit: 'replaceAll' must be a boolean");
+		}
+		if (old_string === new_string) throw new Error("old_string and new_string are identical — no change to make.");
+		const resolved = resolve(path);
+		const original = await readFile(resolved, "utf8");
+		const { content, count } = applyEdit(original, old_string, new_string, replaceAll ?? false);
+		await writeFile(resolved, content, "utf8");
+		return `Edited ${path} (${count} ${count === 1 ? "occurrence" : "occurrences"})`;
 	},
 };
 
@@ -108,7 +157,7 @@ const bash: Tool = {
 	},
 };
 
-export const tools: Tool[] = [read, write, bash];
+export const tools: Tool[] = [read, write, edit, bash];
 
 // Number every line, then keep whole lines until the 2000-line or 50KB cap trips (the first line is always
 // kept, even if it alone exceeds the byte cap). When lines remain past what's shown, append a notice with
@@ -136,6 +185,62 @@ export function formatRead(raw: string, offset: number | undefined, limit: numbe
 	const body = shown.join("\n");
 	if (end >= total) return body;
 	return `${body}\n\n[showing lines ${start + 1}-${end} of ${total}; use offset=${end + 1} to continue]`;
+}
+
+// Replace an exact substring in a file's content, preserving the file's own line endings and BOM. old_string
+// is matched against the native bytes (the model's LF input is first converted to the file's ending), so
+// unchanged text keeps its exact bytes; the match must be unique unless replaceAll is set. Throws a
+// model-readable message when old_string is empty, identical to new_string, missing, or ambiguous.
+export function applyEdit(
+	content: string,
+	oldString: string,
+	newString: string,
+	replaceAll: boolean,
+): { content: string; count: number } {
+	if (oldString === "") {
+		throw new Error("old_string must not be empty — use write to create a file or replace it wholesale.");
+	}
+	const { bom, text } = stripBom(content);
+	const ending = detectLineEnding(text);
+	const nativeOld = restoreLineEndings(normalizeToLF(oldString), ending);
+	const nativeNew = restoreLineEndings(normalizeToLF(newString), ending);
+	if (nativeOld === nativeNew) throw new Error("old_string and new_string are identical — no change to make.");
+
+	const count = text.split(nativeOld).length - 1;
+	if (count === 0) {
+		throw new Error(
+			"Could not find old_string in the file. It must match exactly, including whitespace, indentation, and line endings.",
+		);
+	}
+	if (count > 1 && !replaceAll) {
+		throw new Error(
+			`Found ${count} occurrences of old_string. Add surrounding context to make it unique, or pass replaceAll to change every one.`,
+		);
+	}
+
+	if (replaceAll) return { content: bom + text.split(nativeOld).join(nativeNew), count };
+	const i = text.indexOf(nativeOld);
+	return { content: `${bom}${text.slice(0, i)}${nativeNew}${text.slice(i + nativeOld.length)}`, count };
+}
+
+// The file's first newline decides its ending: CRLF only when the first "\n" is preceded by "\r".
+function detectLineEnding(text: string): "\r\n" | "\n" {
+	const crlf = text.indexOf("\r\n");
+	const lf = text.indexOf("\n");
+	if (lf === -1 || crlf === -1) return "\n";
+	return crlf < lf ? "\r\n" : "\n";
+}
+
+function normalizeToLF(text: string): string {
+	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
+	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
+}
+
+function stripBom(content: string): { bom: string; text: string } {
+	return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
 }
 
 // Run a bash command in the working directory, killing it and its process group if it outruns the
