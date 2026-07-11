@@ -2,21 +2,21 @@
 
 ker is a minimal coding agent.
 
-It's very early. Right now ker does exactly one thing end to end: you send it a prompt and it
-streams back a single model reply. There are no tools yet, so it can't read or change your
-code — that comes next. This repo is the skeleton the real agent gets built on.
+It's very early. Right now ker runs a complete coding-agent loop behind a local daemon: you send
+it a prompt, the model can read and change files or run shell commands, and the loop continues
+until the model returns its final answer.
 
 ## What works today
 
 - A long-lived **daemon** that holds the conversation, and a thin `ker` client that talks to
   it over HTTP.
-- One streaming model call per turn (OpenAI Responses API, with an API key or your ChatGPT
-  subscription), with its own retry/backoff on transient failures.
+- A streaming tool-call loop using the OpenAI Responses API, with its own retry/backoff on
+  transient failures.
+- Four built-in tools: `read`, `write`, `edit`, and `bash`.
 - Conversation memory that lives in the daemon: start a turn in one terminal, continue from
   another — it remembers, because the client is disposable and the daemon isn't.
 
-Not there yet: tools, an agent loop, saved sessions, abort, a TUI, any
-provider other than OpenAI.
+Not there yet: saved sessions, abort, a TUI, or any provider other than OpenAI.
 
 ## Requirements
 
@@ -63,9 +63,8 @@ Forget the subscription login with:
 npx ker logout
 ```
 
-When both are configured the subscription wins; `ker logout` reverts to the key. Every turn
-reports which credential it used on stderr — `using ChatGPT subscription (OAuth)` or `using
-API key`.
+When both are configured the subscription wins; `ker logout` reverts to the key. Use `--json`
+when sending a prompt to inspect the authentication event and the rest of the raw event stream.
 
 ## Usage
 
@@ -82,6 +81,12 @@ npx ker "my name is Beni"
 npx ker "what's my name?"
 ```
 
-Assistant text goes to stdout, token counts and errors to stderr.
+Assistant text goes to stdout and errors go to stderr. Pass `--json` before the prompt to print
+every raw event, including tool calls, tool results, reasoning summaries, authentication, and
+token usage:
+
+```sh
+npx ker --json "my name is Beni"
+```
 
 Stop the daemon with Ctrl-C; restarting it clears the conversation (nothing is saved yet).
