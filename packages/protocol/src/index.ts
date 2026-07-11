@@ -88,7 +88,7 @@ export type Event =
 	| ToolCallEvent
 	| ToolResultEvent;
 
-export const PROTOCOL_VERSION = "0" as const;
+export const PROTOCOL_VERSION = "1" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree
 // on it, so it lives here rather than in config.
