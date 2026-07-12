@@ -98,6 +98,11 @@ async function* streamTurn(
 			}
 			if (event.type === "reasoning") reasoning.push(event.item);
 			if (event.type === "done") {
+				if (event.reason === "content_filter") {
+					yield { role: "assistant", type: "usage", ...event.usage };
+					yield { role: "assistant", type: "error", message: "The model response was stopped by a content filter" };
+					return { kind: "stopped" };
+				}
 				messages.push({ role: "assistant", content: reply, toolCalls, reasoning });
 				yield { role: "assistant", type: "usage", ...event.usage };
 				return { kind: "done", toolCalls };

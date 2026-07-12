@@ -36,12 +36,14 @@ export interface Usage {
 	total: number;
 }
 
+export type FinishReason = "stop" | "length" | "content_filter";
+
 export type Event =
 	| { type: "delta"; text: string }
 	| { type: "reasoning_delta"; text: string }
 	| { type: "tool_call"; callId: string; itemId?: string; name: string; arguments: string }
 	| { type: "reasoning"; item: unknown }
-	| { type: "done"; usage: Usage }
+	| { type: "done"; reason: FinishReason; usage: Usage }
 	| { type: "error"; message: string; retryable: boolean; retryAfterMs?: number };
 
 // How stream() reaches OpenAI: a plain API key against the public API, or a ChatGPT-subscription
@@ -53,10 +55,11 @@ const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 // Stream one OpenAI Responses call as `delta`, `reasoning_delta`, `tool_call`, `reasoning`, `done`, and
 // `error` events. It never throws. Every failure comes back as one `error` event that says whether a
 // retry is worth it and carries any server Retry-After: a pre-stream reject, a mid-stream SDK error, an
-// in-band `response.failed`, or a stream that ends before a terminal event. SDK retries are off
-// (`maxRetries: 0`) so the engine runs the one retry policy, and a `response.incomplete` (token cap) is a
-// normal finish. Reasoning comes back two ways: a summary (`summary: "auto"`) streamed as
-// `reasoning_delta`, and the encrypted item (a `reasoning` event) kept in history. Both auth paths run
+// in-band `error` or `response.failed`, or a stream that ends before a terminal event. SDK retries are off
+// (`maxRetries: 0`) so the engine runs the one retry policy. Incomplete responses keep their finish
+// reason, so a token cap and a content filter do not look like a normal stop. Reasoning comes back two
+// ways: a summary (`summary: "auto"`) streamed as `reasoning_delta`, and the encrypted item (a `reasoning`
+// event) kept in history. Both auth paths run
 // stateless (`store: false`) and replay the encrypted item next turn, so a reasoning model keeps its
 // chain of thought across tool calls. The encrypted item never goes on the wire.
 export async function* stream(
@@ -96,9 +99,11 @@ export async function* stream(
 			tools,
 			instructions: opts?.instructions,
 		});
-		let sawTerminal = false;
 		for await (const event of events) {
 			if (event.type === "response.output_text.delta") {
+				yield { type: "delta", text: event.delta };
+			}
+			if (event.type === "response.refusal.delta") {
 				yield { type: "delta", text: event.delta };
 			}
 			if (event.type === "response.reasoning_summary_text.delta") {
@@ -122,24 +127,45 @@ export async function* stream(
 					yield { type: "reasoning", item };
 				}
 			}
-			if (event.type === "response.completed" || event.type === "response.incomplete") {
-				sawTerminal = true;
+			if (event.type === "response.completed") {
 				const usage = event.response.usage;
 				yield {
 					type: "done",
+					reason: "stop",
 					usage: {
 						input: usage?.input_tokens ?? 0,
 						output: usage?.output_tokens ?? 0,
 						total: usage?.total_tokens ?? 0,
 					},
 				};
+				return;
+			}
+			if (event.type === "response.incomplete") {
+				const reason = event.response.incomplete_details?.reason;
+				if (reason !== "max_output_tokens" && reason !== "content_filter") {
+					throw new Error("OpenAI response was incomplete without a recognized reason");
+				}
+				const usage = event.response.usage;
+				yield {
+					type: "done",
+					reason: reason === "max_output_tokens" ? "length" : "content_filter",
+					usage: {
+						input: usage?.input_tokens ?? 0,
+						output: usage?.output_tokens ?? 0,
+						total: usage?.total_tokens ?? 0,
+					},
+				};
+				return;
 			}
 			if (event.type === "response.failed") {
 				const error = event.response.error;
 				throw new Error(error ? `${error.code}: ${error.message}` : "OpenAI response failed");
 			}
+			if (event.type === "error") {
+				throw new Error(event.code ? `${event.code}: ${event.message}` : event.message);
+			}
 		}
-		if (!sawTerminal) throw new Error("OpenAI stream ended before a terminal response event");
+		throw new Error("OpenAI stream ended before a terminal response event");
 	} catch (err) {
 		yield { type: "error", ...classifyError(err) };
 	}
@@ -183,9 +209,9 @@ interface Classified {
 
 // Reduce any failure to the fields of a terminal error event: a readable message, whether retrying
 // is worth it, and any server-requested delay. Retryable mirrors the OpenAI SDK's own rules (transport
-// failures and 408/409/429/5xx); auth, bad-request, and quota errors are terminal. The two in-band
-// throws land in the `Error` branch: the premature-stream-end guard is transient, and `response.failed`
-// exposes only a provider code string, matched against the same server/rate/overload codes.
+// failures and 408/409/429/5xx); auth, bad-request, and quota errors are terminal. In-band provider
+// failures and the premature-stream-end guard land in the `Error` branch, where their messages are
+// matched against the same server, rate-limit, and overload terms.
 export function classifyError(err: unknown): Classified {
 	if (err instanceof APIConnectionTimeoutError) return { message: "OpenAI request timed out", retryable: true };
 	if (err instanceof APIConnectionError) {
