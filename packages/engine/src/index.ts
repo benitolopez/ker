@@ -14,6 +14,10 @@ export interface EngineConfig {
 	reasoningEffort?: Llm.ReasoningEffort;
 }
 
+export interface Dependencies {
+	stream: typeof Llm.stream;
+}
+
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30_000;
@@ -22,14 +26,14 @@ const MAX_DELAY_MS = 30_000;
 // without asking for a tool: a turn streams one reply, and if it requested tools we run them, append the
 // results to history, and loop so the next turn sees them. No turn cap — a runaway loop is only stopped by
 // aborting the turn, which the daemon can't do gracefully until the abort step lands.
-export function createHarness(config: EngineConfig) {
+export function createHarness(config: EngineConfig, dependencies: Dependencies = { stream: Llm.stream }) {
 	const messages: Llm.Message[] = [];
 
 	async function* send(userText: string): AsyncGenerator<Protocol.Event> {
 		messages.push({ role: "user", content: userText });
 		let firstTurn = true;
 		while (true) {
-			const outcome = yield* streamTurn(config, messages, firstTurn);
+			const outcome = yield* streamTurn(config, dependencies, messages, firstTurn);
 			firstTurn = false;
 			if (outcome.kind === "stopped" || outcome.toolCalls.length === 0) break;
 			for (const call of outcome.toolCalls) {
@@ -61,6 +65,7 @@ type TurnOutcome = { kind: "stopped" } | { kind: "done"; toolCalls: Llm.ToolCall
 // so an OAuth token refreshed between retries is used; a resolution failure ends the turn.
 async function* streamTurn(
 	config: EngineConfig,
+	dependencies: Dependencies,
 	messages: Llm.Message[],
 	firstTurn: boolean,
 ): AsyncGenerator<Protocol.Event, TurnOutcome> {
@@ -79,7 +84,7 @@ async function* streamTurn(
 		let sawToken = false;
 		let pending: { delayMs: number; message: string } | undefined;
 
-		for await (const event of Llm.stream(config.model, messages, auth, {
+		for await (const event of dependencies.stream(config.model, messages, auth, {
 			tools: config.tools,
 			instructions: config.systemPrompt,
 			reasoningEffort: config.reasoningEffort,
