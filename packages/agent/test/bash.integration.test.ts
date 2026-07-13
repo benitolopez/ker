@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
+import { dirname } from "node:path";
 import { test } from "node:test";
 import { tools } from "../src/index.ts";
 
@@ -43,6 +45,24 @@ test("large output is tail-truncated with the full log spilled to a temp file", 
 	assert.equal(lines.length, 100000);
 	assert.equal(lines[0], "1");
 	assert.equal(lines.at(-1), "100000");
+	assert.equal((await stat(path)).mode & 0o777, 0o600);
+	assert.equal((await stat(dirname(path))).mode & 0o777, 0o700);
+});
+
+test("normal process exit removes its private spill directory", () => {
+	const agentUrl = JSON.stringify(new URL("../src/index.ts", import.meta.url).href);
+	const source = [
+		`import { tools } from ${agentUrl}`,
+		'const bash = tools.find((tool) => tool.name === "bash")',
+		'if (!bash) throw new Error("bash tool not registered")',
+		'const result = await bash.execute({ command: "seq 1 100000" })',
+		'const marker = "full output: "',
+		"const start = result.lastIndexOf(marker)",
+		'process.stdout.write(result.slice(start + marker.length, result.indexOf("]", start)))',
+	].join(";");
+	const path = execFileSync(process.execPath, ["--input-type=module", "--eval", source], { encoding: "utf8" });
+	assert.equal(existsSync(path), false);
+	assert.equal(existsSync(dirname(path)), false);
 });
 
 test("a timed-out command throws and its whole process group is killed", { timeout: 20000 }, async (t) => {

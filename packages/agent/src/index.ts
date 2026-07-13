@@ -1,13 +1,13 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import type { Tool } from "@ker-ai/engine";
+import * as Bash from "./bash-output.ts";
+import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES } from "./output-limits.ts";
 
-const MAX_LINES = 2000;
-const MAX_BYTES = 50 * 1024;
+export { truncateTail } from "./bash-output.ts";
+
 const DEFAULT_TIMEOUT_SECS = 120;
 const KILL_GRACE_MS = 2000;
 const IDLE_GRACE_MS = 100;
@@ -26,8 +26,8 @@ const read: Tool = {
 	name: "read",
 	description:
 		"Read a UTF-8 text file from disk. Returns the contents with each line prefixed by its 1-indexed " +
-		"line number. Output is capped at 2000 lines or 50KB, whichever comes first; use offset and limit " +
-		"to page through longer files.",
+		`line number. Output is capped at ${MAX_OUTPUT_LINES} lines or ${MAX_OUTPUT_BYTES / 1024}KB, whichever ` +
+		"comes first; use offset and limit to page through longer files.",
 	parameters: {
 		type: "object",
 		properties: {
@@ -132,10 +132,12 @@ const bash: Tool = {
 	name: "bash",
 	description:
 		"Run a bash command in the working directory and return its combined stdout and stderr. Output is " +
-		"capped at the last 2000 lines or 50KB, whichever comes first; when truncated, the full output is " +
-		"written to a temp file whose path is included so you can read it. Provide an optional timeout in " +
-		"seconds (default 120); a command that runs longer is killed along with its child processes. Use this " +
-		"for shell work and for discovery — ls, grep, find, git, running builds and tests.",
+		`capped at the last ${MAX_OUTPUT_LINES} lines or ${MAX_OUTPUT_BYTES / 1024}KB, whichever comes first; ` +
+		"when truncated, the full output is written to a private temp file whose path is included so you can " +
+		"read it. A command is killed with " +
+		"its child processes if that file reaches 1 GiB. Provide an optional timeout in seconds (default 120); " +
+		"a command that runs longer is also killed with its child processes. Use this for shell work and for " +
+		"discovery — ls, grep, find, git, running builds and tests.",
 	parameters: {
 		type: "object",
 		properties: {
@@ -159,9 +161,8 @@ const bash: Tool = {
 
 export const tools: Tool[] = [read, write, edit, bash];
 
-// Number every line, then keep whole lines until the 2000-line or 50KB cap trips (the first line is always
-// kept, even if it alone exceeds the byte cap). When lines remain past what's shown, append a notice with
-// the offset to continue from, so the model can page itself.
+// Number every line, then keep whole lines until either output cap trips. The first line is always kept,
+// even if it exceeds the byte cap. When lines remain, append the offset needed to continue.
 export function formatRead(raw: string, offset: number | undefined, limit: number | undefined): string {
 	const lines = raw.split("\n");
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
@@ -177,7 +178,7 @@ export function formatRead(raw: string, offset: number | undefined, limit: numbe
 	for (; end < userEnd; end++) {
 		const line = `${end + 1}: ${lines[end]}`;
 		const size = Buffer.byteLength(line, "utf8") + 1;
-		if (shown.length > 0 && (shown.length >= MAX_LINES || bytes + size > MAX_BYTES)) break;
+		if (shown.length > 0 && (shown.length >= MAX_OUTPUT_LINES || bytes + size > MAX_OUTPUT_BYTES)) break;
 		shown.push(line);
 		bytes += size;
 	}
@@ -244,10 +245,9 @@ function stripBom(content: string): { bom: string; text: string } {
 }
 
 // Run a bash command in the working directory, killing it and its process group if it outruns the
-// timeout. stdout and stderr interleave into one buffer in arrival order; the result is tail-truncated
-// to the last 2000 lines / 50KB, with the full output spilled to a temp file when cut. A non-zero exit
-// comes back as data with the code noted, while a timeout or a shell that won't spawn throws, so the
-// model reads those as an error.
+// timeout. Stdout and stderr interleave in arrival order; a bounded tail stays in memory while the full
+// stream moves to a private file once it exceeds the preview. A non-zero exit comes back as data, while
+// timeout, spill failure, output-limit, and spawn errors throw so the model sees a failed tool call.
 async function runBash(command: string, timeoutSecs: number): Promise<string> {
 	const child = spawn(resolveShell(), ["-c", command], {
 		cwd: process.cwd(),
@@ -256,12 +256,24 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 
-	const chunks: Buffer[] = [];
+	const output = new Bash.OutputAccumulator({
+		pause: () => {
+			child.stdout?.pause();
+			child.stderr?.pause();
+		},
+		resume: () => {
+			child.stdout?.resume();
+			child.stderr?.resume();
+		},
+		stop: () => {
+			if (child.pid !== undefined) killTree(child.pid);
+		},
+	});
 	child.stdout?.on("data", (data: Buffer) => {
-		chunks.push(data);
+		output.append(data);
 	});
 	child.stderr?.on("data", (data: Buffer) => {
-		chunks.push(data);
+		output.append(data);
 	});
 
 	let timedOut = false;
@@ -270,17 +282,36 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 		if (child.pid !== undefined) killTree(child.pid);
 	}, timeoutSecs * 1000);
 
-	let exitCode: number | null;
-	try {
-		exitCode = await waitForExit(child);
-	} finally {
-		clearTimeout(timer);
-	}
+	const exit = await waitForExit(child, () => output.isBackpressured).then(
+		(code) => ({ code }) as const,
+		(error: unknown) => ({ error }) as const,
+	);
+	clearTimeout(timer);
+	const snapshot = await output.finish();
+	if ("error" in exit) throw exit.error;
 
-	const output = await formatBashOutput(Buffer.concat(chunks).toString("utf8"));
-	if (timedOut) throw new Error(appendNote(output, `timed out after ${timeoutSecs}s`));
-	if (exitCode !== 0 && exitCode !== null) return appendNote(output, `exited with code ${exitCode}`);
-	return output || "(no output)";
+	const locationLabel = output.failure ? "partial output" : output.limitReached ? "captured output" : "full output";
+	const location = snapshot.path ? `${locationLabel}: ${snapshot.path}` : "full output unavailable";
+	const formatted = snapshot.truncated
+		? appendNote(
+				snapshot.text,
+				`output truncated: showing last ${snapshot.shown} of ${snapshot.total} lines; ${location}`,
+			)
+		: snapshot.text;
+	if (output.failure) {
+		throw new Error(appendNote(formatted, `failed to save bash output: ${output.failure.message}; command terminated`));
+	}
+	if (output.limitReached) {
+		throw new Error(
+			appendNote(
+				formatted,
+				`bash output reached the ${Bash.MAX_SPILL_BYTES / 1024 ** 3} GiB safety limit; command terminated`,
+			),
+		);
+	}
+	if (timedOut) throw new Error(appendNote(formatted, `timed out after ${timeoutSecs}s`));
+	if (exit.code !== 0 && exit.code !== null) return appendNote(formatted, `exited with code ${exit.code}`);
+	return formatted || "(no output)";
 }
 
 // Prefer bash so bashisms in a command work as written; fall back to sh only where bash is absent.
@@ -308,11 +339,10 @@ function killTree(pid: number): void {
 	setTimeout(() => groupKill("SIGKILL"), KILL_GRACE_MS).unref();
 }
 
-// Resolve when the child exits and its pipes fall idle. A short-lived child can exit while a detached
-// grandchild keeps stdout open, so waiting for "close" would hang; instead, once "exit" fires, a short
-// idle timer re-armed on every chunk releases us after output stops without truncating a tail that is
-// still being written. Mirrors pi's waitForChildProcess.
-function waitForExit(child: ChildProcess): Promise<number | null> {
+// Resolve when the child exits and its pipes fall idle. A detached grandchild can keep stdout open, so
+// waiting for "close" would hang; data rearms a short post-exit timer, and spill backpressure postpones
+// that timer until paused pipes can resume.
+function waitForExit(child: ChildProcess, outputBackpressured: () => boolean): Promise<number | null> {
 	return new Promise((resolveExit, rejectExit) => {
 		let exited = false;
 		let settled = false;
@@ -329,7 +359,13 @@ function waitForExit(child: ChildProcess): Promise<number | null> {
 		};
 		const armIdle = () => {
 			if (idle) clearTimeout(idle);
-			idle = setTimeout(finish, IDLE_GRACE_MS);
+			idle = setTimeout(() => {
+				if (outputBackpressured()) {
+					armIdle();
+					return;
+				}
+				finish();
+			}, IDLE_GRACE_MS);
 		};
 
 		child.stdout?.on("data", () => {
@@ -354,43 +390,6 @@ function waitForExit(child: ChildProcess): Promise<number | null> {
 			rejectExit(err);
 		});
 	});
-}
-
-// Tail-truncate combined output to the last 2000 lines / 50KB — a command's errors usually sit at the
-// end. When cut, write the whole output to a temp file and point at it so the model can page the full
-// log with `read`.
-async function formatBashOutput(full: string): Promise<string> {
-	const tail = truncateTail(full);
-	if (!tail.truncated) return tail.text;
-	const path = join(tmpdir(), `ker-bash-${randomUUID()}.txt`);
-	await writeFile(path, full);
-	return `${tail.text}\n\n[output truncated: showing last ${tail.shown} of ${tail.total} lines; full output: ${path}]`;
-}
-
-// Keep whole lines from the end until the 2000-line or 50KB cap trips. Only when a single trailing line
-// alone exceeds the byte cap is that line sliced back to a UTF-8 boundary, so there is always a tail.
-export function truncateTail(content: string): { text: string; truncated: boolean; shown: number; total: number } {
-	const lines = content.split("\n");
-	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-	const total = lines.length;
-	if (total === 0) return { text: content, truncated: false, shown: 0, total: 0 };
-
-	const kept: string[] = [];
-	let bytes = 0;
-	for (let i = total - 1; i >= 0; i--) {
-		const size = Buffer.byteLength(lines[i], "utf8") + (kept.length > 0 ? 1 : 0);
-		if (kept.length >= MAX_LINES || bytes + size > MAX_BYTES) break;
-		kept.unshift(lines[i]);
-		bytes += size;
-	}
-
-	if (kept.length === 0) {
-		const buf = Buffer.from(lines[total - 1], "utf8");
-		let start = buf.length - MAX_BYTES;
-		while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++;
-		return { text: buf.subarray(start).toString("utf8"), truncated: true, shown: 1, total };
-	}
-	return { text: kept.join("\n"), truncated: kept.length < total, shown: kept.length, total };
 }
 
 // Append a bracketed status note to command output, or return it alone when the command printed nothing.
