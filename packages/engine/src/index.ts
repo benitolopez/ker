@@ -25,15 +25,22 @@ const MAX_DELAY_MS = 30_000;
 // Holds the conversation in memory and runs the agent loop. Each send takes turns until the model answers
 // without asking for a tool: a turn streams one reply, and if it requested tools we run them, append the
 // results to history, and loop so the next turn sees them. No turn cap — a runaway loop is only stopped by
-// aborting the turn, which the daemon can't do gracefully until the abort step lands.
+// aborting the turn, but the daemon has no graceful turn cancellation. Initial auth is resolved before the
+// user enters history and reused for the first provider attempt.
 export function createHarness(config: EngineConfig, dependencies: Dependencies = { stream: Llm.stream }) {
 	const messages: Llm.Message[] = [];
 
 	async function* send(userText: string): AsyncGenerator<Protocol.Event> {
+		const initialAuth = await resolveAuth(config);
+		if (initialAuth.kind === "error") {
+			yield { role: "assistant", type: "error", message: initialAuth.message };
+			yield { role: "assistant", type: "end" };
+			return;
+		}
 		messages.push({ role: "user", content: userText });
 		let firstTurn = true;
 		while (true) {
-			const outcome = yield* streamTurn(config, dependencies, messages, firstTurn);
+			const outcome = yield* streamTurn(config, dependencies, messages, firstTurn ? initialAuth.auth : undefined);
 			firstTurn = false;
 			if (outcome.kind === "stopped" || outcome.toolCalls.length === 0) break;
 			for (const call of outcome.toolCalls) {
@@ -61,23 +68,23 @@ type TurnOutcome = { kind: "stopped" } | { kind: "done"; toolCalls: Llm.ToolCall
 // assistant message (text, tool calls, reasoning) into history on completion, and return its tool calls for
 // the loop to run. Retries fire only before the first token — every transient failure is a connect-phase
 // error, and streamed text can't be unprinted. A retryable error waits for the server's Retry-After when
-// given, else a capped exponential backoff, announced as a retry event first. Auth is resolved per attempt,
-// so an OAuth token refreshed between retries is used; a resolution failure ends the turn.
+// given, else a capped exponential backoff, announced as a retry event first. Retries and later tool turns
+// resolve auth again, so an OAuth token refreshed between requests is used; a resolution failure ends the turn.
 async function* streamTurn(
 	config: EngineConfig,
 	dependencies: Dependencies,
 	messages: Llm.Message[],
-	firstTurn: boolean,
+	initialAuth?: Llm.Auth,
 ): AsyncGenerator<Protocol.Event, TurnOutcome> {
 	for (let attempt = 0; ; attempt++) {
-		let auth: Llm.Auth;
-		try {
-			auth = await config.getAuth();
-		} catch (err) {
-			yield { role: "assistant", type: "error", message: err instanceof Error ? err.message : String(err) };
+		const authResult: AuthResult =
+			attempt === 0 && initialAuth ? { kind: "ready", auth: initialAuth } : await resolveAuth(config);
+		if (authResult.kind === "error") {
+			yield { role: "assistant", type: "error", message: authResult.message };
 			return { kind: "stopped" };
 		}
-		if (firstTurn && attempt === 0) yield { role: "assistant", type: "auth", mode: auth.kind };
+		const auth = authResult.auth;
+		if (initialAuth && attempt === 0) yield { role: "assistant", type: "auth", mode: auth.kind };
 		let reply = "";
 		const toolCalls: Llm.ToolCall[] = [];
 		const reasoning: unknown[] = [];
@@ -133,6 +140,16 @@ async function* streamTurn(
 			message: pending.message,
 		};
 		await new Promise((resolve) => setTimeout(resolve, pending.delayMs));
+	}
+}
+
+type AuthResult = { kind: "ready"; auth: Llm.Auth } | { kind: "error"; message: string };
+
+async function resolveAuth(config: EngineConfig): Promise<AuthResult> {
+	try {
+		return { kind: "ready", auth: await config.getAuth() };
+	} catch (err) {
+		return { kind: "error", message: err instanceof Error ? err.message : String(err) };
 	}
 }
 
