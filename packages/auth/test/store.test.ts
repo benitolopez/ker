@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { type Credential, deleteCredential, readCredential, writeCredential } from "../src/store.ts";
+import { type Credential, deleteCredentialUnlocked, readCredential, writeCredentialUnlocked } from "../src/store.ts";
 
 const cred: Credential = { type: "oauth", access: "a-token", refresh: "r-token", expires: 123, accountId: "acc" };
 
@@ -26,17 +26,17 @@ test("reads undefined before any login", () => {
 });
 
 test("round-trips a written credential", () => {
-	writeCredential(cred);
+	writeCredentialUnlocked(cred);
 	assert.deepEqual(readCredential(), cred);
 });
 
 test("writes the credential file 0600", () => {
-	writeCredential(cred);
+	writeCredentialUnlocked(cred);
 	assert.equal(statSync(file).mode & 0o777, 0o600);
 });
 
-test("deleteCredential forgets the login", () => {
-	writeCredential(cred);
-	deleteCredential();
+test("deleteCredentialUnlocked forgets the login", () => {
+	writeCredentialUnlocked(cred);
+	deleteCredentialUnlocked();
 	assert.equal(readCredential(), undefined);
 });

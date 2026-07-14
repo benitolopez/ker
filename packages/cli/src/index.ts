@@ -22,7 +22,7 @@ export async function run(): Promise<void> {
 		return;
 	}
 	if (args.length === 1 && args[0] === "logout") {
-		runLogout();
+		await runLogout();
 		return;
 	}
 	const prompt = args.join(" ").trim();

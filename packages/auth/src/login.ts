@@ -8,7 +8,7 @@ import {
 	generatePkce,
 	parseAuthInput,
 } from "./oauth.ts";
-import { writeCredential } from "./store.ts";
+import { withAuthLock, writeCredentialUnlocked } from "./store.ts";
 
 export interface LoginCallbacks {
 	onUrl: (url: string) => void | Promise<void>;
@@ -30,13 +30,15 @@ export async function login(callbacks: LoginCallbacks): Promise<string> {
 			promptForCode(callbacks.promptCode, state),
 		]);
 		const tokens = await exchangeCode(code, pkce.verifier);
-		writeCredential({
-			type: "oauth",
-			access: tokens.access,
-			refresh: tokens.refresh,
-			expires: tokens.expires,
-			accountId: tokens.accountId,
-		});
+		await withAuthLock(() =>
+			writeCredentialUnlocked({
+				type: "oauth",
+				access: tokens.access,
+				refresh: tokens.refresh,
+				expires: tokens.expires,
+				accountId: tokens.accountId,
+			}),
+		);
 		return tokens.accountId;
 	} finally {
 		controller.abort();

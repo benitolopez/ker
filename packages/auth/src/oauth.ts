@@ -61,11 +61,21 @@ export async function exchangeCode(code: string, verifier: string): Promise<Toke
 	return readTokenResponse(res);
 }
 
+// The timeout bounds how long the auth lock is held by a refresh, so a hung token endpoint cannot
+// keep login or logout waiting indefinitely. It must stay under the lock-wait timeout in store.ts.
+const REFRESH_TIMEOUT_MS = 45_000;
+
 export async function refreshToken(refresh: string): Promise<TokenSet> {
 	const res = await fetch(TOKEN_URL, {
 		method: "POST",
 		headers: { "content-type": "application/x-www-form-urlencoded" },
 		body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh, client_id: CLIENT_ID }),
+		signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
+	}).catch((err: unknown) => {
+		if (err instanceof DOMException && err.name === "TimeoutError") {
+			throw new Error(`OpenAI token refresh timed out after ${REFRESH_TIMEOUT_MS / 1000}s`);
+		}
+		throw err;
 	});
 	return readTokenResponse(res, refresh);
 }

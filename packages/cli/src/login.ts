@@ -27,8 +27,8 @@ export async function runLogin(): Promise<void> {
 }
 
 // `ker logout`: forget the stored OpenAI credential.
-export function runLogout(): void {
-	Auth.logout();
+export async function runLogout(): Promise<void> {
+	await Auth.logout();
 	process.stderr.write("Logged out of OpenAI.\n");
 }
 
