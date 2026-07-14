@@ -27,6 +27,18 @@ test("a non-zero exit comes back as data, not a throw", async () => {
 	assert.match(await bash.execute({ command: "exit 3" }), /\[exited with code 3\]/);
 });
 
+test(
+	"a signal-terminated command throws with its output and signal",
+	{ skip: process.platform === "win32" },
+	async () => {
+		await assert.rejects(bash.execute({ command: 'printf "before"; kill -TERM $$' }), (error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.equal(error.message, "before\n\n[terminated by SIGTERM]");
+			return true;
+		});
+	},
+);
+
 test("a command with no output returns the empty sentinel", async () => {
 	assert.equal(await bash.execute({ command: "true" }), "(no output)");
 });

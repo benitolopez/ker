@@ -247,7 +247,8 @@ function stripBom(content: string): { bom: string; text: string } {
 // Run a bash command in the working directory, killing it and its process group if it outruns the
 // timeout. Stdout and stderr interleave in arrival order; a bounded tail stays in memory while the full
 // stream moves to a private file once it exceeds the preview. A non-zero exit comes back as data, while
-// timeout, spill failure, output-limit, and spawn errors throw so the model sees a failed tool call.
+// signal termination, timeout, spill failure, output-limit, and spawn errors throw so the model sees a
+// failed tool call.
 async function runBash(command: string, timeoutSecs: number): Promise<string> {
 	const child = spawn(resolveShell(), ["-c", command], {
 		cwd: process.cwd(),
@@ -283,7 +284,7 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 	}, timeoutSecs * 1000);
 
 	const exit = await waitForExit(child, () => output.isBackpressured).then(
-		(code) => ({ code }) as const,
+		(status) => ({ status }) as const,
 		(error: unknown) => ({ error }) as const,
 	);
 	clearTimeout(timer);
@@ -310,7 +311,12 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 		);
 	}
 	if (timedOut) throw new Error(appendNote(formatted, `timed out after ${timeoutSecs}s`));
-	if (exit.code !== 0 && exit.code !== null) return appendNote(formatted, `exited with code ${exit.code}`);
+	if (exit.status.signal !== null) {
+		throw new Error(appendNote(formatted, `terminated by ${exit.status.signal}`));
+	}
+	if (exit.status.code !== 0 && exit.status.code !== null) {
+		return appendNote(formatted, `exited with code ${exit.status.code}`);
+	}
 	return formatted || "(no output)";
 }
 
@@ -342,11 +348,15 @@ function killTree(pid: number): void {
 // Resolve when the child exits and its pipes fall idle. A detached grandchild can keep stdout open, so
 // waiting for "close" would hang; data rearms a short post-exit timer, and spill backpressure postpones
 // that timer until paused pipes can resume.
-function waitForExit(child: ChildProcess, outputBackpressured: () => boolean): Promise<number | null> {
+function waitForExit(
+	child: ChildProcess,
+	outputBackpressured: () => boolean,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
 	return new Promise((resolveExit, rejectExit) => {
 		let exited = false;
 		let settled = false;
 		let exitCode: number | null = null;
+		let exitSignal: NodeJS.Signals | null = null;
 		let idle: NodeJS.Timeout | undefined;
 
 		const finish = () => {
@@ -355,7 +365,7 @@ function waitForExit(child: ChildProcess, outputBackpressured: () => boolean): P
 			if (idle) clearTimeout(idle);
 			child.stdout?.destroy();
 			child.stderr?.destroy();
-			resolveExit(exitCode);
+			resolveExit({ code: exitCode, signal: exitSignal });
 		};
 		const armIdle = () => {
 			if (idle) clearTimeout(idle);
@@ -374,13 +384,15 @@ function waitForExit(child: ChildProcess, outputBackpressured: () => boolean): P
 		child.stderr?.on("data", () => {
 			if (exited) armIdle();
 		});
-		child.once("exit", (code) => {
+		child.once("exit", (code, signal) => {
 			exited = true;
 			exitCode = code;
+			exitSignal = signal;
 			armIdle();
 		});
-		child.once("close", (code) => {
+		child.once("close", (code, signal) => {
 			exitCode = code ?? exitCode;
+			exitSignal = signal ?? exitSignal;
 			finish();
 		});
 		child.once("error", (err) => {
