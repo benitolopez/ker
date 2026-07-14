@@ -22,25 +22,33 @@ const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30_000;
 
-// Holds the conversation in memory and runs the agent loop. Each send takes turns until the model answers
-// without asking for a tool: a turn streams one reply, and if it requested tools we run them, append the
-// results to history, and loop so the next turn sees them. No turn cap — a runaway loop is only stopped by
-// aborting the turn, but the daemon has no graceful turn cancellation. Initial auth is resolved before the
-// user enters history and reused for the first provider attempt.
+// Holds one credential-bound conversation in memory and runs the agent loop. Each send takes turns until
+// the model answers without asking for a tool: a turn streams one reply, and any tools it requested run
+// with their results appended to history, so the next turn sees them. No turn cap — a runaway loop is
+// only stopped by aborting the turn, but the daemon has no graceful turn cancellation. Initial auth is
+// resolved and checked before the user enters history, then reused for the first provider attempt.
 export function createHarness(config: EngineConfig, dependencies: Dependencies = { stream: Llm.stream }) {
 	const messages: Llm.Message[] = [];
+	let identity: Protocol.Identity | undefined;
 
 	async function* send(userText: string): AsyncGenerator<Protocol.Event> {
-		const initialAuth = await resolveAuth(config);
+		const initialAuth = await resolveAuth(config, identity);
 		if (initialAuth.kind === "error") {
-			yield { role: "assistant", type: "error", message: initialAuth.message };
+			yield initialAuth.event;
 			yield { role: "assistant", type: "end" };
 			return;
 		}
+		identity ??= identityOf(initialAuth.auth);
 		messages.push({ role: "user", content: userText });
 		let firstTurn = true;
 		while (true) {
-			const outcome = yield* streamTurn(config, dependencies, messages, firstTurn ? initialAuth.auth : undefined);
+			const outcome = yield* streamTurn(
+				config,
+				dependencies,
+				messages,
+				identity,
+				firstTurn ? initialAuth.auth : undefined,
+			);
 			firstTurn = false;
 			if (outcome.kind === "stopped" || outcome.toolCalls.length === 0) break;
 			for (const call of outcome.toolCalls) {
@@ -59,7 +67,12 @@ export function createHarness(config: EngineConfig, dependencies: Dependencies =
 		yield { role: "assistant", type: "end" };
 	}
 
-	return { messages, send };
+	function reset(): void {
+		messages.length = 0;
+		identity = undefined;
+	}
+
+	return { messages, reset, send };
 }
 
 type TurnOutcome = { kind: "stopped" } | { kind: "done"; toolCalls: Llm.ToolCall[] };
@@ -74,13 +87,14 @@ async function* streamTurn(
 	config: EngineConfig,
 	dependencies: Dependencies,
 	messages: Llm.Message[],
+	identity: Protocol.Identity,
 	initialAuth?: Llm.Auth,
 ): AsyncGenerator<Protocol.Event, TurnOutcome> {
 	for (let attempt = 0; ; attempt++) {
 		const authResult: AuthResult =
-			attempt === 0 && initialAuth ? { kind: "ready", auth: initialAuth } : await resolveAuth(config);
+			attempt === 0 && initialAuth ? { kind: "ready", auth: initialAuth } : await resolveAuth(config, identity);
 		if (authResult.kind === "error") {
-			yield { role: "assistant", type: "error", message: authResult.message };
+			yield authResult.event;
 			return { kind: "stopped" };
 		}
 		const auth = authResult.auth;
@@ -143,14 +157,54 @@ async function* streamTurn(
 	}
 }
 
-type AuthResult = { kind: "ready"; auth: Llm.Auth } | { kind: "error"; message: string };
+type AuthResult = { kind: "ready"; auth: Llm.Auth } | { kind: "error"; event: Protocol.ErrorEvent };
 
-async function resolveAuth(config: EngineConfig): Promise<AuthResult> {
+async function resolveAuth(config: EngineConfig, expected?: Protocol.Identity): Promise<AuthResult> {
 	try {
-		return { kind: "ready", auth: await config.getAuth() };
+		const auth = await config.getAuth();
+		const actual = identityOf(auth);
+		if (expected && !sameIdentity(expected, actual)) {
+			return {
+				kind: "error",
+				event: {
+					role: "assistant",
+					type: "error",
+					code: "identity_changed",
+					expected,
+					actual,
+					message: `Conversation belongs to ${describeIdentity(expected)}, but ${describeIdentity(actual)} is active.`,
+				},
+			};
+		}
+		return { kind: "ready", auth };
 	} catch (err) {
-		return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+		return {
+			kind: "error",
+			event: { role: "assistant", type: "error", message: err instanceof Error ? err.message : String(err) },
+		};
 	}
+}
+
+// The explicit return type makes the switch exhaustive: a new Auth kind fails to compile here
+// instead of silently collapsing into the API-key identity.
+function identityOf(auth: Llm.Auth): Protocol.Identity {
+	switch (auth.kind) {
+		case "oauth":
+			return { kind: "oauth", accountId: auth.accountId };
+		case "apikey":
+			return { kind: "apikey" };
+	}
+}
+
+function sameIdentity(expected: Protocol.Identity, actual: Protocol.Identity): boolean {
+	if (expected.kind !== actual.kind) return false;
+	if (expected.kind === "oauth" && actual.kind === "oauth") return expected.accountId === actual.accountId;
+	return true;
+}
+
+function describeIdentity(identity: Protocol.Identity): string {
+	if (identity.kind === "oauth") return `OAuth account ${identity.accountId}`;
+	return "an API key";
 }
 
 // Run one tool call, converting every failure — unknown tool, bad JSON arguments, or a throw from the

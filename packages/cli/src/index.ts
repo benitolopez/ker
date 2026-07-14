@@ -1,14 +1,15 @@
 import * as Daemon from "@ker-ai/daemon";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
+import { identityChangeRemediation } from "./error.ts";
 import { runLogin, runLogout } from "./login.ts";
 import { sseData } from "./sse.ts";
 
 const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
 
 // The `ker` bin: a leading `--json` dumps each raw event as JSON; otherwise only the assistant's
-// answer streams to stdout. The sole argument `daemon`/`login`/`logout` runs that; anything else is
-// a prompt sent to the daemon.
+// answer streams to stdout. A sole command argument runs that operation; anything else is a prompt
+// sent to the daemon.
 export async function run(): Promise<void> {
 	let args = process.argv.slice(2);
 	const json = args[0] === "--json";
@@ -25,13 +26,32 @@ export async function run(): Promise<void> {
 		await runLogout();
 		return;
 	}
+	if (args.length === 1 && args[0] === "new") {
+		await runNewConversation();
+		return;
+	}
 	const prompt = args.join(" ").trim();
 	if (!prompt) {
-		process.stderr.write("usage: ker [--json] <prompt> | ker daemon | ker login | ker logout\n");
+		process.stderr.write("usage: ker [--json] <prompt> | ker daemon | ker login | ker logout | ker new\n");
 		process.exitCode = 1;
 		return;
 	}
 	await runPrompt(prompt, json);
+}
+
+async function runNewConversation(): Promise<void> {
+	if (!(await checkHealth())) return;
+	const res = await fetch(`${BASE}/conversation/new`, { method: "POST" });
+	if (res.status === 204) {
+		process.stderr.write("Started a new conversation.\n");
+		return;
+	}
+	process.stderr.write(
+		res.status === 409
+			? "ker: daemon is busy — wait for the turn to finish before starting a new conversation\n"
+			: `ker: daemon could not start a new conversation (HTTP ${res.status})\n`,
+	);
+	process.exitCode = 1;
 }
 
 // Host the daemon in the foreground, bound to loopback only — a bare listen(port) would expose
@@ -63,7 +83,8 @@ function runDaemon(): void {
 // are their surface. With `json`, each raw event is echoed as one JSON line on stdout. Breaking the loop cancels
 // the stream; no process.exit.
 async function runPrompt(prompt: string, json: boolean): Promise<void> {
-	if (!(await checkHealth())) return;
+	const health = await checkHealth();
+	if (!health) return;
 
 	const events = await fetch(`${BASE}/event`);
 	if (!events.ok || events.body === null) {
@@ -75,14 +96,16 @@ async function runPrompt(prompt: string, json: boolean): Promise<void> {
 	const submitted = await fetch(`${BASE}/prompt`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ text: prompt }),
+		body: JSON.stringify({ text: prompt, generation: health.generation }),
 	});
 	if (submitted.status !== 202) {
 		await events.body.cancel();
 		process.stderr.write(
 			submitted.status === 409
 				? "ker: daemon is busy with another turn\n"
-				: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
+				: submitted.status === 412
+					? "ker: a new conversation was started before this prompt arrived — resubmit it\n"
+					: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
 		);
 		process.exitCode = 1;
 		return;
@@ -110,6 +133,8 @@ async function runPrompt(prompt: string, json: boolean): Promise<void> {
 		}
 		if (event.type === "error") {
 			process.stderr.write(`\nker: ${event.message}\n`);
+			const remediation = identityChangeRemediation(event);
+			if (remediation) process.stderr.write(`ker: ${remediation}\n`);
 			process.exitCode = 1;
 			terminal = true;
 		}
@@ -123,13 +148,14 @@ async function runPrompt(prompt: string, json: boolean): Promise<void> {
 }
 
 // Fail fast before subscribing: a refused connection means no daemon is running, and a protocol
-// mismatch means a stale daemon from an older build is still up. fetch buries the refusal as a
-// TypeError whose cause carries the ECONNREFUSED code.
-async function checkHealth(): Promise<boolean> {
+// mismatch means a stale daemon from an older build is still up. On success returns the daemon's
+// conversation generation, which a prompt echoes back so a reset in between is detected. fetch
+// buries the refusal as a TypeError whose cause carries the ECONNREFUSED code.
+async function checkHealth(): Promise<{ generation: number } | undefined> {
 	try {
 		const res = await fetch(`${BASE}/health`);
-		const health = (await res.json()) as { protocol?: string };
-		if (health.protocol === PROTOCOL_VERSION) return true;
+		const health = (await res.json()) as { protocol?: string; generation?: number };
+		if (health.protocol === PROTOCOL_VERSION) return { generation: health.generation ?? 0 };
 		process.stderr.write(
 			`ker: daemon speaks protocol ${health.protocol}, this client needs ${PROTOCOL_VERSION} — restart the daemon\n`,
 		);
@@ -145,5 +171,5 @@ async function checkHealth(): Promise<boolean> {
 		);
 	}
 	process.exitCode = 1;
-	return false;
+	return undefined;
 }

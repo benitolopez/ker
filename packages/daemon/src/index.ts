@@ -14,24 +14,20 @@ const ALLOWED_HOSTS = new Set([`127.0.0.1:${DEFAULT_PORT}`, `localhost:${DEFAULT
 // One harness (a single in-memory conversation) behind a hand-rolled HTTP+SSE server. The daemon
 // runs each turn to completion itself — appending events to a log and writing them to SSE
 // subscribers — so a turn keeps going even if the client disconnects; POST /prompt only
-// acknowledges. Returns without listening: the bin owns process concerns (port, signals, bind errors).
-export function createDaemon(): Server {
-	const config = Config.loadConfig();
-	const harness = Engine.createHarness({
-		model: config.model,
-		getAuth: () => Auth.resolveAuth(config.apiKey),
-		tools: Agent.tools,
-		systemPrompt: Agent.systemPrompt,
-		reasoningEffort: config.reasoningEffort,
-	});
+// acknowledges. An idle reset clears the model context, trims the event log, and tells every
+// subscriber. Returns without listening: the bin owns process concerns (port, signals, bind errors).
+export function createDaemon(harness: Harness = createConfiguredHarness()): Server {
 	const log: Protocol.Event[] = [];
 	const subscribers = new Set<ServerResponse>();
 	let busy = false;
+	let generation = 0;
+	let idBase = 0;
 
-	// Append to the log and fan out one SSE frame. The frame id is the event's log index — the seed
-	// for Last-Event-ID catch-up. The log grows unbounded in memory; nothing bounds or persists it.
+	// Append to the log and fan out one SSE frame. The frame id is idBase plus the log index — the
+	// seed for Last-Event-ID catch-up. The log grows unbounded within a conversation; a reset empties
+	// it and folds its length into idBase, so ids stay monotonic and discarded events are freed.
 	function broadcast(event: Protocol.Event): void {
-		const frame = `id: ${log.length}\ndata: ${JSON.stringify(event)}\n\n`;
+		const frame = `id: ${idBase + log.length}\ndata: ${JSON.stringify(event)}\n\n`;
 		log.push(event);
 		for (const res of subscribers) {
 			if (!res.destroyed) res.write(frame);
@@ -57,14 +53,11 @@ export function createDaemon(): Server {
 
 	// Guard a prompt submission: Host/Origin checks keep browser pages from driving the agent
 	// cross-origin until real auth exists; the size cap is checked both up front and mid-read.
+	// The prompt must name the conversation generation it was composed against, so a prompt in
+	// flight during a reset is refused (412) instead of landing in the fresh conversation.
 	// Never throws — a client abort mid-upload or bad JSON lands in the catch as a 400.
 	async function handlePrompt(req: IncomingMessage, res: ServerResponse): Promise<void> {
-		if (!ALLOWED_HOSTS.has(req.headers.host ?? "")) {
-			res.writeHead(403).end();
-			return;
-		}
-		const origin = req.headers.origin;
-		if (origin !== undefined && !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+		if (!isLocalRequest(req)) {
 			res.writeHead(403).end();
 			return;
 		}
@@ -87,9 +80,13 @@ export function createDaemon(): Server {
 				}
 				chunks.push(chunk);
 			}
-			const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { text?: unknown };
-			if (typeof parsed.text !== "string" || parsed.text.trim() === "") {
+			const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { text?: unknown; generation?: unknown };
+			if (typeof parsed.text !== "string" || parsed.text.trim() === "" || typeof parsed.generation !== "number") {
 				res.writeHead(400).end();
+				return;
+			}
+			if (parsed.generation !== generation) {
+				res.writeHead(412).end();
 				return;
 			}
 			if (busy) {
@@ -103,15 +100,36 @@ export function createDaemon(): Server {
 		}
 	}
 
+	function handleNewConversation(req: IncomingMessage, res: ServerResponse): void {
+		if (!isLocalRequest(req)) {
+			res.writeHead(403).end();
+			return;
+		}
+		if (busy) {
+			res.writeHead(409).end();
+			return;
+		}
+		harness.reset();
+		generation++;
+		idBase += log.length;
+		log.length = 0;
+		broadcast({ role: "system", type: "conversation_reset" });
+		res.writeHead(204).end();
+	}
+
 	const server = createServer((req, res) => {
 		if (req.method === "GET" && req.url === "/health") {
 			res.writeHead(200, { "content-type": "application/json" });
-			res.end(JSON.stringify({ name: "ker", protocol: PROTOCOL_VERSION }));
+			res.end(JSON.stringify({ name: "ker", protocol: PROTOCOL_VERSION, generation }));
 			return;
 		}
 		// flushHeaders is load-bearing: Node buffers the header block until the first body write,
 		// and a client awaiting fetch("/event") would deadlock against its own POST without it.
 		if (req.method === "GET" && req.url === "/event") {
+			if (!isLocalRequest(req)) {
+				res.writeHead(403).end();
+				return;
+			}
 			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
 			res.flushHeaders();
 			subscribers.add(res);
@@ -120,6 +138,10 @@ export function createDaemon(): Server {
 		}
 		if (req.method === "POST" && req.url === "/prompt") {
 			void handlePrompt(req, res);
+			return;
+		}
+		if (req.method === "POST" && req.url === "/conversation/new") {
+			handleNewConversation(req, res);
 			return;
 		}
 		res.writeHead(404).end();
@@ -135,4 +157,26 @@ export function createDaemon(): Server {
 	heartbeat.unref();
 
 	return server;
+}
+
+interface Harness {
+	reset(): void;
+	send(text: string): AsyncIterable<Protocol.Event>;
+}
+
+function createConfiguredHarness(): Harness {
+	const config = Config.loadConfig();
+	return Engine.createHarness({
+		model: config.model,
+		getAuth: () => Auth.resolveAuth(config.apiKey),
+		tools: Agent.tools,
+		systemPrompt: Agent.systemPrompt,
+		reasoningEffort: config.reasoningEffort,
+	});
+}
+
+function isLocalRequest(req: IncomingMessage): boolean {
+	if (!ALLOWED_HOSTS.has(req.headers.host ?? "")) return false;
+	const origin = req.headers.origin;
+	return origin === undefined || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 }

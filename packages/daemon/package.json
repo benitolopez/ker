@@ -10,6 +10,7 @@
   "dependencies": { "@ker-ai/agent": "^0.0.0", "@ker-ai/auth": "^0.0.0", "@ker-ai/protocol": "^0.0.0", "@ker-ai/config": "^0.0.0", "@ker-ai/engine": "^0.0.0" },
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
-    "clean": "shx rm -rf dist"
+    "clean": "shx rm -rf dist",
+    "test": "node --test test/*.test.ts"
   }
 }

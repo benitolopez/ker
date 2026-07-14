@@ -1,6 +1,6 @@
 // Wire contract between the daemon and its clients.
 
-export type Role = "user" | "assistant" | "tool";
+export type Role = "user" | "assistant" | "tool" | "system";
 
 export interface EventBase {
 	role: Role;
@@ -30,9 +30,20 @@ export interface UsageEvent extends EventBase {
 	total: number;
 }
 
+// The credential a conversation is bound to. OAuth logins are told apart by account; API keys
+// all count as one identity.
+export type Identity = { kind: "apikey" } | { kind: "oauth"; accountId: string };
+
+export type ErrorCode = "identity_changed";
+
+// `code` marks failures a client can act on. An identity_changed error also carries the bound
+// (`expected`) and active (`actual`) identities, so each client writes its own remediation.
 export interface ErrorEvent extends EventBase {
 	type: "error";
 	message: string;
+	code?: ErrorCode;
+	expected?: Identity;
+	actual?: Identity;
 }
 
 export interface RetryEvent extends EventBase {
@@ -53,6 +64,13 @@ export interface AuthEvent extends EventBase {
 // fires per model turn; this fires once at the very end, so a client knows the turn sequence is over.
 export interface EndEvent extends EventBase {
 	type: "end";
+}
+
+// The daemon discarded the model context and removed its credential binding. Connected clients
+// receive this even when another client requested the reset.
+export interface ConversationResetEvent extends EventBase {
+	role: "system";
+	type: "conversation_reset";
 }
 
 // The model asked to run a tool, before it runs. `id` is the provider call id, echoed on the
@@ -85,10 +103,11 @@ export type Event =
 	| RetryEvent
 	| AuthEvent
 	| EndEvent
+	| ConversationResetEvent
 	| ToolCallEvent
 	| ToolResultEvent;
 
-export const PROTOCOL_VERSION = "1" as const;
+export const PROTOCOL_VERSION = "2" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree
 // on it, so it lives here rather than in config.
