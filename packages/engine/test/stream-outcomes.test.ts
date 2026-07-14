@@ -267,6 +267,52 @@ test("stops before a tool follow-up when the oauth account changes mid-turn", as
 	]);
 });
 
+test("stops before a tool follow-up when auth changes from oauth to an api key", async () => {
+	const observed = { useApiKey: false, streamCalls: 0 };
+	const switchAuth: Tool = {
+		name: "switch_auth",
+		description: "Switch the active authentication",
+		parameters: { type: "object" },
+		async execute() {
+			observed.useApiKey = true;
+			return "switched";
+		},
+	};
+	const harness = createHarness(
+		{
+			...createConfig([switchAuth]),
+			getAuth: async () =>
+				observed.useApiKey
+					? { kind: "apikey", key: "test" }
+					: { kind: "oauth", accessToken: "token", accountId: "acc_old" },
+		},
+		{
+			stream: async function* () {
+				observed.streamCalls++;
+				yield { type: "tool_call", callId: "call_1", name: "switch_auth", arguments: "{}" };
+				yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+			},
+		},
+	);
+
+	const events = await collectEvents(harness.send("hello"));
+
+	assert.deepEqual(
+		events.filter((event) => event.type === "auth"),
+		[{ role: "assistant", type: "auth", mode: "oauth" }],
+	);
+	assert.deepEqual(events.at(-2), {
+		role: "assistant",
+		type: "error",
+		code: "identity_changed",
+		expected: { kind: "oauth", accountId: "acc_old" },
+		actual: { kind: "apikey" },
+		message: "Conversation belongs to OAuth account acc_old, but an API key is active.",
+	});
+	assert.deepEqual(events.at(-1), { role: "assistant", type: "end" });
+	assert.equal(observed.streamCalls, 1);
+});
+
 test("resolves fresh auth before retrying the provider", async () => {
 	const observed = { authCalls: 0, streamCalls: 0, providerKeys: [] as string[] };
 	const harness = createHarness(
@@ -294,6 +340,40 @@ test("resolves fresh auth before retrying the provider", async () => {
 		{ role: "assistant", type: "end" },
 	]);
 	assert.deepEqual(observed, { authCalls: 2, streamCalls: 2, providerKeys: ["key-1", "key-2"] });
+});
+
+test("stops a retry when auth changes from oauth to an api key", async () => {
+	const observed = { authCalls: 0, streamCalls: 0 };
+	const harness = createHarness(
+		{
+			...createConfig(),
+			getAuth: async () =>
+				++observed.authCalls === 1
+					? { kind: "oauth", accessToken: "token", accountId: "acc_old" }
+					: { kind: "apikey", key: "test" },
+		},
+		{
+			stream: async function* () {
+				observed.streamCalls++;
+				yield { type: "error", message: "retry me", retryable: true, retryAfterMs: 0 };
+			},
+		},
+	);
+
+	assert.deepEqual(await collectEvents(harness.send("hello")), [
+		{ role: "assistant", type: "auth", mode: "oauth" },
+		{ role: "assistant", type: "retry", attempt: 1, maxAttempts: 3, delayMs: 0, message: "retry me" },
+		{
+			role: "assistant",
+			type: "error",
+			code: "identity_changed",
+			expected: { kind: "oauth", accountId: "acc_old" },
+			actual: { kind: "apikey" },
+			message: "Conversation belongs to OAuth account acc_old, but an API key is active.",
+		},
+		{ role: "assistant", type: "end" },
+	]);
+	assert.deepEqual(observed, { authCalls: 2, streamCalls: 1 });
 });
 
 test("keeps an admitted prompt when the provider rejects it", async () => {

@@ -54,7 +54,8 @@ export interface RetryEvent extends EventBase {
 	message: string;
 }
 
-// Which credential the turn ran on: a plain API key, or a ChatGPT-subscription OAuth login.
+// The conversation-bound credential mode, emitted once per accepted prompt. Retries and tool turns
+// keep that identity. A daemon /auth/status endpoint would let clients query this state instead.
 export interface AuthEvent extends EventBase {
 	type: "auth";
 	mode: "apikey" | "oauth";
