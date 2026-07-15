@@ -48,7 +48,7 @@ const read: Tool = {
 			throw new Error("read: 'limit' must be a number >= 1");
 		}
 		const raw = await readFile(resolve(path), "utf8");
-		return formatRead(raw, offset, limit);
+		return formatRead(raw, offset, limit, path);
 	},
 };
 
@@ -161,9 +161,9 @@ const bash: Tool = {
 
 export const tools: Tool[] = [read, write, edit, bash];
 
-// Number every line, then keep whole lines until either output cap trips. The first line is always kept,
-// even if it exceeds the byte cap. When lines remain, append the offset needed to continue.
-export function formatRead(raw: string, offset: number | undefined, limit: number | undefined): string {
+// Number every line while keeping the complete result within both output caps. An oversized first line
+// is cut at a UTF-8 boundary and carries a byte-exact bash command for reading the remainder.
+export function formatRead(raw: string, offset: number | undefined, limit: number | undefined, path: string): string {
 	const lines = raw.split("\n");
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 	const total = lines.length;
@@ -173,19 +173,53 @@ export function formatRead(raw: string, offset: number | undefined, limit: numbe
 	const userEnd = limit !== undefined ? Math.min(start + limit, total) : total;
 
 	const shown: string[] = [];
+	const sizes: number[] = [];
 	let bytes = 0;
 	let end = start;
 	for (; end < userEnd; end++) {
 		const line = `${end + 1}: ${lines[end]}`;
-		const size = Buffer.byteLength(line, "utf8") + 1;
-		if (shown.length > 0 && (shown.length >= MAX_OUTPUT_LINES || bytes + size > MAX_OUTPUT_BYTES)) break;
+		const size = Buffer.byteLength(line, "utf8") + (shown.length > 0 ? 1 : 0);
+		if (shown.length >= MAX_OUTPUT_LINES || bytes + size > MAX_OUTPUT_BYTES) break;
 		shown.push(line);
+		sizes.push(size);
 		bytes += size;
 	}
 
 	const body = shown.join("\n");
 	if (end >= total) return body;
-	return `${body}\n\n[showing lines ${start + 1}-${end} of ${total}; use offset=${end + 1} to continue]`;
+
+	while (shown.length > 0) {
+		const note = `\n\n[showing lines ${start + 1}-${end} of ${total}; use offset=${end + 1} to continue]`;
+		if (bytes + Buffer.byteLength(note, "utf8") <= MAX_OUTPUT_BYTES) return `${shown.join("\n")}${note}`;
+		shown.pop();
+		bytes -= sizes.pop() ?? 0;
+		end--;
+	}
+
+	return formatOversizedReadLine(lines, start, path);
+}
+
+// Reserve the notice before cutting the line so the complete result stays within the byte cap.
+function formatOversizedReadLine(lines: string[], start: number, path: string): string {
+	const prefix = `${start + 1}: `;
+	const lineStartBytes = start === 0 ? 0 : Buffer.byteLength(lines.slice(0, start).join("\n"), "utf8") + 1;
+	const quotedPath = `'${path.replaceAll("'", "'\\''")}'`;
+	const largestNextByte = lineStartBytes + MAX_OUTPUT_BYTES + 1;
+	const reservedNote =
+		`\n\n[line ${start + 1} truncated to keep the read result within ${MAX_OUTPUT_BYTES / 1024}KB; ` +
+		`use bash to inspect the remainder: tail -c +${largestNextByte} -- ${quotedPath} | head -c ${MAX_OUTPUT_BYTES}]`;
+	const lineBytes = Buffer.from(lines[start], "utf8");
+	const available = Math.max(
+		0,
+		MAX_OUTPUT_BYTES - Buffer.byteLength(prefix, "utf8") - Buffer.byteLength(reservedNote, "utf8"),
+	);
+	let sliceEnd = Math.min(available, lineBytes.length);
+	while (sliceEnd > 0 && sliceEnd < lineBytes.length && (lineBytes[sliceEnd] & 0xc0) === 0x80) sliceEnd--;
+	const nextByte = lineStartBytes + sliceEnd + 1;
+	const note =
+		`\n\n[line ${start + 1} truncated to keep the read result within ${MAX_OUTPUT_BYTES / 1024}KB; ` +
+		`use bash to inspect the remainder: tail -c +${nextByte} -- ${quotedPath} | head -c ${MAX_OUTPUT_BYTES}]`;
+	return `${prefix}${lineBytes.subarray(0, sliceEnd).toString("utf8")}${note}`;
 }
 
 // Replace an exact substring in a file's content, preserving the file's own line endings and BOM. old_string
