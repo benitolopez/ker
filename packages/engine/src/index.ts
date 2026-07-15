@@ -79,10 +79,11 @@ type TurnOutcome = { kind: "stopped" } | { kind: "done"; toolCalls: Llm.ToolCall
 
 // Stream one model turn: re-emit text deltas and tool-call notices as protocol events, record the finished
 // assistant message (text, tool calls, reasoning) into history on completion, and return its tool calls for
-// the loop to run. Retries fire only before the first token — every transient failure is a connect-phase
-// error, and streamed text can't be unprinted. A retryable error waits for the server's Retry-After when
-// given, else a capped exponential backoff, announced as a retry event first. Retries and later tool turns
-// resolve auth again, so an OAuth token refreshed between requests is used; a resolution failure ends the turn.
+// the loop to run. Retries fire only before provider output: visible deltas can't be unprinted, and completed
+// tool calls or reasoning items can't be safely regenerated. A retryable error waits for the server's
+// Retry-After when given, else a capped exponential backoff, announced as a retry event first. Retries and
+// later tool turns resolve auth again, so an OAuth token refreshed between requests is used; a resolution
+// failure ends the turn.
 async function* streamTurn(
 	config: EngineConfig,
 	dependencies: Dependencies,
@@ -102,7 +103,7 @@ async function* streamTurn(
 		let reply = "";
 		const toolCalls: Llm.ToolCall[] = [];
 		const reasoning: unknown[] = [];
-		let sawToken = false;
+		let sawOutput = false;
 		let pending: { delayMs: number; message: string } | undefined;
 
 		for await (const event of dependencies.stream(config.model, messages, auth, {
@@ -110,8 +111,8 @@ async function* streamTurn(
 			instructions: config.systemPrompt,
 			reasoningEffort: config.reasoningEffort,
 		})) {
+			if (event.type !== "done" && event.type !== "error") sawOutput = true;
 			if (event.type === "delta") {
-				sawToken = true;
 				reply += event.text;
 				yield { role: "assistant", type: "message_delta", text: event.text };
 			}
@@ -134,7 +135,7 @@ async function* streamTurn(
 				return { kind: "done", toolCalls };
 			}
 			if (event.type === "error") {
-				if (!sawToken && event.retryable && attempt < MAX_RETRIES) {
+				if (!sawOutput && event.retryable && attempt < MAX_RETRIES) {
 					const delayMs = Math.min(event.retryAfterMs ?? BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
 					pending = { delayMs, message: event.message };
 					break;

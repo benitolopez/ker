@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 import { createHarness, type EngineConfig, type Tool } from "../src/index.ts";
 
@@ -340,6 +341,53 @@ test("resolves fresh auth before retrying the provider", async () => {
 		{ role: "assistant", type: "end" },
 	]);
 	assert.deepEqual(observed, { authCalls: 2, streamCalls: 2, providerKeys: ["key-1", "key-2"] });
+});
+
+test("does not retry after provider output", async (t) => {
+	const scenarios: { name: string; output: Llm.Event; visible: Protocol.Event[] }[] = [
+		{
+			name: "answer delta",
+			output: { type: "delta", text: "partial answer" },
+			visible: [{ role: "assistant", type: "message_delta", text: "partial answer" }],
+		},
+		{
+			name: "reasoning delta",
+			output: { type: "reasoning_delta", text: "partial reasoning" },
+			visible: [{ role: "assistant", type: "reasoning_delta", text: "partial reasoning" }],
+		},
+		{
+			name: "completed tool call",
+			output: { type: "tool_call", callId: "call_1", name: "lookup", arguments: "{}" },
+			visible: [{ role: "tool", type: "tool_call", id: "call_1", name: "lookup", arguments: "{}" }],
+		},
+		{
+			name: "completed reasoning item",
+			output: { type: "reasoning", item: { type: "reasoning", encrypted_content: "encrypted" } },
+			visible: [],
+		},
+	];
+
+	for (const scenario of scenarios) {
+		await t.test(scenario.name, async () => {
+			const observed = { streamCalls: 0 };
+			const harness = createHarness(createConfig(), {
+				stream: async function* () {
+					observed.streamCalls++;
+					yield scenario.output;
+					yield { type: "error", message: "stream failed", retryable: true, retryAfterMs: 0 };
+				},
+			});
+
+			assert.deepEqual(await collectEvents(harness.send("hello")), [
+				{ role: "assistant", type: "auth", mode: "apikey" },
+				...scenario.visible,
+				{ role: "assistant", type: "error", message: "stream failed" },
+				{ role: "assistant", type: "end" },
+			]);
+			assert.equal(observed.streamCalls, 1);
+			assert.deepEqual(harness.messages, [{ role: "user", content: "hello" }]);
+		});
+	}
 });
 
 test("stops a retry when auth changes from oauth to an api key", async () => {
