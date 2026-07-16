@@ -11,10 +11,14 @@ until the model returns its final answer.
 - A long-lived **daemon** that holds the conversation, and a thin `ker` client that talks to
   it over HTTP.
 - A streaming tool-call loop using the OpenAI Responses API, with its own retry/backoff on
-  transient failures.
+  transient failures before provider output starts.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
 - Conversation memory that lives in the daemon: start a turn in one terminal, continue from
   another — it remembers, because the client is disposable and the daemon isn't.
+- OpenAI API-key authentication and an optional ChatGPT OAuth login. A conversation stays bound
+  to the credential identity that started it.
+- Bounded tool output: `read` pages large files, and `bash` keeps a bounded tail while spilling
+  the full stream to a private temporary file.
 
 Not there yet: saved sessions, abort, a TUI, or any provider other than OpenAI.
 
@@ -43,7 +47,8 @@ ker needs either an OpenAI API key or a ChatGPT Plus/Pro subscription.
 }
 ```
 
-Or set `OPENAI_API_KEY` in the environment. `model` is optional and defaults to `gpt-5.4-mini`.
+Or set `OPENAI_API_KEY` in the environment. `model` is optional and defaults to `gpt-5.4-mini`;
+`reasoningEffort` is optional and accepts `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
 
 **ChatGPT subscription.** Sign in with your OpenAI account instead of a key:
 
@@ -63,8 +68,11 @@ Forget the subscription login with:
 npx ker logout
 ```
 
-When both are configured the subscription wins; `ker logout` reverts to the key. Use `--json`
-when sending a prompt to inspect the authentication event and the rest of the raw event stream.
+When both are configured the subscription wins; `ker logout` reverts to the key. The daemon reads
+the stored login before every provider request, so login, refresh, and logout do not require a daemon
+restart. An existing conversation refuses a different OAuth account or a switch between OAuth and an
+API key; use `ker new` to clear its history and credential binding. Use `--json` when sending a prompt
+to inspect the authentication event and the rest of the raw event stream.
 
 ## Usage
 
@@ -81,6 +89,12 @@ npx ker "my name is Beni"
 npx ker "what's my name?"
 ```
 
+Start a fresh in-memory conversation with:
+
+```sh
+npx ker new
+```
+
 Assistant text goes to stdout and errors go to stderr. Pass `--json` before the prompt to print
 every raw event, including tool calls, tool results, reasoning summaries, authentication, and
 token usage:
@@ -89,4 +103,5 @@ token usage:
 npx ker --json "my name is Beni"
 ```
 
-Stop the daemon with Ctrl-C; restarting it clears the conversation (nothing is saved yet).
+Stop the daemon with Ctrl-C; restarting it clears the conversation (nothing is saved yet). `ker new`
+also clears the current conversation without stopping the daemon, but only while no turn is running.
