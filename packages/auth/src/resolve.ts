@@ -12,7 +12,8 @@ const EXPIRY_SKEW_MS = 60_000;
 
 // Resolve the credential for a request: a stored OAuth login (refreshed if within a minute of expiry)
 // takes precedence over the caller's API key. The store is read on every call, so a login saved after
-// the daemon started is used without a restart. Throws only when neither a login nor an API key exists.
+// the daemon started is used without a restart. Throws when an OAuth credential cannot be refreshed or
+// when neither a login nor an API key exists.
 export async function resolveAuth(fallbackApiKey?: string): Promise<Auth> {
 	const cred = readCredential();
 	if (cred) {
