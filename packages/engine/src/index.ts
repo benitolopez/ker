@@ -24,8 +24,8 @@ const MAX_DELAY_MS = 30_000;
 
 // Holds one credential-bound conversation in memory and runs the agent loop. Each send takes turns until
 // the model answers without asking for a tool: a turn streams one reply, and any tools it requested run
-// with their results appended to history, so the next turn sees them. No turn cap — a runaway loop is
-// only stopped by aborting the turn, but the daemon has no graceful turn cancellation. Initial auth is
+// with their results appended to history, so the next turn sees them. There is no turn cap or graceful
+// cancellation, so a runaway loop continues until its host process stops. Initial auth is
 // resolved and checked before the user enters history, then reused for the first provider attempt.
 export function createHarness(config: EngineConfig, dependencies: Dependencies = { stream: Llm.stream }) {
 	const messages: Llm.Message[] = [];
