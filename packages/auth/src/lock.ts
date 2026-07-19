@@ -12,7 +12,8 @@ export interface Lock {
 // stale-lock recovery are needed. Waiting never uses SQLite's busy timeout, because node:sqlite is
 // synchronous and would block the event loop; contention surfaces as an immediate SQLITE_BUSY and
 // is retried after an async sleep until the deadline.
-export async function acquireLock(path: string, timeoutMs: number): Promise<Lock> {
+export async function acquireLock(path: string, timeoutMs: number, signal?: AbortSignal): Promise<Lock> {
+	signal?.throwIfAborted();
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const db = new DatabaseSync(path);
 	const deadline = Date.now() + timeoutMs;
@@ -37,7 +38,12 @@ export async function acquireLock(path: string, timeoutMs: number): Promise<Lock
 				db.close();
 				throw new Error(`Timed out waiting for the lock at ${path}`);
 			}
-			await sleep(50 + Math.random() * 100);
+			try {
+				await sleep(50 + Math.random() * 100, undefined, { signal });
+			} catch (error) {
+				db.close();
+				throw error;
+			}
 		}
 	}
 }

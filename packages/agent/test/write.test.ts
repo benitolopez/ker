@@ -74,3 +74,16 @@ test("rejects a non-string or empty path", async () => {
 test("rejects non-string content", async () => {
 	await assert.rejects(write.execute({ path: "placeholder.txt", content: 42 }), /'content' must be a string/);
 });
+
+test("does not start a write when the turn is already aborted", async (t) => {
+	const dir = await tempDir(t);
+	const path = join(dir, "cancelled.txt");
+	const controller = new AbortController();
+	controller.abort();
+
+	await assert.rejects(
+		write.execute({ path, content: "should not be written" }, controller.signal),
+		(error: unknown) => error instanceof DOMException && error.name === "AbortError",
+	);
+	assert.equal(existsSync(path), false);
+});

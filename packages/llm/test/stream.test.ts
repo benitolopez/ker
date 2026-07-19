@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
-import OpenAI from "openai";
+import OpenAI, { APIUserAbortError } from "openai";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
 import { type Event, stream } from "../src/index.ts";
 
@@ -64,6 +64,28 @@ test("rejects an incomplete response without a recognized reason", async (t) => 
 			retryable: false,
 		},
 	]);
+});
+
+test("passes the abort signal to OpenAI and reports cancellation separately", async (t) => {
+	const controller = new AbortController();
+	controller.abort();
+	t.mock.method(responsesPrototype, "create", (...args: Parameters<OpenAI["responses"]["create"]>) => {
+		const options = args[1];
+		assert.equal(options?.signal, controller.signal);
+		throw new APIUserAbortError();
+	});
+
+	const events: Event[] = [];
+	for await (const event of stream(
+		"gpt-5",
+		[{ role: "user", content: "hello" }],
+		{ kind: "apikey", key: "test" },
+		{ signal: controller.signal },
+	)) {
+		events.push(event);
+	}
+
+	assert.deepEqual(events, [{ type: "aborted" }]);
 });
 
 function mockStream(t: TestContext, events: ResponseStreamEvent[]) {

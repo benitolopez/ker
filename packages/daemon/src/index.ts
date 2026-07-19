@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import * as Agent from "@ker-ai/agent";
@@ -14,13 +15,14 @@ const ALLOWED_HOSTS = new Set([`127.0.0.1:${DEFAULT_PORT}`, `localhost:${DEFAULT
 // One harness (a single in-memory conversation) behind a hand-rolled HTTP+SSE server. The daemon
 // runs each turn to completion itself — appending events to a log and writing them to SSE
 // subscribers — so a turn keeps going even if the client disconnects; POST /prompt only
-// acknowledges. An idle reset clears the model context, trims the event log, and tells every
-// subscriber. Returns without listening: the bin owns process concerns (port, signals, bind errors).
+// acknowledges with the turn id. An idle reset creates a new session, clears the model context,
+// trims the event log, and tells every subscriber. Returns without listening: the bin owns process
+// concerns (port, signals, bind errors).
 export function createDaemon(harness: Harness = createConfiguredHarness()): Server {
 	const log: Protocol.Event[] = [];
 	const subscribers = new Set<ServerResponse>();
-	let busy = false;
-	let generation = 0;
+	let sessionId: Protocol.SessionId = randomUUID();
+	let activeTurn: ActiveTurn | undefined;
 	let idBase = 0;
 
 	// Append to the log and fan out one SSE frame. The frame id is idBase plus the log index — the
@@ -34,69 +36,105 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 		}
 	}
 
-	// Fire-and-forget turn driver. The catch turns a failure in the turn into a terminal error event —
-	// an unhandled rejection here would take down the whole daemon; the finally frees the turn slot.
-	// With no abort or timeout, a turn that never completes holds the slot and every later prompt 409s
-	// until the daemon restarts.
-	function pump(text: string): void {
-		busy = true;
+	// Drive one accepted turn independently of its submitting client. Every path publishes one end,
+	// marks the turn terminal before that frame is visible, and resolves done only after cleanup.
+	function pump(text: string, turn: ActiveTurn): void {
 		void (async () => {
+			let sawAborted = false;
 			try {
-				for await (const event of harness.send(text)) broadcast(event);
+				for await (const event of harness.send(text, turn.controller.signal)) {
+					if (turn.terminal) continue;
+					if (event.type === "aborted") sawAborted = true;
+					if (event.type === "end") {
+						turn.terminal = true;
+						broadcast(event);
+						continue;
+					}
+					broadcast(event);
+				}
 			} catch (err) {
-				broadcast({ role: "assistant", type: "error", message: err instanceof Error ? err.message : String(err) });
+				if (!turn.terminal && turn.controller.signal.aborted && !sawAborted) {
+					broadcast({ role: "assistant", type: "aborted" });
+				}
+				if (!turn.terminal && !turn.controller.signal.aborted) {
+					broadcast({ role: "assistant", type: "error", message: err instanceof Error ? err.message : String(err) });
+				}
 			} finally {
-				busy = false;
+				if (!turn.terminal) {
+					turn.terminal = true;
+					broadcast({ role: "assistant", type: "end" });
+				}
+				if (activeTurn === turn) activeTurn = undefined;
+				turn.done.resolve();
 			}
 		})();
 	}
 
 	// Guard a prompt submission: Host/Origin checks keep browser pages from driving the agent
 	// cross-origin until real auth exists; the size cap is checked both up front and mid-read.
-	// The prompt must name the conversation generation it was composed against, so a prompt in
-	// flight during a reset is refused (412) instead of landing in the fresh conversation.
+	// The prompt must name the session it was composed against, so a prompt in flight during a reset
+	// is refused (412) instead of landing in the fresh conversation.
 	// Never throws — a client abort mid-upload or bad JSON lands in the catch as a 400.
 	async function handlePrompt(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		if (!isLocalRequest(req)) {
 			res.writeHead(403).end();
 			return;
 		}
-		if (!req.headers["content-type"]?.startsWith("application/json")) {
-			res.writeHead(415).end();
-			return;
-		}
-		if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
-			res.writeHead(413).end();
-			return;
-		}
 		try {
-			const chunks: Buffer[] = [];
-			let size = 0;
-			for await (const chunk of req) {
-				size += chunk.length;
-				if (size > MAX_BODY_BYTES) {
-					res.writeHead(413).end();
-					return;
-				}
-				chunks.push(chunk);
-			}
-			const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { text?: unknown; generation?: unknown };
-			if (typeof parsed.text !== "string" || parsed.text.trim() === "" || typeof parsed.generation !== "number") {
-				res.writeHead(400).end();
+			const parsed = await readJsonBody(req, res);
+			if (
+				!isRecord(parsed) ||
+				typeof parsed.text !== "string" ||
+				parsed.text.trim() === "" ||
+				typeof parsed.sessionId !== "string"
+			) {
+				if (parsed !== undefined) res.writeHead(400).end();
 				return;
 			}
-			if (parsed.generation !== generation) {
+			if (parsed.sessionId !== sessionId) {
 				res.writeHead(412).end();
 				return;
 			}
-			if (busy) {
+			if (activeTurn) {
 				res.writeHead(409).end();
 				return;
 			}
-			pump(parsed.text);
-			res.writeHead(202).end();
+			const turn: ActiveTurn = {
+				sessionId,
+				turnId: randomUUID(),
+				controller: new AbortController(),
+				done: Promise.withResolvers<void>(),
+				terminal: false,
+			};
+			activeTurn = turn;
+			pump(parsed.text, turn);
+			writeJson(res, 202, { turnId: turn.turnId });
 		} catch {
-			res.writeHead(400).end();
+			if (!res.headersSent) res.writeHead(400).end();
+		}
+	}
+
+	async function handleAbort(req: IncomingMessage, res: ServerResponse): Promise<void> {
+		if (!isLocalRequest(req)) {
+			res.writeHead(403).end();
+			return;
+		}
+		try {
+			const parsed = await readJsonBody(req, res);
+			if (!isRecord(parsed) || typeof parsed.sessionId !== "string" || typeof parsed.turnId !== "string") {
+				if (parsed !== undefined) res.writeHead(400).end();
+				return;
+			}
+			const turn = activeTurn;
+			if (!turn || turn.terminal || parsed.sessionId !== turn.sessionId || parsed.turnId !== turn.turnId) {
+				res.writeHead(409).end();
+				return;
+			}
+			turn.controller.abort();
+			await turn.done.promise;
+			res.writeHead(204).end();
+		} catch {
+			if (!res.headersSent) res.writeHead(400).end();
 		}
 	}
 
@@ -105,22 +143,21 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 			res.writeHead(403).end();
 			return;
 		}
-		if (busy) {
+		if (activeTurn) {
 			res.writeHead(409).end();
 			return;
 		}
 		harness.reset();
-		generation++;
+		sessionId = randomUUID();
 		idBase += log.length;
 		log.length = 0;
 		broadcast({ role: "system", type: "conversation_reset" });
-		res.writeHead(204).end();
+		writeJson(res, 201, { sessionId });
 	}
 
 	const server = createServer((req, res) => {
 		if (req.method === "GET" && req.url === "/health") {
-			res.writeHead(200, { "content-type": "application/json" });
-			res.end(JSON.stringify({ name: "ker", protocol: PROTOCOL_VERSION, generation }));
+			writeJson(res, 200, { name: "ker", protocol: PROTOCOL_VERSION, sessionId });
 			return;
 		}
 		// flushHeaders is load-bearing: Node buffers the header block until the first body write,
@@ -138,6 +175,10 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 		}
 		if (req.method === "POST" && req.url === "/prompt") {
 			void handlePrompt(req, res);
+			return;
+		}
+		if (req.method === "POST" && req.url === "/turn/abort") {
+			void handleAbort(req, res);
 			return;
 		}
 		if (req.method === "POST" && req.url === "/conversation/new") {
@@ -161,14 +202,22 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 
 interface Harness {
 	reset(): void;
-	send(text: string): AsyncIterable<Protocol.Event>;
+	send(text: string, signal?: AbortSignal): AsyncIterable<Protocol.Event>;
+}
+
+interface ActiveTurn {
+	sessionId: Protocol.SessionId;
+	turnId: Protocol.TurnId;
+	controller: AbortController;
+	done: PromiseWithResolvers<void>;
+	terminal: boolean;
 }
 
 function createConfiguredHarness(): Harness {
 	const config = Config.loadConfig();
 	return Engine.createHarness({
 		model: config.model,
-		getAuth: () => Auth.resolveAuth(config.apiKey),
+		getAuth: (signal) => Auth.resolveAuth(config.apiKey, signal),
 		tools: Agent.tools,
 		systemPrompt: Agent.systemPrompt,
 		reasoningEffort: config.reasoningEffort,
@@ -179,4 +228,35 @@ function isLocalRequest(req: IncomingMessage): boolean {
 	if (!ALLOWED_HOSTS.has(req.headers.host ?? "")) return false;
 	const origin = req.headers.origin;
 	return origin === undefined || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+}
+
+async function readJsonBody(req: IncomingMessage, res: ServerResponse): Promise<unknown | undefined> {
+	if (!req.headers["content-type"]?.startsWith("application/json")) {
+		res.writeHead(415).end();
+		return undefined;
+	}
+	if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
+		res.writeHead(413).end();
+		return undefined;
+	}
+	const chunks: Buffer[] = [];
+	let size = 0;
+	for await (const chunk of req) {
+		size += chunk.length;
+		if (size > MAX_BODY_BYTES) {
+			res.writeHead(413).end();
+			return undefined;
+		}
+		chunks.push(chunk);
+	}
+	return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function writeJson(res: ServerResponse, status: number, body: object): void {
+	res.writeHead(status, { "content-type": "application/json" });
+	res.end(JSON.stringify(body));
 }

@@ -439,7 +439,7 @@ test("keeps an admitted prompt when the provider rejects it", async () => {
 	assert.deepEqual(harness.messages, [{ role: "user", content: "hello" }]);
 });
 
-test("keeps completed tool history when auth disappears before the next model turn", async () => {
+test("keeps completed tool history when auth disappears before the next model step", async () => {
 	const observed = { authCalls: 0 };
 	const lookup: Tool = {
 		name: "lookup",
@@ -547,6 +547,253 @@ test("saves a length-limited response without reporting an error", async () => {
 		{ role: "assistant", content: "truncated response", toolCalls: [], reasoning: [] },
 	]);
 	assert.deepEqual(observed, { streamCalls: 1 });
+});
+
+test("aborts before admission without saving the prompt or interruption marker", async () => {
+	const authStarted = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const harness = createHarness({
+		...createConfig(),
+		getAuth: (signal) =>
+			new Promise((_, reject) => {
+				authStarted.resolve();
+				signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+			}),
+	});
+
+	const collecting = collectEvents(harness.send("hello", controller.signal));
+	await authStarted.promise;
+	controller.abort();
+
+	assert.deepEqual(await collecting, [
+		{ role: "assistant", type: "aborted" },
+		{ role: "assistant", type: "end" },
+	]);
+	assert.deepEqual(harness.messages, []);
+});
+
+test("drops an incomplete assistant response and records an interruption marker", async () => {
+	const streamStarted = Promise.withResolvers<void>();
+	const deltaDelivered = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const harness = createHarness(createConfig(), {
+		stream: async function* (_model, _messages, _auth, options) {
+			streamStarted.resolve();
+			yield { type: "delta", text: "partial" };
+			deltaDelivered.resolve();
+			await new Promise<void>((resolve) => {
+				if (options?.signal?.aborted) {
+					resolve();
+					return;
+				}
+				options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			yield { type: "aborted" };
+		},
+	});
+
+	const collecting = collectEvents(harness.send("hello", controller.signal));
+	await streamStarted.promise;
+	await deltaDelivered.promise;
+	controller.abort();
+
+	assert.deepEqual(await collecting, [
+		{ role: "assistant", type: "auth", mode: "apikey" },
+		{ role: "assistant", type: "message_delta", text: "partial" },
+		{ role: "assistant", type: "aborted" },
+		{ role: "assistant", type: "end" },
+	]);
+	assert.deepEqual(harness.messages, [
+		{ role: "user", content: "hello" },
+		{
+			role: "developer",
+			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
+		},
+	]);
+});
+
+test("repairs a completed tool call from an interrupted provider response", async () => {
+	const controller = new AbortController();
+	const harness = createHarness(createConfig(), {
+		stream: async function* () {
+			yield { type: "delta", text: "partial" };
+			yield { type: "tool_call", callId: "call_1", name: "lookup", arguments: "{}" };
+			yield { type: "aborted" };
+		},
+	});
+	const events: Protocol.Event[] = [];
+
+	for await (const event of harness.send("hello", controller.signal)) {
+		events.push(event);
+		if (event.type === "tool_call") controller.abort();
+	}
+
+	assert.deepEqual(events.slice(-3), [
+		{
+			role: "tool",
+			type: "tool_result",
+			id: "call_1",
+			name: "lookup",
+			status: "error",
+			output: "Tool not executed because the turn was aborted.",
+		},
+		{ role: "assistant", type: "aborted" },
+		{ role: "assistant", type: "end" },
+	]);
+	assert.deepEqual(harness.messages, [
+		{ role: "user", content: "hello" },
+		{
+			role: "assistant",
+			content: "",
+			toolCalls: [{ callId: "call_1", itemId: undefined, name: "lookup", arguments: "{}" }],
+			reasoning: [],
+		},
+		{ role: "tool", toolCallId: "call_1", content: "Tool not executed because the turn was aborted." },
+		{
+			role: "developer",
+			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
+		},
+	]);
+});
+
+test("cancels retry backoff without another provider attempt", async () => {
+	const controller = new AbortController();
+	const observed = { streamCalls: 0 };
+	const harness = createHarness(createConfig(), {
+		stream: async function* () {
+			observed.streamCalls++;
+			yield { type: "error", message: "retry later", retryable: true, retryAfterMs: 60_000 };
+		},
+	});
+	const events: Protocol.Event[] = [];
+
+	for await (const event of harness.send("hello", controller.signal)) {
+		events.push(event);
+		if (event.type === "retry") controller.abort();
+	}
+
+	assert.deepEqual(events, [
+		{ role: "assistant", type: "auth", mode: "apikey" },
+		{ role: "assistant", type: "retry", attempt: 1, maxAttempts: 3, delayMs: 30_000, message: "retry later" },
+		{ role: "assistant", type: "aborted" },
+		{ role: "assistant", type: "end" },
+	]);
+	assert.equal(observed.streamCalls, 1);
+});
+
+test("repairs active and queued tool results before reporting the abort", async () => {
+	const toolStarted = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const first: Tool = {
+		name: "first",
+		description: "First tool",
+		parameters: { type: "object" },
+		execute: (_args, signal) =>
+			new Promise((_, reject) => {
+				toolStarted.resolve();
+				signal?.addEventListener("abort", () => reject(new Error("partial output")), { once: true });
+			}),
+	};
+	const second: Tool = {
+		name: "second",
+		description: "Second tool",
+		parameters: { type: "object" },
+		async execute() {
+			return "should not run";
+		},
+	};
+	const harness = createHarness(createConfig([first, second]), {
+		stream: async function* () {
+			yield { type: "tool_call", callId: "call_1", name: "first", arguments: "{}" };
+			yield { type: "tool_call", callId: "call_2", name: "second", arguments: "{}" };
+			yield { type: "done", reason: "stop", usage: { input: 3, output: 2, total: 5 } };
+		},
+	});
+
+	const collecting = collectEvents(harness.send("hello", controller.signal));
+	await toolStarted.promise;
+	controller.abort();
+	const events = await collecting;
+
+	assert.deepEqual(events.slice(-4), [
+		{
+			role: "tool",
+			type: "tool_result",
+			id: "call_1",
+			name: "first",
+			status: "error",
+			output: "partial output\n\n[aborted by user; tool may have partially executed]",
+		},
+		{
+			role: "tool",
+			type: "tool_result",
+			id: "call_2",
+			name: "second",
+			status: "error",
+			output: "Tool not executed because the turn was aborted.",
+		},
+		{ role: "assistant", type: "aborted" },
+		{ role: "assistant", type: "end" },
+	]);
+	assert.deepEqual(harness.messages.slice(-3), [
+		{
+			role: "tool",
+			toolCallId: "call_1",
+			content: "partial output\n\n[aborted by user; tool may have partially executed]",
+		},
+		{ role: "tool", toolCallId: "call_2", content: "Tool not executed because the turn was aborted." },
+		{
+			role: "developer",
+			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
+		},
+	]);
+});
+
+test("repairs every advertised tool when cancellation follows provider completion", async () => {
+	const controller = new AbortController();
+	const observed = { executions: 0 };
+	const lookup: Tool = {
+		name: "lookup",
+		description: "Look up a value",
+		parameters: { type: "object" },
+		async execute() {
+			observed.executions++;
+			return "should not run";
+		},
+	};
+	const harness = createHarness(createConfig([lookup]), {
+		stream: async function* () {
+			yield { type: "tool_call", callId: "call_1", name: "lookup", arguments: "{}" };
+			yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+		},
+	});
+	const events: Protocol.Event[] = [];
+
+	for await (const event of harness.send("hello", controller.signal)) {
+		events.push(event);
+		if (event.type === "usage") controller.abort();
+	}
+
+	assert.deepEqual(events.slice(-3), [
+		{
+			role: "tool",
+			type: "tool_result",
+			id: "call_1",
+			name: "lookup",
+			status: "error",
+			output: "Tool not executed because the turn was aborted.",
+		},
+		{ role: "assistant", type: "aborted" },
+		{ role: "assistant", type: "end" },
+	]);
+	assert.equal(observed.executions, 0);
+	assert.deepEqual(harness.messages.slice(-2), [
+		{ role: "tool", toolCallId: "call_1", content: "Tool not executed because the turn was aborted." },
+		{
+			role: "developer",
+			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
+		},
+	]);
 });
 
 function createConfig(tools: Tool[] = []): EngineConfig {

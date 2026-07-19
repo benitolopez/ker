@@ -54,7 +54,7 @@ export interface RetryEvent extends EventBase {
 	message: string;
 }
 
-// The conversation-bound credential mode, emitted once per accepted prompt. Retries and tool turns
+// The conversation-bound credential mode, emitted once per accepted prompt. Retries and tool steps
 // keep that identity. A daemon /auth/status endpoint would let clients query this state instead.
 export interface AuthEvent extends EventBase {
 	type: "auth";
@@ -62,9 +62,15 @@ export interface AuthEvent extends EventBase {
 }
 
 // The whole response is complete — the model answered without asking for another tool. A `usage` event
-// fires per model turn; this fires once at the very end, so a client knows the turn sequence is over.
+// fires per model request; this fires once at the very end, so a client knows the turn sequence is over.
 export interface EndEvent extends EventBase {
 	type: "end";
+}
+
+// The turn stopped before completion after its abort signal fired.
+export interface AbortedEvent extends EventBase {
+	role: "assistant";
+	type: "aborted";
 }
 
 // The daemon discarded the model context and removed its credential binding. Connected clients
@@ -103,12 +109,16 @@ export type Event =
 	| ErrorEvent
 	| RetryEvent
 	| AuthEvent
+	| AbortedEvent
 	| EndEvent
 	| ConversationResetEvent
 	| ToolCallEvent
 	| ToolResultEvent;
 
-export const PROTOCOL_VERSION = "2" as const;
+export type SessionId = string;
+export type TurnId = string;
+
+export const PROTOCOL_VERSION = "3" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree
 // on it, so it lives here rather than in config.

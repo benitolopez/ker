@@ -102,3 +102,32 @@ test("a timed-out command throws and its whole process group is killed", { timeo
 	}
 	assert.deepEqual(survivors, [], "a backgrounded grandchild outlived the group kill");
 });
+
+test("an aborted command keeps partial output and kills its process group", { timeout: 20000 }, async (t) => {
+	const marker = `sleep ${990000 + Math.floor(Math.random() * 9000)}`;
+	t.after(() => {
+		for (const pid of pidsMatching(marker)) {
+			try {
+				process.kill(Number(pid), "SIGKILL");
+			} catch {}
+		}
+	});
+	const controller = new AbortController();
+	const execution = bash.execute({ command: `printf "before"; ${marker} & ${marker}` }, controller.signal);
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	controller.abort();
+
+	await assert.rejects(execution, (error: unknown) => {
+		assert.ok(error instanceof Error);
+		assert.match(error.message, /^before/);
+		assert.match(error.message, /\[aborted by user; command may have partially executed\]/);
+		return true;
+	});
+
+	let survivors = pidsMatching(marker);
+	for (let i = 0; i < 30 && survivors.length > 0; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		survivors = pidsMatching(marker);
+	}
+	assert.deepEqual(survivors, [], "a backgrounded grandchild outlived the abort");
+});

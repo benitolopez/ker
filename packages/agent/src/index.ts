@@ -38,7 +38,7 @@ const read: Tool = {
 		required: ["path"],
 		additionalProperties: false,
 	},
-	async execute(args: unknown): Promise<string> {
+	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
 		const { path, offset, limit } = args as { path?: unknown; offset?: unknown; limit?: unknown };
 		if (typeof path !== "string" || path.trim() === "") throw new Error("read: 'path' must be a non-empty string");
 		if (offset !== undefined && (typeof offset !== "number" || offset < 1)) {
@@ -47,7 +47,8 @@ const read: Tool = {
 		if (limit !== undefined && (typeof limit !== "number" || limit < 1)) {
 			throw new Error("read: 'limit' must be a number >= 1");
 		}
-		const raw = await readFile(resolve(path), "utf8");
+		signal?.throwIfAborted();
+		const raw = await readFile(resolve(path), { encoding: "utf8", signal });
 		return formatRead(raw, offset, limit, path);
 	},
 };
@@ -68,13 +69,15 @@ const write: Tool = {
 		required: ["path", "content"],
 		additionalProperties: false,
 	},
-	async execute(args: unknown): Promise<string> {
+	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
 		const { path, content } = args as { path?: unknown; content?: unknown };
 		if (typeof path !== "string" || path.trim() === "") throw new Error("write: 'path' must be a non-empty string");
 		if (typeof content !== "string") throw new Error("write: 'content' must be a string");
 		const resolved = resolve(path);
 		const existed = existsSync(resolved);
+		signal?.throwIfAborted();
 		await mkdir(dirname(resolved), { recursive: true });
+		signal?.throwIfAborted();
 		await writeFile(resolved, content, "utf8");
 		return `${existed ? "Wrote" : "Created"} ${path} (${Buffer.byteLength(content, "utf8")} bytes)`;
 	},
@@ -106,7 +109,7 @@ const edit: Tool = {
 		required: ["path", "old_string", "new_string"],
 		additionalProperties: false,
 	},
-	async execute(args: unknown): Promise<string> {
+	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
 		const { path, old_string, new_string, replaceAll } = args as {
 			path?: unknown;
 			old_string?: unknown;
@@ -121,8 +124,10 @@ const edit: Tool = {
 		}
 		if (old_string === new_string) throw new Error("old_string and new_string are identical — no change to make.");
 		const resolved = resolve(path);
-		const original = await readFile(resolved, "utf8");
+		signal?.throwIfAborted();
+		const original = await readFile(resolved, { encoding: "utf8", signal });
 		const { content, count } = applyEdit(original, old_string, new_string, replaceAll ?? false);
+		signal?.throwIfAborted();
 		await writeFile(resolved, content, "utf8");
 		return `Edited ${path} (${count} ${count === 1 ? "occurrence" : "occurrences"})`;
 	},
@@ -147,7 +152,7 @@ const bash: Tool = {
 		required: ["command"],
 		additionalProperties: false,
 	},
-	async execute(args: unknown): Promise<string> {
+	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
 		const { command, timeout } = args as { command?: unknown; timeout?: unknown };
 		if (typeof command !== "string" || command.trim() === "") {
 			throw new Error("bash: 'command' must be a non-empty string");
@@ -155,7 +160,7 @@ const bash: Tool = {
 		if (timeout !== undefined && (typeof timeout !== "number" || timeout <= 0)) {
 			throw new Error("bash: 'timeout' must be a positive number of seconds");
 		}
-		return runBash(command, timeout ?? DEFAULT_TIMEOUT_SECS);
+		return runBash(command, timeout ?? DEFAULT_TIMEOUT_SECS, signal);
 	},
 };
 
@@ -283,7 +288,8 @@ function stripBom(content: string): { bom: string; text: string } {
 // stream moves to a private file once it exceeds the preview. A non-zero exit comes back as data, while
 // signal termination, timeout, spill failure, output-limit, and spawn errors throw so the model sees a
 // failed tool call.
-async function runBash(command: string, timeoutSecs: number): Promise<string> {
+async function runBash(command: string, timeoutSecs: number, signal?: AbortSignal): Promise<string> {
+	signal?.throwIfAborted();
 	const child = spawn(resolveShell(), ["-c", command], {
 		cwd: process.cwd(),
 		env: process.env,
@@ -291,6 +297,13 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 
+	let stopRequested = false;
+	let killTimer: NodeJS.Timeout | undefined;
+	const stop = () => {
+		if (stopRequested || child.pid === undefined) return;
+		stopRequested = true;
+		killTimer = killTree(child.pid);
+	};
 	const output = new Bash.OutputAccumulator({
 		pause: () => {
 			child.stdout?.pause();
@@ -300,9 +313,7 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 			child.stdout?.resume();
 			child.stderr?.resume();
 		},
-		stop: () => {
-			if (child.pid !== undefined) killTree(child.pid);
-		},
+		stop,
 	});
 	child.stdout?.on("data", (data: Buffer) => {
 		output.append(data);
@@ -314,25 +325,38 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 	let timedOut = false;
 	const timer = setTimeout(() => {
 		timedOut = true;
-		if (child.pid !== undefined) killTree(child.pid);
+		stop();
 	}, timeoutSecs * 1000);
+	let aborted = false;
+	const onAbort = () => {
+		aborted = true;
+		stop();
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
+	if (signal?.aborted) onAbort();
 
 	const exit = await waitForExit(child, () => output.isBackpressured).then(
 		(status) => ({ status }) as const,
 		(error: unknown) => ({ error }) as const,
 	);
 	clearTimeout(timer);
+	if (stopRequested && child.pid !== undefined) killProcessGroup(child.pid, "SIGKILL");
+	if (killTimer) clearTimeout(killTimer);
+	signal?.removeEventListener("abort", onAbort);
 	const snapshot = await output.finish();
 	if ("error" in exit) throw exit.error;
 
 	const locationLabel = output.failure ? "partial output" : output.limitReached ? "captured output" : "full output";
 	const location = snapshot.path ? `${locationLabel}: ${snapshot.path}` : "full output unavailable";
-	const formatted = snapshot.truncated
+	const formattedOutput = snapshot.truncated
 		? appendNote(
 				snapshot.text,
 				`output truncated: showing last ${snapshot.shown} of ${snapshot.total} lines; ${location}`,
 			)
 		: snapshot.text;
+	const formatted = aborted
+		? appendNote(formattedOutput, "aborted by user; command may have partially executed")
+		: formattedOutput;
 	if (output.failure) {
 		throw new Error(appendNote(formatted, `failed to save bash output: ${output.failure.message}; command terminated`));
 	}
@@ -344,6 +368,7 @@ async function runBash(command: string, timeoutSecs: number): Promise<string> {
 			),
 		);
 	}
+	if (aborted) throw new Error(formatted);
 	if (timedOut) throw new Error(appendNote(formatted, `timed out after ${timeoutSecs}s`));
 	if (exit.status.signal !== null) {
 		throw new Error(appendNote(formatted, `terminated by ${exit.status.signal}`));
@@ -363,20 +388,22 @@ function resolveShell(): string {
 }
 
 // Kill the command's whole process group so grandchildren — a dev server under `npm run dev` — die with
-// it. SIGTERM first for a clean shutdown, then SIGKILL after a grace if the group is still alive. The
-// negative pid targets the group (the command was spawned detached). This is the one kill path; the
-// step-3 abort signal will reuse it.
-function killTree(pid: number): void {
-	const groupKill = (signal: NodeJS.Signals): boolean => {
-		try {
-			process.kill(-pid, signal);
-			return true;
-		} catch {
-			return false;
-		}
-	};
-	if (!groupKill("SIGTERM")) return;
-	setTimeout(() => groupKill("SIGKILL"), KILL_GRACE_MS).unref();
+// it. SIGTERM first for a clean shutdown, then SIGKILL after the leader exits or the grace elapses.
+// The negative pid targets the group because the command was spawned detached.
+function killTree(pid: number): NodeJS.Timeout | undefined {
+	if (!killProcessGroup(pid, "SIGTERM")) return undefined;
+	const timer = setTimeout(() => killProcessGroup(pid, "SIGKILL"), KILL_GRACE_MS);
+	timer.unref();
+	return timer;
+}
+
+function killProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+	try {
+		process.kill(-pid, signal);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // Resolve when the child exits and its pipes fall idle. A detached grandchild can keep stdout open, so

@@ -1,4 +1,4 @@
-import OpenAI, { APIConnectionError, APIConnectionTimeoutError, APIError } from "openai";
+import OpenAI, { APIConnectionError, APIConnectionTimeoutError, APIError, APIUserAbortError } from "openai";
 
 export interface ToolCall {
 	callId: string;
@@ -9,6 +9,7 @@ export interface ToolCall {
 
 export type Message =
 	| { role: "user"; content: string }
+	| { role: "developer"; content: string }
 	| { role: "assistant"; content: string; toolCalls?: ToolCall[]; reasoning?: unknown[] }
 	| { role: "tool"; toolCallId: string; content: string };
 
@@ -28,6 +29,7 @@ export interface StreamOptions {
 	tools?: Tool[];
 	instructions?: string;
 	reasoningEffort?: ReasoningEffort;
+	signal?: AbortSignal;
 }
 
 export interface Usage {
@@ -44,6 +46,7 @@ export type Event =
 	| { type: "tool_call"; callId: string; itemId?: string; name: string; arguments: string }
 	| { type: "reasoning"; item: unknown }
 	| { type: "done"; reason: FinishReason; usage: Usage }
+	| { type: "aborted" }
 	| { type: "error"; message: string; retryable: boolean; retryAfterMs?: number };
 
 // How stream() reaches OpenAI: a plain API key against the public API, or a ChatGPT-subscription
@@ -52,10 +55,10 @@ export type Auth = { kind: "apikey"; key: string } | { kind: "oauth"; accessToke
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
-// Stream one OpenAI Responses call as `delta`, `reasoning_delta`, `tool_call`, `reasoning`, `done`, and
-// `error` events. It never throws. Every failure comes back as one `error` event that says whether a
-// retry is worth it and carries any server Retry-After: a pre-stream reject, a mid-stream SDK error, an
-// in-band `error` or `response.failed`, or a stream that ends before a terminal event. SDK retries are off
+// Stream one OpenAI Responses call as normalized events. It never throws: cancellation returns
+// `aborted`, while every failure returns one `error` that says whether a retry is worth it and carries
+// any server Retry-After. Failures include a pre-stream reject, a mid-stream SDK error, an in-band
+// `error` or `response.failed`, and a stream that ends before a terminal event. SDK retries are off
 // (`maxRetries: 0`) so the engine runs the one retry policy. Incomplete responses keep their finish
 // reason, so a token cap and a content filter do not look like a normal stop. Reasoning comes back two
 // ways: a summary (`summary: "auto"`) streamed as `reasoning_delta`, and the encrypted item (a `reasoning`
@@ -89,16 +92,19 @@ export async function* stream(
 			parameters: t.parameters,
 			strict: false,
 		}));
-		const events = await client.responses.create({
-			model,
-			input: toInput(messages),
-			stream: true,
-			store: false,
-			include: ["reasoning.encrypted_content"],
-			reasoning: { effort: opts?.reasoningEffort, summary: "auto" },
-			tools,
-			instructions: opts?.instructions,
-		});
+		const events = await client.responses.create(
+			{
+				model,
+				input: toInput(messages),
+				stream: true,
+				store: false,
+				include: ["reasoning.encrypted_content"],
+				reasoning: { effort: opts?.reasoningEffort, summary: "auto" },
+				tools,
+				instructions: opts?.instructions,
+			},
+			{ signal: opts?.signal },
+		);
 		for await (const event of events) {
 			if (event.type === "response.output_text.delta") {
 				yield { type: "delta", text: event.delta };
@@ -167,6 +173,10 @@ export async function* stream(
 		}
 		throw new Error("OpenAI stream ended before a terminal response event");
 	} catch (err) {
+		if (opts?.signal?.aborted || err instanceof APIUserAbortError) {
+			yield { type: "aborted" };
+			return;
+		}
 		yield { type: "error", ...classifyError(err) };
 	}
 }
@@ -178,8 +188,8 @@ export async function* stream(
 export function toInput(messages: Message[]): OpenAI.Responses.ResponseInputItem[] {
 	const items: OpenAI.Responses.ResponseInputItem[] = [];
 	for (const m of messages) {
-		if (m.role === "user") {
-			items.push({ role: "user", content: m.content });
+		if (m.role === "user" || m.role === "developer") {
+			items.push({ role: m.role, content: m.content });
 			continue;
 		}
 		if (m.role === "tool") {

@@ -20,8 +20,8 @@ export interface Credential {
 // Run fn holding the cross-process auth lock. Every credential mutation happens inside it (login,
 // logout, and the whole expired-token refresh including its network call), so mutations are
 // strictly ordered: once a logout returns, no refresh that started earlier can rewrite the store.
-export async function withAuthLock<T>(fn: () => T | Promise<T>): Promise<T> {
-	const lock = await acquireLock(`${authFilePath()}.lock`, AUTH_LOCK_TIMEOUT_MS);
+export async function withAuthLock<T>(fn: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+	const lock = await acquireLock(`${authFilePath()}.lock`, AUTH_LOCK_TIMEOUT_MS, signal);
 	try {
 		return await fn();
 	} finally {

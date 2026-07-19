@@ -6,6 +6,12 @@ test("maps a user message to a user input item", () => {
 	assert.deepEqual(toInput([{ role: "user", content: "hi" }]), [{ role: "user", content: "hi" }]);
 });
 
+test("maps an interruption marker to a developer input item", () => {
+	assert.deepEqual(toInput([{ role: "developer", content: "interrupted" }]), [
+		{ role: "developer", content: "interrupted" },
+	]);
+});
+
 test("replays an assistant turn as reasoning, then text, then function calls in order", () => {
 	const reasoning = { type: "reasoning", id: "rs_1", encrypted_content: "enc", summary: [] };
 	const items = toInput([

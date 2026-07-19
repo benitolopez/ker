@@ -119,6 +119,43 @@ test("falls back to the api key when a logout wins the lock before the refresh",
 	assert.equal(fetchCalls, 0);
 });
 
+test("aborts while waiting for the refresh lock without calling the token endpoint", async () => {
+	writeCredentialUnlocked(oauthCred({ expires: Date.now() - 1000 }));
+	stubTokenEndpoint({});
+	const gate = await acquireLock(`${process.env.KER_AUTH_FILE}.lock`, 1000);
+	const controller = new AbortController();
+	const resolving = resolveAuth(undefined, controller.signal);
+	controller.abort();
+
+	await assert.rejects(resolving, (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+	assert.equal(fetchCalls, 0);
+	gate.release();
+});
+
+test("an in-flight refresh persists rotated tokens after its caller aborts", async () => {
+	writeCredentialUnlocked(oauthCred({ expires: Date.now() - 1000 }));
+	const started = Promise.withResolvers<void>();
+	const response = Promise.withResolvers<Response>();
+	globalThis.fetch = async (): Promise<Response> => {
+		started.resolve();
+		return response.promise;
+	};
+	const controller = new AbortController();
+	const resolving = resolveAuth(undefined, controller.signal);
+	await started.promise;
+	controller.abort();
+
+	await assert.rejects(resolving, (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+	response.resolve(
+		new Response(JSON.stringify({ access_token: jwt("acc_new"), refresh_token: "r-new", expires_in: 3600 }), {
+			status: 200,
+		}),
+	);
+	const lock = await acquireLock(`${process.env.KER_AUTH_FILE}.lock`, 1000);
+	lock.release();
+	assert.equal(readCredential()?.refresh, "r-new");
+});
+
 test("a timed-out refresh releases the auth lock", async (t) => {
 	writeCredentialUnlocked(oauthCred({ expires: Date.now() - 1000 }));
 	t.mock.method(AbortSignal, "timeout", () =>

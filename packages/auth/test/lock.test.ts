@@ -65,3 +65,15 @@ test("acquisition times out while another process holds the lock", async () => {
 	await assert.rejects(acquireLock(lockPath, 300), /Timed out/);
 	await holder.exited;
 });
+
+test("an abort stops lock waiting and closes the contender", async () => {
+	const holder = await acquireLock(lockPath, 1000);
+	const controller = new AbortController();
+	const contender = acquireLock(lockPath, 10_000, controller.signal);
+	await sleep(100);
+	controller.abort();
+	await assert.rejects(contender, (error: unknown) => error instanceof Error && error.name === "AbortError");
+	holder.release();
+	const next = await acquireLock(lockPath, 1000);
+	next.release();
+});
