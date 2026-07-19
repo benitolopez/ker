@@ -6,6 +6,14 @@ It's very early. Right now ker runs a complete coding-agent loop behind a local 
 it a prompt, the model can read and change files or run shell commands, and the loop continues
 until the model returns its final answer.
 
+## Contributions
+
+ker is currently a personal project under active development, and I'm not accepting
+contributions yet. I'd like to establish its direction and bring it to a more stable
+state first. I plan to open it to contributions in some form when it's ready.
+
+Thank you for your interest and understanding.
+
 ## What works today
 
 - A long-lived **daemon** that holds the conversation, and a thin `ker` client that talks to
