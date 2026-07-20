@@ -76,21 +76,19 @@ function runDaemon(): void {
 	process.once("SIGTERM", shutdown);
 }
 
-// Drive one turn through the daemon: health-check, subscribe to /event *before* POSTing so no events
-// are missed, then consume the stream until the terminal `end` event. In the default mode
-// only the assistant answer streams to stdout and fatal errors go to stderr; the other events
-// (reasoning, tool calls, usage, auth, retry) are intentionally left unrendered — the TUI and `--json`
-// are their surface. The first SIGINT requests exact-turn cancellation and waits for cleanup; a
-// second exits immediately. With `json`, each raw event is echoed as one JSON line on stdout.
+// Subscribe before submission so a newly started turn cannot emit events before its client listens.
+// A queued sender acknowledges admission and leaves the shared turn to its starter. Only the starter
+// renders matching turn events and owns SIGINT cancellation.
 async function runPrompt(prompt: string, json: boolean): Promise<void> {
 	const preSubmit = new AbortController();
 	let submissionStarted = false;
 	let abortRequested = false;
+	let ownsTurn = false;
 	let sessionId: Protocol.SessionId | undefined;
 	let turnId: Protocol.TurnId | undefined;
 	let abortRequest: Promise<{ kind: "response"; response: Response } | { kind: "error"; error: unknown }> | undefined;
 	const requestAbort = () => {
-		if (!abortRequested || !sessionId || !turnId || abortRequest) return;
+		if (!abortRequested || !ownsTurn || !sessionId || !turnId || abortRequest) return;
 		abortRequest = fetch(`${BASE}/turn/abort`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -148,22 +146,32 @@ async function runPrompt(prompt: string, json: boolean): Promise<void> {
 				return;
 			}
 			process.stderr.write(
-				submitted.status === 409
-					? "ker: daemon is busy with another turn\n"
-					: submitted.status === 412
-						? "ker: a new conversation was started before this prompt arrived — resubmit it\n"
-						: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
+				submitted.status === 412
+					? "ker: a new conversation was started before this prompt arrived — resubmit it\n"
+					: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
 			);
 			process.exitCode = 1;
 			return;
 		}
-		const accepted = (await submitted.json()) as { turnId?: unknown };
-		if (typeof accepted.turnId !== "string") {
+		const accepted: unknown = await submitted.json();
+		if (!isMessageSubmitted(accepted)) {
 			await events.body.cancel();
-			process.stderr.write("ker: daemon accepted the prompt without a turn id\n");
+			process.stderr.write("ker: daemon accepted the prompt without a valid submission event\n");
 			process.exitCode = 1;
 			return;
 		}
+		if (accepted.queued) {
+			await events.body.cancel();
+			if (json) {
+				process.stdout.write(`${JSON.stringify(accepted)}\n`);
+				return;
+			}
+			process.stderr.write("Queued message for the active turn.\n");
+			return;
+		}
+
+		ownsTurn = true;
+		sessionId = accepted.sessionId;
 		turnId = accepted.turnId;
 		requestAbort();
 
@@ -172,6 +180,9 @@ async function runPrompt(prompt: string, json: boolean): Promise<void> {
 		let aborted = false;
 		for await (const data of sseData(events.body)) {
 			const event = JSON.parse(data) as Protocol.Event;
+			if (event.sessionId !== accepted.sessionId || !("turnId" in event) || event.turnId !== accepted.turnId) {
+				continue;
+			}
 			if (json) process.stdout.write(`${data}\n`);
 			if (!json && event.type === "message_delta") {
 				streamed = true;
@@ -223,6 +234,20 @@ async function runPrompt(prompt: string, json: boolean): Promise<void> {
 	} finally {
 		process.off("SIGINT", onSigint);
 	}
+}
+
+function isMessageSubmitted(value: unknown): value is Protocol.MessageSubmittedEvent {
+	if (typeof value !== "object" || value === null) return false;
+	const event = value as Record<string, unknown>;
+	return (
+		event.actor === "human" &&
+		event.type === "message_submitted" &&
+		typeof event.sessionId === "string" &&
+		typeof event.turnId === "string" &&
+		typeof event.messageId === "string" &&
+		typeof event.text === "string" &&
+		typeof event.queued === "boolean"
+	);
 }
 
 // Fail fast before subscribing: a refused connection means no daemon is running, and a protocol

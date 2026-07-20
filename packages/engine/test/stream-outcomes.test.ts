@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
-import { createHarness, type EngineConfig, type Tool } from "../src/index.ts";
+import { createHarness, type EngineConfig, type Tool, type TurnInput } from "../src/index.ts";
 
 test("does not admit a prompt when initial auth resolution fails", async () => {
 	const observed = { loggedIn: true, streamCalls: 0 };
@@ -23,10 +23,10 @@ test("does not admit a prompt when initial auth resolution fails", async () => {
 		},
 	);
 
-	await collectEvents(harness.send("first"));
+	await collectEvents(send(harness, "first"));
 	observed.loggedIn = false;
 
-	assert.deepEqual(await collectEvents(harness.send("second")), [
+	assert.deepEqual(await collectEvents(send(harness, "second")), [
 		{ role: "assistant", type: "error", message: "not logged in" },
 		{ role: "assistant", type: "end" },
 	]);
@@ -59,12 +59,12 @@ test("does not restore an auth-rejected prompt after login and resubmission", as
 		},
 	);
 
-	assert.deepEqual(await collectEvents(harness.send("rejected")), [
+	assert.deepEqual(await collectEvents(send(harness, "rejected")), [
 		{ role: "assistant", type: "error", message: "not logged in" },
 		{ role: "assistant", type: "end" },
 	]);
 	observed.loggedIn = true;
-	await collectEvents(harness.send("resubmitted"));
+	await collectEvents(send(harness, "resubmitted"));
 
 	assert.deepEqual(observed.providerUsers, [["resubmitted"]]);
 	assert.deepEqual(harness.messages, [
@@ -88,7 +88,7 @@ test("reuses preflight auth for the initial provider attempt", async () => {
 		},
 	);
 
-	await collectEvents(harness.send("hello"));
+	await collectEvents(send(harness, "hello"));
 
 	assert.deepEqual(observed, { authCalls: 1, providerKeys: ["key-1"] });
 });
@@ -108,10 +108,10 @@ test("rejects a changed oauth account before admitting the prompt", async () => 
 		},
 	);
 
-	await collectEvents(harness.send("first"));
+	await collectEvents(send(harness, "first"));
 	observed.accountId = "acc_new";
 
-	assert.deepEqual(await collectEvents(harness.send("rejected")), [
+	assert.deepEqual(await collectEvents(send(harness, "rejected")), [
 		{
 			role: "assistant",
 			type: "error",
@@ -147,10 +147,10 @@ test("rejects a change between oauth and api-key auth", async () => {
 		},
 	);
 
-	await collectEvents(harness.send("first"));
+	await collectEvents(send(harness, "first"));
 	observed.auth = { kind: "apikey", key: "test" };
 
-	assert.deepEqual(await collectEvents(harness.send("rejected")), [
+	assert.deepEqual(await collectEvents(send(harness, "rejected")), [
 		{
 			role: "assistant",
 			type: "error",
@@ -181,11 +181,11 @@ test("allows the original oauth account after rejecting another account", async 
 		},
 	);
 
-	await collectEvents(harness.send("first"));
+	await collectEvents(send(harness, "first"));
 	observed.accountId = "acc_new";
-	await collectEvents(harness.send("rejected"));
+	await collectEvents(send(harness, "rejected"));
 	observed.accountId = "acc_old";
-	await collectEvents(harness.send("second"));
+	await collectEvents(send(harness, "second"));
 
 	assert.deepEqual(observed.providerUsers, [["first"], ["first", "second"]]);
 });
@@ -207,10 +207,10 @@ test("reset clears history and lets the next prompt bind another account", async
 		},
 	);
 
-	await collectEvents(harness.send("first"));
+	await collectEvents(send(harness, "first"));
 	harness.reset();
 	observed.accountId = "acc_new";
-	await collectEvents(harness.send("second"));
+	await collectEvents(send(harness, "second"));
 
 	assert.deepEqual(observed.providerUsers, [["first"], ["second"]]);
 	assert.deepEqual(harness.messages, [
@@ -244,7 +244,7 @@ test("stops before a tool follow-up when the oauth account changes mid-turn", as
 		},
 	);
 
-	const events = await collectEvents(harness.send("hello"));
+	const events = await collectEvents(send(harness, "hello"));
 
 	assert.deepEqual(events.at(-2), {
 		role: "assistant",
@@ -296,7 +296,7 @@ test("stops before a tool follow-up when auth changes from oauth to an api key",
 		},
 	);
 
-	const events = await collectEvents(harness.send("hello"));
+	const events = await collectEvents(send(harness, "hello"));
 
 	assert.deepEqual(
 		events.filter((event) => event.type === "auth"),
@@ -334,7 +334,7 @@ test("resolves fresh auth before retrying the provider", async () => {
 		},
 	);
 
-	assert.deepEqual(await collectEvents(harness.send("hello")), [
+	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "assistant", type: "retry", attempt: 1, maxAttempts: 3, delayMs: 0, message: "retry me" },
 		{ role: "assistant", type: "usage", input: 1, output: 1, total: 2 },
@@ -344,7 +344,7 @@ test("resolves fresh auth before retrying the provider", async () => {
 });
 
 test("does not retry after provider output", async (t) => {
-	const scenarios: { name: string; output: Llm.Event; visible: Protocol.Event[] }[] = [
+	const scenarios: { name: string; output: Llm.Event; visible: Array<Record<string, unknown>> }[] = [
 		{
 			name: "answer delta",
 			output: { type: "delta", text: "partial answer" },
@@ -378,7 +378,7 @@ test("does not retry after provider output", async (t) => {
 				},
 			});
 
-			assert.deepEqual(await collectEvents(harness.send("hello")), [
+			assert.deepEqual(await collectEvents(send(harness, "hello")), [
 				{ role: "assistant", type: "auth", mode: "apikey" },
 				...scenario.visible,
 				{ role: "assistant", type: "error", message: "stream failed" },
@@ -408,7 +408,7 @@ test("stops a retry when auth changes from oauth to an api key", async () => {
 		},
 	);
 
-	assert.deepEqual(await collectEvents(harness.send("hello")), [
+	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "oauth" },
 		{ role: "assistant", type: "retry", attempt: 1, maxAttempts: 3, delayMs: 0, message: "retry me" },
 		{
@@ -431,7 +431,7 @@ test("keeps an admitted prompt when the provider rejects it", async () => {
 		},
 	});
 
-	assert.deepEqual(await collectEvents(harness.send("hello")), [
+	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "assistant", type: "error", message: "invalid token" },
 		{ role: "assistant", type: "end" },
@@ -465,7 +465,7 @@ test("keeps completed tool history when auth disappears before the next model st
 		},
 	);
 
-	assert.deepEqual(await collectEvents(harness.send("hello")), [
+	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "tool", type: "tool_call", id: "call_1", name: "lookup", arguments: "{}" },
 		{ role: "assistant", type: "usage", input: 2, output: 1, total: 3 },
@@ -510,7 +510,7 @@ test("stops a content-filtered turn without saving its response or executing its
 		},
 	});
 
-	assert.deepEqual(await collectEvents(harness.send("hello")), [
+	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "assistant", type: "message_delta", text: "partial response" },
 		{ role: "tool", type: "tool_call", id: "call_1", name: "lookup", arguments: "{}" },
@@ -536,7 +536,7 @@ test("saves a length-limited response without reporting an error", async () => {
 		},
 	});
 
-	assert.deepEqual(await collectEvents(harness.send("hello")), [
+	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "assistant", type: "message_delta", text: "truncated response" },
 		{ role: "assistant", type: "usage", input: 8, output: 4, total: 12 },
@@ -561,7 +561,7 @@ test("aborts before admission without saving the prompt or interruption marker",
 			}),
 	});
 
-	const collecting = collectEvents(harness.send("hello", controller.signal));
+	const collecting = collectEvents(send(harness, "hello", controller.signal));
 	await authStarted.promise;
 	controller.abort();
 
@@ -592,7 +592,7 @@ test("drops an incomplete assistant response and records an interruption marker"
 		},
 	});
 
-	const collecting = collectEvents(harness.send("hello", controller.signal));
+	const collecting = collectEvents(send(harness, "hello", controller.signal));
 	await streamStarted.promise;
 	await deltaDelivered.promise;
 	controller.abort();
@@ -621,10 +621,10 @@ test("repairs a completed tool call from an interrupted provider response", asyn
 			yield { type: "aborted" };
 		},
 	});
-	const events: Protocol.Event[] = [];
+	const events: Array<Record<string, unknown>> = [];
 
-	for await (const event of harness.send("hello", controller.signal)) {
-		events.push(event);
+	for await (const event of send(harness, "hello", controller.signal)) {
+		if (event.type !== "message_delivered") events.push(legacyEvent(event));
 		if (event.type === "tool_call") controller.abort();
 	}
 
@@ -665,10 +665,10 @@ test("cancels retry backoff without another provider attempt", async () => {
 			yield { type: "error", message: "retry later", retryable: true, retryAfterMs: 60_000 };
 		},
 	});
-	const events: Protocol.Event[] = [];
+	const events: Array<Record<string, unknown>> = [];
 
-	for await (const event of harness.send("hello", controller.signal)) {
-		events.push(event);
+	for await (const event of send(harness, "hello", controller.signal)) {
+		if (event.type !== "message_delivered") events.push(legacyEvent(event));
 		if (event.type === "retry") controller.abort();
 	}
 
@@ -710,7 +710,7 @@ test("repairs active and queued tool results before reporting the abort", async 
 		},
 	});
 
-	const collecting = collectEvents(harness.send("hello", controller.signal));
+	const collecting = collectEvents(send(harness, "hello", controller.signal));
 	await toolStarted.promise;
 	controller.abort();
 	const events = await collecting;
@@ -767,10 +767,10 @@ test("repairs every advertised tool when cancellation follows provider completio
 			yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
 		},
 	});
-	const events: Protocol.Event[] = [];
+	const events: Array<Record<string, unknown>> = [];
 
-	for await (const event of harness.send("hello", controller.signal)) {
-		events.push(event);
+	for await (const event of send(harness, "hello", controller.signal)) {
+		if (event.type !== "message_delivered") events.push(legacyEvent(event));
 		if (event.type === "usage") controller.abort();
 	}
 
@@ -796,6 +796,125 @@ test("repairs every advertised tool when cancellation follows provider completio
 	]);
 });
 
+test("delivers one steering message after the full tool batch with actor-aware events", async () => {
+	const observed = { providerUsers: [] as string[][], toolsFinished: 0 };
+	const tools: Tool[] = ["first", "second"].map((name) => ({
+		name,
+		description: name,
+		parameters: { type: "object" },
+		async execute() {
+			observed.toolsFinished++;
+			return `${name} result`;
+		},
+	}));
+	const harness = createHarness(createConfig(tools), {
+		stream: async function* (_model, messages) {
+			observed.providerUsers.push(
+				messages.filter((message) => message.role === "user").map((message) => message.content),
+			);
+			if (observed.providerUsers.length === 1) {
+				yield { type: "delta", text: "working" };
+				yield { type: "reasoning_delta", text: "thinking" };
+				yield { type: "tool_call", callId: "call-1", name: "first", arguments: "{}" };
+				yield { type: "tool_call", callId: "call-2", name: "second", arguments: "{}" };
+			}
+			yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+		},
+	});
+	const queued = {
+		sessionId: "session-1",
+		turnId: "turn-1",
+		messageId: "message-2",
+		text: "steer",
+	};
+	const steering = [queued];
+	const events = await collectProtocolEvents(
+		send(harness, "initial", undefined, () => {
+			assert.equal(observed.toolsFinished, 2);
+			return steering.shift();
+		}),
+	);
+
+	assert.deepEqual(
+		events.map((event) => ({
+			type: event.type,
+			actor: event.actor,
+			modelRole: "modelRole" in event ? event.modelRole : undefined,
+			messageId: "messageId" in event ? event.messageId : undefined,
+		})),
+		[
+			{ type: "message_delivered", actor: "human", modelRole: "user", messageId: "message-1" },
+			{ type: "auth", actor: "process", modelRole: undefined, messageId: undefined },
+			{ type: "message_delta", actor: "agent", modelRole: "assistant", messageId: undefined },
+			{ type: "reasoning_delta", actor: "agent", modelRole: "assistant", messageId: undefined },
+			{ type: "tool_call", actor: "agent", modelRole: "assistant", messageId: undefined },
+			{ type: "tool_call", actor: "agent", modelRole: "assistant", messageId: undefined },
+			{ type: "usage", actor: "process", modelRole: undefined, messageId: undefined },
+			{ type: "tool_result", actor: "process", modelRole: "tool", messageId: undefined },
+			{ type: "tool_result", actor: "process", modelRole: "tool", messageId: undefined },
+			{ type: "message_delivered", actor: "human", modelRole: "user", messageId: "message-2" },
+			{ type: "usage", actor: "process", modelRole: undefined, messageId: undefined },
+			{ type: "end", actor: "process", modelRole: undefined, messageId: undefined },
+		],
+	);
+	assert(events.every((event) => event.sessionId === "session-1" && event.turnId === "turn-1"));
+	assert.deepEqual(observed.providerUsers, [["initial"], ["initial", "steer"]]);
+});
+
+test("admits steering in FIFO order one message per model boundary", async () => {
+	const observed = { providerUsers: [] as string[][] };
+	const harness = createHarness(createConfig(), {
+		stream: async function* (_model, messages) {
+			observed.providerUsers.push(
+				messages.filter((message) => message.role === "user").map((message) => message.content),
+			);
+			yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+		},
+	});
+	const steering = ["second", "third"].map((text, index) => ({
+		sessionId: "session-1",
+		turnId: "turn-1",
+		messageId: `message-${index + 2}`,
+		text,
+	}));
+	const events = await collectProtocolEvents(send(harness, "first", undefined, () => steering.shift()));
+
+	assert.deepEqual(
+		events.filter((event) => event.type === "message_delivered").map((event) => event.messageId),
+		["message-1", "message-2", "message-3"],
+	);
+	assert.deepEqual(observed.providerUsers, [["first"], ["first", "second"], ["first", "second", "third"]]);
+});
+
+test("waits through provider retry before delivering steering", async () => {
+	const observed = { streamCalls: 0, users: [] as string[][] };
+	const harness = createHarness(createConfig(), {
+		stream: async function* (_model, messages) {
+			observed.streamCalls++;
+			observed.users.push(messages.filter((message) => message.role === "user").map((message) => message.content));
+			if (observed.streamCalls === 1) {
+				yield { type: "error", message: "retry", retryable: true, retryAfterMs: 0 };
+				return;
+			}
+			yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+		},
+	});
+	const steering = {
+		sessionId: "session-1",
+		turnId: "turn-1",
+		messageId: "message-2",
+		text: "after retry",
+	};
+	const queue = [steering];
+	const events = await collectProtocolEvents(send(harness, "first", undefined, () => queue.shift()));
+
+	assert.deepEqual(observed.users, [["first"], ["first"], ["first", "after retry"]]);
+	assert(
+		events.findIndex((event) => event.type === "retry") <
+			events.findIndex((event) => event.type === "message_delivered" && event.messageId === "message-2"),
+	);
+});
+
 function createConfig(tools: Tool[] = []): EngineConfig {
 	return {
 		model: "test-model",
@@ -805,8 +924,46 @@ function createConfig(tools: Tool[] = []): EngineConfig {
 	};
 }
 
-async function collectEvents(events: AsyncIterable<Protocol.Event>): Promise<Protocol.Event[]> {
-	const collected: Protocol.Event[] = [];
+async function collectEvents(events: AsyncIterable<Protocol.TurnEvent>): Promise<Array<Record<string, unknown>>> {
+	const collected: Array<Record<string, unknown>> = [];
+	for await (const event of events) {
+		if (event.type !== "message_delivered") collected.push(legacyEvent(event));
+	}
+	return collected;
+}
+
+async function collectProtocolEvents(events: AsyncIterable<Protocol.TurnEvent>): Promise<Protocol.TurnEvent[]> {
+	const collected: Protocol.TurnEvent[] = [];
 	for await (const event of events) collected.push(event);
 	return collected;
+}
+
+function send(
+	harness: ReturnType<typeof createHarness>,
+	text: string,
+	signal?: AbortSignal,
+	takeSteering: TurnInput["takeSteering"] = () => undefined,
+): AsyncIterable<Protocol.TurnEvent> {
+	return harness.send(
+		{
+			initial: {
+				sessionId: "session-1",
+				turnId: "turn-1",
+				messageId: "message-1",
+				text,
+			},
+			takeSteering,
+		},
+		signal,
+	);
+}
+
+function legacyEvent(event: Protocol.TurnEvent): Record<string, unknown> {
+	const rest: Record<string, unknown> = { ...event };
+	delete rest.actor;
+	delete rest.modelRole;
+	delete rest.sessionId;
+	delete rest.turnId;
+	const role = event.type === "tool_call" || event.type === "tool_result" ? "tool" : "assistant";
+	return { role, ...rest };
 }

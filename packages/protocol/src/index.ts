@@ -1,29 +1,62 @@
 // Wire contract between the daemon and its clients.
 
-export type Role = "user" | "assistant" | "tool" | "system";
+export type Actor = "human" | "agent" | "process";
+export type ModelRole = "user" | "assistant" | "tool";
+export type SessionId = string;
+export type TurnId = string;
+export type MessageId = string;
 
 export interface EventBase {
-	role: Role;
+	actor: Actor;
+	sessionId: SessionId;
 	type: string;
 }
 
-export interface MessageEvent extends EventBase {
-	type: "message";
+export interface TurnEventBase extends EventBase {
+	turnId: TurnId;
+}
+
+export interface MessageSubmittedEvent extends TurnEventBase {
+	actor: "human";
+	type: "message_submitted";
+	messageId: MessageId;
+	text: string;
+	queued: boolean;
+}
+
+export interface MessageDeliveredEvent extends TurnEventBase {
+	actor: "human";
+	modelRole: "user";
+	type: "message_delivered";
+	messageId: MessageId;
 	text: string;
 }
 
-export interface MessageDeltaEvent extends EventBase {
+export interface MessageUndeliveredEvent extends TurnEventBase {
+	actor: "process";
+	type: "message_undelivered";
+	messageId: MessageId;
+	text: string;
+	reason: "aborted" | "error";
+}
+
+export interface MessageDeltaEvent extends TurnEventBase {
+	actor: "agent";
+	modelRole: "assistant";
 	type: "message_delta";
 	text: string;
 }
 
 // The model's reasoning summary, streamed in pieces. Only the summary text, not the encrypted reasoning.
-export interface ReasoningDeltaEvent extends EventBase {
+export interface ReasoningDeltaEvent extends TurnEventBase {
+	actor: "agent";
+	modelRole: "assistant";
 	type: "reasoning_delta";
 	text: string;
 }
 
-export interface UsageEvent extends EventBase {
+export interface UsageEvent extends TurnEventBase {
+	actor: "process";
 	type: "usage";
 	input: number;
 	output: number;
@@ -38,7 +71,8 @@ export type ErrorCode = "identity_changed";
 
 // `code` marks failures a client can act on. An identity_changed error also carries the bound
 // (`expected`) and active (`actual`) identities, so each client writes its own remediation.
-export interface ErrorEvent extends EventBase {
+export interface ErrorEvent extends TurnEventBase {
+	actor: "process";
 	type: "error";
 	message: string;
 	code?: ErrorCode;
@@ -46,7 +80,8 @@ export interface ErrorEvent extends EventBase {
 	actual?: Identity;
 }
 
-export interface RetryEvent extends EventBase {
+export interface RetryEvent extends TurnEventBase {
+	actor: "process";
 	type: "retry";
 	attempt: number;
 	maxAttempts: number;
@@ -54,36 +89,36 @@ export interface RetryEvent extends EventBase {
 	message: string;
 }
 
-// The conversation-bound credential mode, emitted once per accepted prompt. Retries and tool steps
+// The conversation-bound credential mode, emitted once per accepted turn. Retries and tool steps
 // keep that identity. A daemon /auth/status endpoint would let clients query this state instead.
-export interface AuthEvent extends EventBase {
+export interface AuthEvent extends TurnEventBase {
+	actor: "process";
 	type: "auth";
 	mode: "apikey" | "oauth";
 }
 
-// The whole response is complete — the model answered without asking for another tool. A `usage` event
-// fires per model request; this fires once at the very end, so a client knows the turn sequence is over.
-export interface EndEvent extends EventBase {
+export interface EndEvent extends TurnEventBase {
+	actor: "process";
 	type: "end";
 }
 
-// The turn stopped before completion after its abort signal fired.
-export interface AbortedEvent extends EventBase {
-	role: "assistant";
+export interface AbortedEvent extends TurnEventBase {
+	actor: "process";
 	type: "aborted";
 }
 
 // The daemon discarded the model context and removed its credential binding. Connected clients
 // receive this even when another client requested the reset.
 export interface ConversationResetEvent extends EventBase {
-	role: "system";
+	actor: "process";
 	type: "conversation_reset";
 }
 
 // The model asked to run a tool, before it runs. `id` is the provider call id, echoed on the
 // matching result so a client can pair the two.
-export interface ToolCallEvent extends EventBase {
-	role: "tool";
+export interface ToolCallEvent extends TurnEventBase {
+	actor: "agent";
+	modelRole: "assistant";
 	type: "tool_call";
 	id: string;
 	name: string;
@@ -92,8 +127,9 @@ export interface ToolCallEvent extends EventBase {
 
 // The tool ran. `output` carries the full result the model saw, so every client renders it as it
 // likes; `status` is "error" when the tool threw (the model still receives the error as its result).
-export interface ToolResultEvent extends EventBase {
-	role: "tool";
+export interface ToolResultEvent extends TurnEventBase {
+	actor: "process";
+	modelRole: "tool";
 	type: "tool_result";
 	id: string;
 	name: string;
@@ -102,7 +138,9 @@ export interface ToolResultEvent extends EventBase {
 }
 
 export type Event =
-	| MessageEvent
+	| MessageSubmittedEvent
+	| MessageDeliveredEvent
+	| MessageUndeliveredEvent
 	| MessageDeltaEvent
 	| ReasoningDeltaEvent
 	| UsageEvent
@@ -115,10 +153,9 @@ export type Event =
 	| ToolCallEvent
 	| ToolResultEvent;
 
-export type SessionId = string;
-export type TurnId = string;
+export type TurnEvent = Exclude<Event, ConversationResetEvent>;
 
-export const PROTOCOL_VERSION = "3" as const;
+export const PROTOCOL_VERSION = "4" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree
 // on it, so it lives here rather than in config.

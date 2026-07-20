@@ -5,7 +5,9 @@ import { identityChangeRemediation } from "../src/error.ts";
 test("tells an oauth-bound conversation to log back in", () => {
 	assert.equal(
 		identityChangeRemediation({
-			role: "assistant",
+			actor: "process",
+			sessionId: "session-1",
+			turnId: "turn-1",
 			type: "error",
 			code: "identity_changed",
 			expected: { kind: "oauth", accountId: "acc_old" },
@@ -19,7 +21,9 @@ test("tells an oauth-bound conversation to log back in", () => {
 test("tells an api-key-bound conversation to remove the oauth login", () => {
 	assert.equal(
 		identityChangeRemediation({
-			role: "assistant",
+			actor: "process",
+			sessionId: "session-1",
+			turnId: "turn-1",
 			type: "error",
 			code: "identity_changed",
 			expected: { kind: "apikey" },
@@ -31,5 +35,14 @@ test("tells an api-key-bound conversation to remove the oauth login", () => {
 });
 
 test("does not add remediation to an ordinary error", () => {
-	assert.equal(identityChangeRemediation({ role: "assistant", type: "error", message: "provider failed" }), undefined);
+	assert.equal(
+		identityChangeRemediation({
+			actor: "process",
+			sessionId: "session-1",
+			turnId: "turn-1",
+			type: "error",
+			message: "provider failed",
+		}),
+		undefined,
+	);
 });

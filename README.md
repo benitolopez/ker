@@ -23,12 +23,14 @@ Thank you for your interest and understanding.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
 - Conversation memory that lives in the daemon: start a turn in one terminal, continue from
   another — it remembers, because the client is disposable and the daemon isn't.
+- Prompts sent while a turn is active join that turn in FIFO order. They enter model history
+  after the current response and its requested tools finish.
 - OpenAI API-key authentication and an optional ChatGPT OAuth login. A conversation stays bound
   to the credential identity that started it.
 - Bounded tool output: `read` pages large files, and `bash` keeps a bounded tail while spilling
   the full stream to a private temporary file.
 
-Not there yet: saved sessions, abort, a TUI, or any provider other than OpenAI.
+Not there yet: saved sessions, a TUI, or any provider other than OpenAI.
 
 ## Requirements
 
@@ -110,6 +112,10 @@ token usage:
 ```sh
 npx ker --json "my name is Beni"
 ```
+
+If another terminal submits a prompt while a turn is running, that terminal prints a queue
+acknowledgement and exits. The terminal that started the turn keeps rendering the shared response.
+Ctrl-C aborts a turn only from the terminal that started it.
 
 Stop the daemon with Ctrl-C; restarting it clears the conversation (nothing is saved yet). `ker new`
 also clears the current conversation without stopping the daemon, but only while no turn is running.

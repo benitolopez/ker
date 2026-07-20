@@ -12,12 +12,9 @@ const MAX_BODY_BYTES = 64 * 1024;
 const HEARTBEAT_MS = 15_000;
 const ALLOWED_HOSTS = new Set([`127.0.0.1:${DEFAULT_PORT}`, `localhost:${DEFAULT_PORT}`]);
 
-// One harness (a single in-memory conversation) behind a hand-rolled HTTP+SSE server. The daemon
-// runs each turn to completion itself — appending events to a log and writing them to SSE
-// subscribers — so a turn keeps going even if the client disconnects; POST /prompt only
-// acknowledges with the turn id. An idle reset creates a new session, clears the model context,
-// trims the event log, and tells every subscriber. Returns without listening: the bin owns process
-// concerns (port, signals, bind errors).
+// Hosts one in-memory conversation and owns prompt admission. An active turn keeps a FIFO of steering
+// messages that the engine reads synchronously at model boundaries. Closing that FIFO and observing it
+// empty happen in the same callback, so later submissions wait for cleanup and start the next turn.
 export function createDaemon(harness: Harness = createConfiguredHarness()): Server {
 	const log: Protocol.Event[] = [];
 	const subscribers = new Set<ServerResponse>();
@@ -25,9 +22,7 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 	let activeTurn: ActiveTurn | undefined;
 	let idBase = 0;
 
-	// Append to the log and fan out one SSE frame. The frame id is idBase plus the log index — the
-	// seed for Last-Event-ID catch-up. The log grows unbounded within a conversation; a reset empties
-	// it and folds its length into idBase, so ids stay monotonic and discarded events are freed.
+	// Append to the log and fan out one SSE frame. The frame id is only the event-log cursor.
 	function broadcast(event: Protocol.Event): void {
 		const frame = `id: ${idBase + log.length}\ndata: ${JSON.stringify(event)}\n\n`;
 		log.push(event);
@@ -36,33 +31,111 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 		}
 	}
 
-	// Drive one accepted turn independently of its submitting client. Every path publishes one end,
-	// marks the turn terminal before that frame is visible, and resolves done only after cleanup.
-	function pump(text: string, turn: ActiveTurn): void {
+	function takeSteering(turn: ActiveTurn, closeIfEmpty: boolean): Engine.UserMessage | undefined {
+		const message = turn.steering.shift();
+		if (message) return message;
+		if (closeIfEmpty) turn.accepting = false;
+		return undefined;
+	}
+
+	function removePending(turn: ActiveTurn, messageId: Protocol.MessageId): void {
+		const index = turn.pending.findIndex((message) => message.messageId === messageId);
+		if (index !== -1) turn.pending.splice(index, 1);
+	}
+
+	function flushUndelivered(turn: ActiveTurn, reason: "aborted" | "error"): void {
+		for (const message of turn.pending) {
+			broadcast({
+				actor: "process",
+				sessionId: turn.sessionId,
+				turnId: turn.turnId,
+				type: "message_undelivered",
+				messageId: message.messageId,
+				text: message.text,
+				reason,
+			});
+		}
+		turn.pending.length = 0;
+		turn.steering.length = 0;
+	}
+
+	function flushTerminalPending(turn: ActiveTurn, failureReason?: "aborted" | "error"): void {
+		const reason = failureReason ?? (turn.pending.length > 0 ? "error" : undefined);
+		if (!failureReason && reason) {
+			broadcast({
+				actor: "process",
+				sessionId: turn.sessionId,
+				turnId: turn.turnId,
+				type: "error",
+				message: "The turn ended before every submitted message was delivered",
+			});
+		}
+		if (reason) flushUndelivered(turn, reason);
+	}
+
+	// Drive one turn independently of its submitting client and keep end last on every terminal path.
+	function pump(turn: ActiveTurn): void {
 		void (async () => {
-			let sawAborted = false;
+			let failureReason: "aborted" | "error" | undefined;
 			try {
-				for await (const event of harness.send(text, turn.controller.signal)) {
+				for await (const event of harness.send(
+					{
+						initial: turn.initial,
+						takeSteering: (closeIfEmpty) => takeSteering(turn, closeIfEmpty),
+					},
+					turn.controller.signal,
+				)) {
 					if (turn.terminal) continue;
-					if (event.type === "aborted") sawAborted = true;
+					if (event.type === "message_delivered") removePending(turn, event.messageId);
+					if (event.type === "aborted") {
+						turn.accepting = false;
+						failureReason = "aborted";
+					}
+					if (event.type === "error") {
+						turn.accepting = false;
+						failureReason = "error";
+					}
 					if (event.type === "end") {
+						turn.accepting = false;
+						flushTerminalPending(turn, failureReason);
 						turn.terminal = true;
 						broadcast(event);
-						continue;
+						break;
 					}
 					broadcast(event);
 				}
 			} catch (err) {
-				if (!turn.terminal && turn.controller.signal.aborted && !sawAborted) {
-					broadcast({ role: "assistant", type: "aborted" });
+				turn.accepting = false;
+				if (!failureReason && turn.controller.signal.aborted) {
+					failureReason = "aborted";
+					broadcast({
+						actor: "process",
+						sessionId: turn.sessionId,
+						turnId: turn.turnId,
+						type: "aborted",
+					});
 				}
-				if (!turn.terminal && !turn.controller.signal.aborted) {
-					broadcast({ role: "assistant", type: "error", message: err instanceof Error ? err.message : String(err) });
+				if (!failureReason) {
+					failureReason = "error";
+					broadcast({
+						actor: "process",
+						sessionId: turn.sessionId,
+						turnId: turn.turnId,
+						type: "error",
+						message: err instanceof Error ? err.message : String(err),
+					});
 				}
 			} finally {
 				if (!turn.terminal) {
+					turn.accepting = false;
+					flushTerminalPending(turn, failureReason);
 					turn.terminal = true;
-					broadcast({ role: "assistant", type: "end" });
+					broadcast({
+						actor: "process",
+						sessionId: turn.sessionId,
+						turnId: turn.turnId,
+						type: "end",
+					});
 				}
 				if (activeTurn === turn) activeTurn = undefined;
 				turn.done.resolve();
@@ -70,11 +143,8 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 		})();
 	}
 
-	// Guard a prompt submission: Host/Origin checks keep browser pages from driving the agent
-	// cross-origin until real auth exists; the size cap is checked both up front and mid-read.
-	// The prompt must name the session it was composed against, so a prompt in flight during a reset
-	// is refused (412) instead of landing in the fresh conversation.
-	// Never throws — a client abort mid-upload or bad JSON lands in the catch as a 400.
+	// Validate one prompt, then either append it to the open active turn or start a new turn. A request
+	// that reaches admission during cleanup waits and is evaluated again against the current session.
 	async function handlePrompt(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		if (!isLocalRequest(req)) {
 			res.writeHead(403).end();
@@ -95,20 +165,67 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 				res.writeHead(412).end();
 				return;
 			}
-			if (activeTurn) {
-				res.writeHead(409).end();
+
+			while (activeTurn && !activeTurn.accepting) await activeTurn.done.promise;
+			if (parsed.sessionId !== sessionId) {
+				res.writeHead(412).end();
 				return;
 			}
-			const turn: ActiveTurn = {
+
+			const turn = activeTurn;
+			if (turn) {
+				const message: Engine.UserMessage = {
+					sessionId,
+					turnId: turn.turnId,
+					messageId: randomUUID(),
+					text: parsed.text,
+				};
+				const submitted: Protocol.MessageSubmittedEvent = {
+					actor: "human",
+					sessionId,
+					turnId: turn.turnId,
+					type: "message_submitted",
+					messageId: message.messageId,
+					text: message.text,
+					queued: true,
+				};
+				turn.pending.push(message);
+				turn.steering.push(message);
+				broadcast(submitted);
+				writeJson(res, 202, submitted);
+				return;
+			}
+
+			const message: Engine.UserMessage = {
 				sessionId,
 				turnId: randomUUID(),
+				messageId: randomUUID(),
+				text: parsed.text,
+			};
+			const nextTurn: ActiveTurn = {
+				sessionId,
+				turnId: message.turnId,
+				initial: message,
+				pending: [message],
+				steering: [],
+				accepting: true,
 				controller: new AbortController(),
 				done: Promise.withResolvers<void>(),
 				terminal: false,
 			};
-			activeTurn = turn;
-			pump(parsed.text, turn);
-			writeJson(res, 202, { turnId: turn.turnId });
+			const submitted: Protocol.MessageSubmittedEvent = {
+				actor: "human",
+				sessionId,
+				turnId: nextTurn.turnId,
+				type: "message_submitted",
+				messageId: message.messageId,
+				text: message.text,
+				queued: false,
+			};
+			activeTurn = nextTurn;
+			broadcast(submitted);
+			pump(nextTurn);
+			writeJson(res, 202, submitted);
 		} catch {
 			if (!res.headersSent) res.writeHead(400).end();
 		}
@@ -130,6 +247,7 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 				res.writeHead(409).end();
 				return;
 			}
+			turn.accepting = false;
 			turn.controller.abort();
 			await turn.done.promise;
 			res.writeHead(204).end();
@@ -151,17 +269,16 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 		sessionId = randomUUID();
 		idBase += log.length;
 		log.length = 0;
-		broadcast({ role: "system", type: "conversation_reset" });
+		broadcast({ actor: "process", sessionId, type: "conversation_reset" });
 		writeJson(res, 201, { sessionId });
 	}
 
+	// The event route flushes headers immediately because clients subscribe before sending their prompt.
 	const server = createServer((req, res) => {
 		if (req.method === "GET" && req.url === "/health") {
 			writeJson(res, 200, { name: "ker", protocol: PROTOCOL_VERSION, sessionId });
 			return;
 		}
-		// flushHeaders is load-bearing: Node buffers the header block until the first body write,
-		// and a client awaiting fetch("/event") would deadlock against its own POST without it.
 		if (req.method === "GET" && req.url === "/event") {
 			if (!isLocalRequest(req)) {
 				res.writeHead(403).end();
@@ -188,8 +305,7 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 		res.writeHead(404).end();
 	});
 
-	// The heartbeat keeps intermediaries and undici's 300s idle body timeout from severing quiet
-	// streams; unref'd so it never holds the process open once the server is gone.
+	// Keep quiet streams alive without holding the daemon process open.
 	const heartbeat = setInterval(() => {
 		for (const res of subscribers) {
 			if (!res.destroyed) res.write(": hb\n\n");
@@ -202,12 +318,16 @@ export function createDaemon(harness: Harness = createConfiguredHarness()): Serv
 
 interface Harness {
 	reset(): void;
-	send(text: string, signal?: AbortSignal): AsyncIterable<Protocol.Event>;
+	send(input: Engine.TurnInput, signal?: AbortSignal): AsyncIterable<Protocol.TurnEvent>;
 }
 
 interface ActiveTurn {
 	sessionId: Protocol.SessionId;
 	turnId: Protocol.TurnId;
+	initial: Engine.UserMessage;
+	pending: Engine.UserMessage[];
+	steering: Engine.UserMessage[];
+	accepting: boolean;
 	controller: AbortController;
 	done: PromiseWithResolvers<void>;
 	terminal: boolean;
