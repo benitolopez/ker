@@ -225,6 +225,64 @@ test("active cancellation becomes durable and returns before cleanup", async (t)
 	assert.equal((await getSnapshot(running.url, session.id)).queue.revision, snapshot.queue.revision);
 });
 
+test("concurrent cancellation requests record one transition", async (t) => {
+	const controlled = controlledFactory({ pauseAfterAbort: true });
+	const running = await startServer(t, controlled.factory);
+	const session = await createSession(running.url);
+	const admitted = await prompt(running.url, session.id, "A");
+	await controlled.deltaSeen(0);
+	const before = await getSnapshot(running.url, session.id);
+	const subscription = await localFetch(
+		`${running.url}/sessions/${session.id}/events?epoch=${before.cursor.epoch}&sequence=${before.cursor.sequence}`,
+	);
+	const cancelUrl = `${running.url}/sessions/${session.id}/turns/${admitted.turnId}/cancel`;
+
+	const responses = await Promise.all([
+		localFetch(cancelUrl, { method: "POST" }),
+		localFetch(cancelUrl, { method: "POST" }),
+	]);
+	assert.deepEqual(
+		responses.map((response) => response.status),
+		[202, 202],
+	);
+	await Promise.all(responses.map((response) => readJson(response.body)));
+	assert.equal((await getSnapshot(running.url, session.id)).queue.revision, before.queue.revision + 1);
+
+	controlled.releaseCleanup(0);
+	const events: Protocol.Event[] = [];
+	for await (const envelope of readEnvelopes(subscription.body)) {
+		events.push(envelope.event);
+		if (envelope.event.type === "end" && envelope.event.turnId === admitted.turnId) break;
+	}
+	assert.equal(
+		events.filter((event) => event.type === "turn_cancel_requested" && event.turnId === admitted.turnId).length,
+		1,
+	);
+	assert.equal(events.filter((event) => event.type === "turn_terminal" && event.turnId === admitted.turnId).length, 1);
+});
+
+test("cancellation racing natural completion has one consistent outcome", async (t) => {
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory);
+	const session = await createSession(running.url);
+	const admitted = await prompt(running.url, session.id, "A");
+	await controlled.deltaSeen(0);
+
+	const cancellation = localFetch(`${running.url}/sessions/${session.id}/turns/${admitted.turnId}/cancel`, {
+		method: "POST",
+	});
+	controlled.release(0);
+	const response = await cancellation;
+	assert([202, 409].includes(response.status));
+	await readJson(response.body);
+	await waitForTerminal(running.url, session.id, admitted.turnId);
+	const snapshot = await getSnapshot(running.url, session.id);
+	const status = snapshot.turns.find((turn) => turn.id === admitted.turnId)?.status;
+
+	assert.equal(status, response.status === 202 ? "aborted" : "completed");
+	assert.equal(snapshot.queue.running, undefined);
+});
+
 test("cancellation keeps successors waiting until abort cleanup finishes", async (t) => {
 	const controlled = controlledFactory({ pauseAfterAbort: true });
 	const running = await startServer(t, controlled.factory);
@@ -248,6 +306,37 @@ test("cancellation keeps successors waiting until abort cleanup finishes", async
 	controlled.release(1);
 	await controlled.finished(1);
 	assert.deepEqual(controlled.initials, ["A", "B"]);
+});
+
+test("waiting cancellation racing promotion never retargets its successor", async (t) => {
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory);
+	const session = await createSession(running.url);
+	await prompt(running.url, session.id, "A");
+	await controlled.deltaSeen(0);
+	const second = await prompt(running.url, session.id, "B");
+	const successor = await prompt(running.url, session.id, "C");
+
+	const cancellation = localFetch(`${running.url}/sessions/${session.id}/turns/${second.turnId}/cancel`, {
+		method: "POST",
+	});
+	controlled.release(0);
+	const response = await cancellation;
+	assert([200, 202].includes(response.status));
+	await readJson(response.body);
+	await waitForTerminal(running.url, session.id, second.turnId);
+	while (!controlled.initials.includes("C")) await new Promise<void>((resolve) => setImmediate(resolve));
+	const successorIndex = controlled.initials.indexOf("C");
+	controlled.release(successorIndex);
+	await controlled.finished(successorIndex);
+	await waitForTerminal(running.url, session.id, successor.turnId);
+	const snapshot = await getSnapshot(running.url, session.id);
+
+	assert.equal(
+		snapshot.turns.find((turn) => turn.id === second.turnId)?.status,
+		response.status === 200 ? "cancelled" : "aborted",
+	);
+	assert.equal(snapshot.turns.find((turn) => turn.id === successor.turnId)?.status, "completed");
 });
 
 test("completed and unknown turns cannot be cancelled", async (t) => {
@@ -401,6 +490,27 @@ test("restart finalizes a durable cancellation as aborted without repeating tool
 	if (marker?.role === "developer") assert.match(marker.content, /cancelled before a daemon restart finished cleanup/);
 });
 
+test("restart finishes cancellation cleanup before starting its queued successor", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cancelling-queue-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const seeded = await seedCancellingWithWaiting(store);
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory, { sessionDir });
+	await controlled.started(0);
+	const recovered = await getSnapshot(running.url, seeded.session.session.id);
+
+	assert.equal(recovered.turns.find((turn) => turn.id === "turn-1")?.status, "aborted");
+	assert.equal(recovered.turns.find((turn) => turn.id === seeded.waiting.turnId)?.status, "running");
+	assert.deepEqual(controlled.initials, ["next"]);
+
+	controlled.release(0);
+	await controlled.finished(0);
+	await waitForTerminal(running.url, seeded.session.session.id, seeded.waiting.turnId);
+	const completed = await getSnapshot(running.url, seeded.session.session.id);
+	assert.equal(completed.turns.find((turn) => turn.id === seeded.waiting.turnId)?.status, "completed");
+});
+
 function immediateFactory(): NonNullable<DaemonOptions["harnessFactory"]> {
 	return (initial) => {
 		const state = structuredClone(initial);
@@ -523,6 +633,54 @@ async function seedRunning(store: SessionStore, extra: Payload[], state: "runnin
 			: []),
 	]);
 	return session;
+}
+
+async function seedCancellingWithWaiting(store: SessionStore) {
+	const session = await seedRunning(store, [], "cancelling");
+	const running: Protocol.QueueItem = {
+		id: "queue-1",
+		sessionId: session.session.id,
+		turnId: "turn-1",
+		messageId: "message-1",
+		text: "hello",
+		state: "cancelling",
+		submittedAt: "2026-01-01T00:00:00.000Z",
+	};
+	const waiting: Protocol.QueueItem = {
+		id: "queue-2",
+		sessionId: session.session.id,
+		turnId: "turn-2",
+		messageId: "message-2",
+		text: "next",
+		state: "waiting",
+		submittedAt: "2026-01-01T00:00:01.000Z",
+	};
+	await session.log.append([
+		{
+			type: "event",
+			event: {
+				actor: "human",
+				sessionId: session.session.id,
+				turnId: waiting.turnId,
+				type: "message_submitted",
+				messageId: waiting.messageId,
+				queueItemId: waiting.id,
+				text: waiting.text,
+				placement: "end",
+				admission: "waiting",
+			},
+		},
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				type: "queue_changed",
+				queue: { revision: 3, running, waiting: [waiting] },
+			},
+		},
+	]);
+	return { session, waiting };
 }
 
 function controlledFactory(options: { pauseAfterDelta?: boolean; pauseAfterAbort?: boolean } = {}): {
@@ -730,7 +888,7 @@ async function waitForTerminal(url: string, sessionId: string, turnId: string): 
 	while (true) {
 		const snapshot = await getSnapshot(url, sessionId);
 		const turn = snapshot.turns.find((candidate) => candidate.id === turnId);
-		if (turn && turn.status !== "running" && turn.status !== "waiting") return;
+		if (turn && turn.status !== "running" && turn.status !== "cancelling" && turn.status !== "waiting") return;
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 }
