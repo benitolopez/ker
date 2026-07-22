@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import * as Daemon from "@ker-ai/daemon";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
@@ -7,276 +8,423 @@ import { sseData } from "./sse.ts";
 
 const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
 
-// The `ker` bin: a leading `--json` dumps each raw event as JSON; otherwise only the assistant's
-// answer streams to stdout. A sole command argument runs that operation; anything else is a prompt
-// sent to the daemon.
+interface ParsedPrompt {
+	json: boolean;
+	sessionId: Protocol.SessionId;
+	placement: Protocol.Placement;
+	text: string;
+}
+
 export async function run(): Promise<void> {
-	let args = process.argv.slice(2);
-	const json = args[0] === "--json";
-	if (json) args = args.slice(1);
-	if (args.length === 1 && args[0] === "daemon") {
+	const args = process.argv.slice(2);
+	const json = args.includes("--json");
+	const positional = args.filter((arg) => arg !== "--json");
+	if (positional.length === 1 && positional[0] === "daemon") {
 		runDaemon();
 		return;
 	}
-	if (args.length === 1 && args[0] === "login") {
+	if (positional.length === 1 && positional[0] === "login") {
 		await runLogin();
 		return;
 	}
-	if (args.length === 1 && args[0] === "logout") {
+	if (positional.length === 1 && positional[0] === "logout") {
 		await runLogout();
 		return;
 	}
-	if (args.length === 1 && args[0] === "new") {
-		await runNewConversation();
+	if (positional.length === 1 && positional[0] === "new") {
+		await runNewSession(json);
 		return;
 	}
-	const prompt = args.join(" ").trim();
+	if (positional.length === 1 && positional[0] === "sessions") {
+		await runSessions(json);
+		return;
+	}
+	if (positional[0] === "attach" && positional.length === 2) {
+		await runAttach(positional[1], json);
+		return;
+	}
+	const prompt = parsePrompt(args);
 	if (!prompt) {
-		process.stderr.write("usage: ker [--json] <prompt> | ker daemon | ker login | ker logout | ker new\n");
+		writeUsage();
 		process.exitCode = 1;
 		return;
 	}
-	await runPrompt(prompt, json);
+	await runPrompt(prompt);
 }
 
-async function runNewConversation(): Promise<void> {
+async function runNewSession(json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
-	const res = await fetch(`${BASE}/conversation/new`, { method: "POST" });
-	if (res.status === 201) {
-		process.stderr.write("Started a new conversation.\n");
+	const res = await fetch(`${BASE}/sessions`, { method: "POST" });
+	if (!res.ok) {
+		process.stderr.write(`ker: daemon could not create a session (HTTP ${res.status})\n`);
+		process.exitCode = 1;
 		return;
 	}
-	process.stderr.write(
-		res.status === 409
-			? "ker: daemon is busy — wait for the turn to finish before starting a new conversation\n"
-			: `ker: daemon could not start a new conversation (HTTP ${res.status})\n`,
-	);
-	process.exitCode = 1;
+	const session = (await res.json()) as Protocol.SessionDescriptor;
+	process.stdout.write(json ? `${JSON.stringify(session)}\n` : `${session.id}\n`);
 }
 
-// Host the daemon in the foreground, bound to loopback only — a bare listen(port) would expose
-// the agent on every interface. Signals close all connections first: a plain close() waits
-// forever on open SSE responses.
+async function runSessions(json: boolean): Promise<void> {
+	if (!(await checkHealth())) return;
+	const res = await fetch(`${BASE}/sessions`);
+	if (!res.ok) {
+		process.stderr.write(`ker: daemon could not list sessions (HTTP ${res.status})\n`);
+		process.exitCode = 1;
+		return;
+	}
+	const body = (await res.json()) as {
+		sessions: Protocol.SessionDescriptor[];
+		unreadable: Protocol.UnreadableSession[];
+	};
+	if (json) {
+		process.stdout.write(`${JSON.stringify(body)}\n`);
+		return;
+	}
+	for (const session of body.sessions) {
+		process.stdout.write(`${session.id}\t${session.updatedAt}\t${session.cwd}\n`);
+	}
+	for (const session of body.unreadable) {
+		process.stderr.write(`ker: session ${session.id} is unreadable — ${session.error}\n`);
+	}
+}
+
+// Signals stop new connections, abort the active turn cleanly, and leave waiting work persisted.
 function runDaemon(): void {
 	const server = Daemon.createDaemon();
-	server.once("error", (err) => {
-		if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE") throw err;
+	server.once("error", (error) => {
+		if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
 		process.stderr.write(`ker: port ${DEFAULT_PORT} is in use — is another ker daemon running?\n`);
 		process.exitCode = 1;
 	});
 	server.listen(DEFAULT_PORT, "127.0.0.1", () => {
 		process.stderr.write(`ker daemon listening on ${BASE}\n`);
 	});
+	let shuttingDown = false;
 	const shutdown = () => {
-		server.closeAllConnections();
-		server.close();
-		process.exit(0);
+		if (shuttingDown) return;
+		shuttingDown = true;
+		void (async () => {
+			await server.shutdown();
+			server.closeAllConnections();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		})();
 	};
 	process.once("SIGINT", shutdown);
 	process.once("SIGTERM", shutdown);
 }
 
-// Subscribe before submission so a newly started turn cannot emit events before its client listens.
-// A queued sender acknowledges admission and leaves the shared turn to its starter. Only the starter
-// renders matching turn events and owns SIGINT cancellation.
-async function runPrompt(prompt: string, json: boolean): Promise<void> {
-	const preSubmit = new AbortController();
-	let submissionStarted = false;
-	let abortRequested = false;
-	let ownsTurn = false;
-	let sessionId: Protocol.SessionId | undefined;
-	let turnId: Protocol.TurnId | undefined;
-	let abortRequest: Promise<{ kind: "response"; response: Response } | { kind: "error"; error: unknown }> | undefined;
-	const requestAbort = () => {
-		if (!abortRequested || !ownsTurn || !sessionId || !turnId || abortRequest) return;
-		abortRequest = fetch(`${BASE}/turn/abort`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ sessionId, turnId }),
-		}).then(
-			(response) => ({ kind: "response", response }),
-			(error: unknown) => ({ kind: "error", error }),
-		);
-	};
-	const onSigint = () => {
-		if (abortRequested) {
-			process.exit(130);
-			return;
-		}
-		abortRequested = true;
-		if (!submissionStarted) preSubmit.abort();
-		requestAbort();
-	};
-	process.on("SIGINT", onSigint);
-
+async function runAttach(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
+	if (!(await checkHealth())) return;
+	const controller = new AbortController();
+	const renderer = new Renderer();
+	const onSigint = () => controller.abort();
+	process.once("SIGINT", onSigint);
 	try {
-		const health = await checkHealth(preSubmit.signal);
-		if (!health) {
-			if (abortRequested) process.exitCode = 130;
-			return;
-		}
-		if (abortRequested) {
-			process.exitCode = 130;
-			return;
-		}
-		sessionId = health.sessionId;
-
-		const events = await fetch(`${BASE}/event`, { signal: preSubmit.signal });
-		if (!events.ok || events.body === null) {
-			process.stderr.write(`ker: could not subscribe to the event stream (HTTP ${events.status})\n`);
-			process.exitCode = 1;
-			return;
-		}
-		if (abortRequested) {
-			await events.body.cancel();
-			process.exitCode = 130;
-			return;
-		}
-
-		submissionStarted = true;
-		const submitted = await fetch(`${BASE}/prompt`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ text: prompt, sessionId: health.sessionId }),
-		});
-		if (submitted.status !== 202) {
-			await events.body.cancel();
-			if (abortRequested) {
-				process.exitCode = 130;
-				return;
-			}
-			process.stderr.write(
-				submitted.status === 412
-					? "ker: a new conversation was started before this prompt arrived — resubmit it\n"
-					: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
-			);
-			process.exitCode = 1;
-			return;
-		}
-		const accepted: unknown = await submitted.json();
-		if (!isMessageSubmitted(accepted)) {
-			await events.body.cancel();
-			process.stderr.write("ker: daemon accepted the prompt without a valid submission event\n");
-			process.exitCode = 1;
-			return;
-		}
-		if (accepted.queued) {
-			await events.body.cancel();
-			if (json) {
-				process.stdout.write(`${JSON.stringify(accepted)}\n`);
-				return;
-			}
-			process.stderr.write("Queued message for the active turn.\n");
-			return;
-		}
-
-		ownsTurn = true;
-		sessionId = accepted.sessionId;
-		turnId = accepted.turnId;
-		requestAbort();
-
-		let streamed = false;
-		let terminal = false;
-		let aborted = false;
-		for await (const data of sseData(events.body)) {
-			const event = JSON.parse(data) as Protocol.Event;
-			if (event.sessionId !== accepted.sessionId || !("turnId" in event) || event.turnId !== accepted.turnId) {
-				continue;
-			}
-			if (json) process.stdout.write(`${data}\n`);
-			if (!json && event.type === "message_delta") {
-				streamed = true;
-				process.stdout.write(event.text);
-			}
-			if (event.type === "error") {
-				if (!json) {
-					process.stderr.write(`\nker: ${event.message}\n`);
-					const remediation = identityChangeRemediation(event);
-					if (remediation) process.stderr.write(`ker: ${remediation}\n`);
+		const initial = await fetchSnapshot(sessionId, controller.signal);
+		if (!initial) return;
+		if (json) process.stdout.write(`${JSON.stringify(initial)}\n`);
+		if (!json) renderer.snapshot(initial, () => true, true);
+		let cursor = initial.cursor;
+		while (!controller.signal.aborted) {
+			try {
+				const events = await subscribe(sessionId, cursor, controller.signal);
+				if (events.status === 410) {
+					const snapshot = await fetchSnapshot(sessionId, controller.signal);
+					if (!snapshot) return;
+					if (json) process.stdout.write(`${JSON.stringify(snapshot)}\n`);
+					if (!json) renderer.snapshot(snapshot, () => true, true);
+					cursor = snapshot.cursor;
+					continue;
 				}
-				process.exitCode = 1;
-			}
-			if (event.type === "aborted") aborted = true;
-			if (event.type === "end") {
-				terminal = true;
-				break;
-			}
-		}
-		if (streamed) process.stdout.write("\n");
-		if (!terminal) {
-			process.stderr.write("ker: daemon closed the event stream mid-turn\n");
-			process.exitCode = 1;
-		}
-		if (aborted) {
-			if (!json) process.stderr.write("ker: aborted\n");
-			process.exitCode = 130;
-		}
-		if (abortRequest) {
-			const result = await abortRequest;
-			if (result.kind === "error") {
+				if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
+				for await (const data of sseData(events.body)) {
+					const envelope = JSON.parse(data) as Protocol.EventEnvelope;
+					cursor = { epoch: envelope.epoch, sequence: envelope.sequence };
+					if (json) process.stdout.write(`${data}\n`);
+					if (!json) renderer.event(envelope.event, () => true);
+				}
+			} catch (error) {
+				if (controller.signal.aborted) break;
 				process.stderr.write(
-					`ker: could not reach the daemon to abort the turn — ${result.error instanceof Error ? result.error.message : String(result.error)}\n`,
+					`ker: attach disconnected — ${error instanceof Error ? error.message : String(error)}; reconnecting\n`,
 				);
-				process.exitCode = 1;
-			}
-			if (result.kind === "response" && result.response.status !== 204 && result.response.status !== 409) {
-				process.stderr.write(`ker: daemon could not abort the turn (HTTP ${result.response.status})\n`);
-				process.exitCode = 1;
+				await sleep(1_000, undefined, { signal: controller.signal });
 			}
 		}
 	} catch (error) {
-		if (abortRequested && !submissionStarted) {
-			process.exitCode = 130;
-			return;
+		if (!controller.signal.aborted) {
+			process.stderr.write(`ker: attach failed — ${error instanceof Error ? error.message : String(error)}\n`);
+			process.exitCode = 1;
 		}
-		process.stderr.write(`ker: turn failed — ${error instanceof Error ? error.message : String(error)}\n`);
-		process.exitCode = 1;
 	} finally {
 		process.off("SIGINT", onSigint);
 	}
 }
 
-function isMessageSubmitted(value: unknown): value is Protocol.MessageSubmittedEvent {
-	if (typeof value !== "object" || value === null) return false;
-	const event = value as Record<string, unknown>;
-	return (
-		event.actor === "human" &&
-		event.type === "message_submitted" &&
-		typeof event.sessionId === "string" &&
-		typeof event.turnId === "string" &&
-		typeof event.messageId === "string" &&
-		typeof event.text === "string" &&
-		typeof event.queued === "boolean"
-	);
+// A prompt subscribes before admission, waits through the project queue, and cancels only its exact turn.
+async function runPrompt(prompt: ParsedPrompt): Promise<void> {
+	const controller = new AbortController();
+	const renderer = new Renderer();
+	let accepted: Protocol.PromptAdmission | undefined;
+	let cancelRequest: Promise<Response> | undefined;
+	let interrupted = false;
+	const onSigint = () => {
+		if (interrupted) {
+			process.exit(130);
+			return;
+		}
+		interrupted = true;
+		controller.abort();
+		if (accepted) {
+			cancelRequest = fetch(
+				`${BASE}/sessions/${encodeURIComponent(accepted.sessionId)}/turns/${encodeURIComponent(accepted.turnId)}/cancel`,
+				{ method: "POST" },
+			);
+		}
+	};
+	process.on("SIGINT", onSigint);
+	try {
+		if (!(await checkHealth(controller.signal))) return;
+		const initial = await fetchSnapshot(prompt.sessionId, controller.signal);
+		if (!initial) return;
+		if (prompt.json) process.stdout.write(`${JSON.stringify(initial)}\n`);
+		renderer.snapshot(initial, () => true, false);
+		let cursor = initial.cursor;
+		let events = await subscribe(prompt.sessionId, cursor, controller.signal);
+		if (events.status === 410) {
+			const replacement = await fetchSnapshot(prompt.sessionId, controller.signal);
+			if (!replacement) return;
+			if (prompt.json) process.stdout.write(`${JSON.stringify(replacement)}\n`);
+			renderer.snapshot(replacement, () => true, false);
+			cursor = replacement.cursor;
+			events = await subscribe(prompt.sessionId, cursor, controller.signal);
+		}
+		if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
+		const submitted = await fetch(`${BASE}/sessions/${encodeURIComponent(prompt.sessionId)}/prompts`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				text: prompt.text,
+				placement: prompt.placement.type,
+				turnId: prompt.placement.type === "end" ? undefined : prompt.placement.turnId,
+			}),
+		});
+		if (submitted.status !== 202) {
+			const body = (await submitted.json().catch(() => undefined)) as { code?: string } | undefined;
+			process.stderr.write(
+				body?.code === "turn_unavailable"
+					? "ker: the named turn is no longer running in this session\n"
+					: submitted.status === 404
+						? `ker: session ${prompt.sessionId} was not found\n`
+						: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
+			);
+			process.exitCode = 1;
+			return;
+		}
+		accepted = (await submitted.json()) as Protocol.PromptAdmission;
+		if (interrupted && !cancelRequest) {
+			cancelRequest = fetch(
+				`${BASE}/sessions/${encodeURIComponent(accepted.sessionId)}/turns/${encodeURIComponent(accepted.turnId)}/cancel`,
+				{ method: "POST" },
+			);
+		}
+		process.stderr.write(`ker: ${accepted.status} (turn ${accepted.turnId})\n`);
+		const matches = (turnId: Protocol.TurnId) => turnId === accepted?.turnId;
+		let terminal = false;
+		let failed = false;
+		while (!terminal && !controller.signal.aborted) {
+			try {
+				if (!events.body) throw new Error("event stream has no body");
+				for await (const data of sseData(events.body)) {
+					const envelope = JSON.parse(data) as Protocol.EventEnvelope;
+					cursor = { epoch: envelope.epoch, sequence: envelope.sequence };
+					if (prompt.json) process.stdout.write(`${data}\n`);
+					if (!prompt.json) renderer.event(envelope.event, matches);
+					if (!("turnId" in envelope.event) || !matches(envelope.event.turnId)) continue;
+					if (envelope.event.type === "error") {
+						failed = true;
+						if (!prompt.json) {
+							process.stderr.write(`ker: ${envelope.event.message}\n`);
+							const remediation = identityChangeRemediation(envelope.event);
+							if (remediation) process.stderr.write(`ker: ${remediation}\n`);
+						}
+					}
+					if (envelope.event.type === "turn_terminal") {
+						if (envelope.event.reason !== "completed") failed = true;
+					}
+					if (envelope.event.type === "end") terminal = true;
+					if (terminal) break;
+				}
+				if (terminal) break;
+				const snapshot = await fetchSnapshot(prompt.sessionId, controller.signal);
+				if (!snapshot) return;
+				if (prompt.json) process.stdout.write(`${JSON.stringify(snapshot)}\n`);
+				if (!prompt.json) renderer.snapshot(snapshot, matches, true);
+				cursor = snapshot.cursor;
+				const turn = snapshot.turns.find((candidate) => matches(candidate.id));
+				if (turn && turn.status !== "running" && turn.status !== "waiting") {
+					terminal = true;
+					failed = turn.status !== "completed";
+					break;
+				}
+				events = await subscribe(prompt.sessionId, cursor, controller.signal);
+				if (events.status === 410) continue;
+				if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
+			} catch (error) {
+				if (controller.signal.aborted) break;
+				process.stderr.write(
+					`ker: event stream disconnected — ${error instanceof Error ? error.message : String(error)}; reconnecting\n`,
+				);
+				await sleep(1_000, undefined, { signal: controller.signal });
+				const snapshot = await fetchSnapshot(prompt.sessionId, controller.signal);
+				if (!snapshot) return;
+				if (prompt.json) process.stdout.write(`${JSON.stringify(snapshot)}\n`);
+				if (!prompt.json) renderer.snapshot(snapshot, matches, true);
+				cursor = snapshot.cursor;
+				events = await subscribe(prompt.sessionId, cursor, controller.signal);
+			}
+		}
+		if (failed) process.exitCode = 1;
+	} catch (error) {
+		if (!interrupted) {
+			process.stderr.write(`ker: prompt failed — ${error instanceof Error ? error.message : String(error)}\n`);
+			process.exitCode = 1;
+		}
+	} finally {
+		if (cancelRequest) {
+			try {
+				const response = await cancelRequest;
+				if (response.status !== 204 && response.status !== 409) {
+					process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${response.status})\n`);
+				}
+			} catch (error) {
+				process.stderr.write(
+					`ker: could not reach the daemon to cancel the turn — ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		}
+		if (interrupted) process.exitCode = 130;
+		process.off("SIGINT", onSigint);
+	}
 }
 
-// Fail fast before subscribing: a refused connection means no daemon is running, and a protocol
-// mismatch means a stale daemon from an older build is still up. On success returns the daemon's
-// session id, which a prompt echoes back so a reset in between is detected. fetch
-// buries the refusal as a TypeError whose cause carries the ECONNREFUSED code.
-async function checkHealth(signal?: AbortSignal): Promise<{ sessionId: Protocol.SessionId } | undefined> {
+class Renderer {
+	readonly #seen = new Map<Protocol.MessageId, number>();
+	readonly #ended = new Set<Protocol.MessageId>();
+	readonly #activeByTurn = new Map<Protocol.TurnId, Protocol.MessageId>();
+
+	snapshot(snapshot: Protocol.SessionSnapshot, matches: (turnId: Protocol.TurnId) => boolean, render: boolean): void {
+		for (const message of snapshot.messages) {
+			if (!matches(message.turnId)) continue;
+			this.#text(message.id, message.turnId, message.text, render);
+			this.#finish(message.id, render);
+		}
+		if (snapshot.active && matches(snapshot.active.turnId)) {
+			this.#text(snapshot.active.id, snapshot.active.turnId, snapshot.active.text, render);
+		}
+	}
+
+	event(event: Protocol.Event, matches: (turnId: Protocol.TurnId) => boolean): void {
+		if (!("turnId" in event) || !matches(event.turnId)) return;
+		if (event.type === "message_delta") this.#text(event.messageId, event.turnId, event.text, true, event.offset);
+		if (event.type === "assistant_message_completed") this.#finish(event.messageId, true);
+		if (event.type === "error" || event.type === "aborted" || event.type === "interrupted") {
+			const active = this.#activeByTurn.get(event.turnId);
+			if (active) this.#finish(active, true);
+		}
+	}
+
+	#text(id: Protocol.MessageId, turnId: Protocol.TurnId, text: string, render: boolean, offset = 0): void {
+		const seen = this.#seen.get(id) ?? 0;
+		const end = offset + text.length;
+		if (end <= seen) return;
+		if (offset > seen) throw new Error(`Missing assistant output before offset ${offset}`);
+		if (render) process.stdout.write(text.slice(seen - offset));
+		this.#seen.set(id, end);
+		this.#activeByTurn.set(turnId, id);
+	}
+
+	#finish(id: Protocol.MessageId, render: boolean): void {
+		if (this.#ended.has(id)) return;
+		if (render && (this.#seen.get(id) ?? 0) > 0) process.stdout.write("\n");
+		this.#ended.add(id);
+	}
+}
+
+function parsePrompt(args: string[]): ParsedPrompt | undefined {
+	const values = args.filter((arg) => arg !== "--json");
+	const json = values.length !== args.length;
+	const sessionIndex = values.indexOf("--session");
+	if (sessionIndex === -1 || !values[sessionIndex + 1]) return undefined;
+	const sessionId = values[sessionIndex + 1];
+	values.splice(sessionIndex, 2);
+	const afterIndex = values.indexOf("--after-turn");
+	const toIndex = values.indexOf("--to-turn");
+	if (afterIndex !== -1 && toIndex !== -1) return undefined;
+	if ((afterIndex !== -1 && !values[afterIndex + 1]) || (toIndex !== -1 && !values[toIndex + 1])) return undefined;
+	const placement: Protocol.Placement =
+		afterIndex !== -1 && values[afterIndex + 1]
+			? { type: "after_turn", turnId: values[afterIndex + 1] }
+			: toIndex !== -1 && values[toIndex + 1]
+				? { type: "running_turn", turnId: values[toIndex + 1] }
+				: { type: "end" };
+	const placementIndex = afterIndex !== -1 ? afterIndex : toIndex;
+	if (placementIndex !== -1) values.splice(placementIndex, 2);
+	const text = values.join(" ").trim();
+	if (!text || values.some((value) => value.startsWith("--"))) return undefined;
+	return { json, sessionId, placement, text };
+}
+
+async function subscribe(
+	sessionId: Protocol.SessionId,
+	cursor: Protocol.Cursor,
+	signal: AbortSignal,
+): Promise<Response> {
+	const query = new URLSearchParams({ epoch: cursor.epoch, sequence: String(cursor.sequence) });
+	return fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/events?${query}`, { signal });
+}
+
+async function fetchSnapshot(
+	sessionId: Protocol.SessionId,
+	signal?: AbortSignal,
+): Promise<Protocol.SessionSnapshot | undefined> {
+	const res = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`, { signal });
+	if (res.status === 404) {
+		process.stderr.write(`ker: session ${sessionId} was not found\n`);
+		process.exitCode = 1;
+		return undefined;
+	}
+	if (!res.ok) throw new Error(`snapshot returned HTTP ${res.status}`);
+	return (await res.json()) as Protocol.SessionSnapshot;
+}
+
+async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 	try {
 		const res = await fetch(`${BASE}/health`, { signal });
-		const health = (await res.json()) as { protocol?: string; sessionId?: unknown };
-		if (health.protocol === PROTOCOL_VERSION && typeof health.sessionId === "string") {
-			return { sessionId: health.sessionId };
-		}
-		if (signal?.aborted) return undefined;
+		const health = (await res.json()) as { protocol?: string };
+		if (health.protocol === PROTOCOL_VERSION) return true;
+		if (signal?.aborted) return false;
 		process.stderr.write(
 			`ker: daemon speaks protocol ${health.protocol}, this client needs ${PROTOCOL_VERSION} — restart the daemon\n`,
 		);
-	} catch (err) {
-		if (signal?.aborted) return undefined;
+	} catch (error) {
+		if (signal?.aborted) return false;
 		const refused =
-			err instanceof TypeError &&
-			err.cause instanceof Error &&
-			(err.cause as NodeJS.ErrnoException).code === "ECONNREFUSED";
+			error instanceof TypeError &&
+			error.cause instanceof Error &&
+			(error.cause as NodeJS.ErrnoException).code === "ECONNREFUSED";
 		process.stderr.write(
 			refused
 				? "ker: daemon not running — start it with `ker daemon`\n"
-				: `ker: could not reach the daemon — ${err instanceof Error ? err.message : String(err)}\n`,
+				: `ker: could not reach the daemon — ${error instanceof Error ? error.message : String(error)}\n`,
 		);
 	}
 	process.exitCode = 1;
-	return undefined;
+	return false;
+}
+
+function writeUsage(): void {
+	process.stderr.write(
+		"usage: ker [--json] new | sessions | attach <id>\n       ker [--json] --session <id> [--after-turn <id> | --to-turn <id>] <prompt>\n       ker daemon | login | logout\n",
+	);
 }

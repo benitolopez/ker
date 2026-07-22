@@ -1,151 +1,122 @@
 import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
+import type * as Protocol from "@ker-ai/protocol";
 import { PROTOCOL_VERSION } from "@ker-ai/protocol";
 import { run } from "../src/index.ts";
 
-test("an accepted prompt runs without sending an abort", async (t) => {
-	const controlled = controlPrompt(t, true);
+test("an admitted prompt waits for its turn and prints only assistant text", async (t) => {
+	const controlled = controlPrompt(t, "running");
 	const running = run();
 	await controlled.promptStarted.promise;
-
-	controlled.promptResponse.resolve(jsonResponse(submitted(false), 202));
-	await controlled.complete([end()]);
-	await running;
-
-	assert.deepEqual(controlled.abortBodies, []);
-	assert.equal(process.exitCode, undefined);
-});
-
-test("SIGINT racing prompt acceptance aborts the exact returned turn", async (t) => {
-	const controlled = controlPrompt(t, true);
-	const running = run();
-	await controlled.promptStarted.promise;
-	const interrupt = findNewSignalListener(controlled.signalListeners);
-
-	interrupt("SIGINT");
-	controlled.promptResponse.resolve(jsonResponse(submitted(false), 202));
-	await running;
-
-	assert.deepEqual(controlled.abortBodies, [{ sessionId: "session-1", turnId: "turn-1" }]);
-	assert.equal(process.exitCode, 130);
-	assert.match(controlled.stderr.join(""), /ker: aborted/);
-});
-
-test("a second SIGINT exits immediately", async (t) => {
-	const controlled = controlPrompt(t, true);
-	const exitCodes: Array<number | string | null | undefined> = [];
-	t.mock.method(process, "exit", (code: number | string | null | undefined) => {
-		exitCodes.push(code);
-		return undefined as never;
-	});
-	const running = run();
-	await controlled.promptStarted.promise;
-	const interrupt = findNewSignalListener(controlled.signalListeners);
-
-	interrupt("SIGINT");
-	interrupt("SIGINT");
-	controlled.promptResponse.resolve(jsonResponse(submitted(false), 202));
-	await running;
-
-	assert.deepEqual(exitCodes, [130]);
-});
-
-test("a natural end racing a late abort remains successful", async (t) => {
-	const controlled = controlPrompt(t, false);
-	const running = run();
-	await controlled.promptStarted.promise;
-	const interrupt = findNewSignalListener(controlled.signalListeners);
-
-	interrupt("SIGINT");
-	controlled.promptResponse.resolve(jsonResponse(submitted(false), 202));
-	await running;
-
-	assert.deepEqual(controlled.abortBodies, [{ sessionId: "session-1", turnId: "turn-1" }]);
-	assert.equal(process.exitCode, undefined);
-});
-
-test("a queued sender acknowledges and never aborts the shared turn", async (t) => {
-	const controlled = controlPrompt(t, true);
-	const running = run();
-	await controlled.promptStarted.promise;
-	const interrupt = findNewSignalListener(controlled.signalListeners);
-
-	interrupt("SIGINT");
-	controlled.promptResponse.resolve(jsonResponse(submitted(true), 202));
-	await running;
-
-	assert.deepEqual(controlled.abortBodies, []);
-	assert.equal(controlled.stderr.join(""), "Queued message for the active turn.\n");
-	assert.equal(process.exitCode, undefined);
-});
-
-test("--json prints only the returned submission for a queued sender", async (t) => {
-	const controlled = controlPrompt(t, true, true);
-	const running = run();
-	await controlled.promptStarted.promise;
-
-	controlled.promptResponse.resolve(jsonResponse(submitted(true), 202));
-	await running;
-
-	assert.equal(controlled.stdout.join(""), `${JSON.stringify(submitted(true))}\n`);
-	assert.deepEqual(controlled.abortBodies, []);
-});
-
-test("a turn starter ignores events belonging to another turn", async (t) => {
-	const controlled = controlPrompt(t, true);
-	const running = run();
-	await controlled.promptStarted.promise;
-
-	controlled.promptResponse.resolve(jsonResponse(submitted(false), 202));
-	await controlled.complete([
-		{
-			actor: "process",
-			sessionId: "session-1",
-			turnId: "other-turn",
-			type: "error",
-			message: "other failure",
-		},
-		{
-			actor: "process",
-			sessionId: "session-1",
-			turnId: "other-turn",
-			type: "end",
-		},
+	controlled.promptResponse.resolve(jsonResponse(admission("running"), 202));
+	controlled.complete([
 		{
 			actor: "agent",
 			modelRole: "assistant",
 			sessionId: "session-1",
 			turnId: "turn-1",
 			type: "message_delta",
+			messageId: "assistant-1",
+			offset: 0,
 			text: "answer",
 		},
+		{
+			actor: "agent",
+			modelRole: "assistant",
+			sessionId: "session-1",
+			turnId: "turn-1",
+			type: "assistant_message_completed",
+			messageId: "assistant-1",
+			reason: "completed",
+		},
+		terminal("completed"),
 		end(),
 	]);
 	await running;
 
 	assert.equal(controlled.stdout.join(""), "answer\n");
-	assert.equal(controlled.stderr.join(""), "");
-	assert.equal(process.exitCode, undefined);
+	assert.equal(controlled.stderr.join(""), "ker: running (turn turn-1)\n");
+	assert.deepEqual(controlled.cancelBodies, []);
+});
+
+test("a waiting prompt remains attached until its own turn finishes", async (t) => {
+	const controlled = controlPrompt(t, "waiting");
+	const running = run();
+	await controlled.promptStarted.promise;
+	controlled.promptResponse.resolve(jsonResponse(admission("waiting"), 202));
+
+	assert.equal(await Promise.race([running.then(() => "done"), Promise.resolve("waiting")]), "waiting");
+	controlled.complete([terminal("completed"), end()]);
+	await running;
+	assert.match(controlled.stderr.join(""), /ker: waiting/);
+});
+
+test("SIGINT racing admission cancels the exact returned turn", async (t) => {
+	const controlled = controlPrompt(t, "running");
+	const running = run();
+	await controlled.promptStarted.promise;
+	const interrupt = findNewSignalListener(controlled.signalListeners);
+	interrupt("SIGINT");
+	controlled.promptResponse.resolve(jsonResponse(admission("running"), 202));
+	await running;
+
+	assert.deepEqual(controlled.cancelBodies, [{ sessionId: "session-1", turnId: "turn-1" }]);
+	assert.equal(process.exitCode, 130);
+});
+
+test("--to-turn sends exact running-turn placement", async (t) => {
+	const controlled = controlPrompt(t, "added_to_running", ["--session", "session-1", "--to-turn", "turn-1", "steer"]);
+	const running = run();
+	await controlled.promptStarted.promise;
+	controlled.promptResponse.resolve(jsonResponse(admission("added_to_running"), 202));
+	controlled.complete([terminal("completed"), end()]);
+	await running;
+
+	assert.deepEqual(controlled.promptBodies, [{ text: "steer", placement: "running_turn", turnId: "turn-1" }]);
+});
+
+test("--json prints the snapshot and raw event envelopes", async (t) => {
+	const controlled = controlPrompt(t, "running", ["--json", "--session", "session-1", "hello"]);
+	const running = run();
+	await controlled.promptStarted.promise;
+	controlled.promptResponse.resolve(jsonResponse(admission("running"), 202));
+	controlled.complete([terminal("completed"), end()]);
+	await running;
+
+	const lines = controlled.stdout
+		.join("")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line) as unknown);
+	assert.deepEqual(lines[0], snapshot());
+	assert.equal((lines[1] as Protocol.EventEnvelope).event.type, "turn_terminal");
+	assert.equal((lines[2] as Protocol.EventEnvelope).event.type, "end");
 });
 
 interface ControlledPrompt {
 	promptStarted: PromiseWithResolvers<void>;
 	promptResponse: PromiseWithResolvers<Response>;
-	abortBodies: Array<{ sessionId: string; turnId: string }>;
+	cancelBodies: Array<{ sessionId: string; turnId: string }>;
+	promptBodies: object[];
 	signalListeners: Set<(signal: NodeJS.Signals) => void>;
 	stderr: string[];
 	stdout: string[];
-	complete: (events: object[]) => Promise<void>;
+	complete(events: Protocol.Event[]): void;
 }
 
-function controlPrompt(t: TestContext, aborts: boolean, json = false): ControlledPrompt {
+function controlPrompt(
+	t: TestContext,
+	_status: Protocol.AdmissionStatus,
+	args = ["--session", "session-1", "hello"],
+): ControlledPrompt {
 	const originalFetch = globalThis.fetch;
 	const originalArgv = process.argv;
 	const originalExitCode = process.exitCode;
 	const promptStarted = Promise.withResolvers<void>();
 	const promptResponse = Promise.withResolvers<Response>();
 	const streamController = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
-	const abortBodies: Array<{ sessionId: string; turnId: string }> = [];
+	const cancelBodies: Array<{ sessionId: string; turnId: string }> = [];
+	const promptBodies: object[] = [];
 	const signalListeners = new Set(process.listeners("SIGINT"));
 	const stderr: string[] = [];
 	const stdout: string[] = [];
@@ -156,7 +127,7 @@ function controlPrompt(t: TestContext, aborts: boolean, json = false): Controlle
 		},
 	});
 
-	process.argv = json ? [process.execPath, "ker", "--json", "hello"] : [process.execPath, "ker", "hello"];
+	process.argv = [process.execPath, "ker", ...args];
 	process.exitCode = undefined;
 	t.mock.method(process.stderr, "write", (chunk: string | Uint8Array) => {
 		stderr.push(String(chunk));
@@ -168,31 +139,17 @@ function controlPrompt(t: TestContext, aborts: boolean, json = false): Controlle
 	});
 	globalThis.fetch = async (input, init): Promise<Response> => {
 		const path = new URL(String(input)).pathname;
-		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION, sessionId: "session-1" }, 200);
-		if (path === "/event") return new Response(body, { status: 200 });
-		if (path === "/prompt") {
+		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION }, 200);
+		if (path === "/sessions/session-1" && init?.method !== "POST") return jsonResponse(snapshot(), 200);
+		if (path === "/sessions/session-1/events") return new Response(body, { status: 200 });
+		if (path === "/sessions/session-1/prompts") {
+			promptBodies.push(JSON.parse(String(init?.body)) as object);
 			promptStarted.resolve();
 			return promptResponse.promise;
 		}
-		if (path === "/turn/abort") {
-			abortBodies.push(JSON.parse(String(init?.body)) as { sessionId: string; turnId: string });
-			const controller = await streamController.promise;
-			const events = aborts
-				? [
-						{
-							actor: "process",
-							sessionId: "session-1",
-							turnId: "turn-1",
-							type: "aborted",
-						},
-						end(),
-					]
-				: [end()];
-			for (const event of events) {
-				controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-			}
-			controller.close();
-			return new Response(null, { status: aborts ? 204 : 409 });
+		if (path === "/sessions/session-1/turns/turn-1/cancel") {
+			cancelBodies.push({ sessionId: "session-1", turnId: "turn-1" });
+			return new Response(null, { status: 204 });
 		}
 		throw new Error(`Unexpected request to ${path}`);
 	};
@@ -202,15 +159,66 @@ function controlPrompt(t: TestContext, aborts: boolean, json = false): Controlle
 		process.exitCode = originalExitCode;
 	});
 
-	const complete = async (events: object[]) => {
-		const controller = await streamController.promise;
-		for (const event of events) {
-			controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-		}
-		controller.close();
+	return {
+		promptStarted,
+		promptResponse,
+		cancelBodies,
+		promptBodies,
+		signalListeners,
+		stderr,
+		stdout,
+		complete(events) {
+			void streamController.promise.then((controller) => {
+				for (const [index, event] of events.entries()) {
+					const envelope: Protocol.EventEnvelope = { epoch: "epoch-1", sequence: index + 1, event };
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(envelope)}\n\n`));
+				}
+				controller.close();
+			});
+		},
 	};
+}
 
-	return { promptStarted, promptResponse, abortBodies, signalListeners, stderr, stdout, complete };
+function snapshot(): Protocol.SessionSnapshot {
+	return {
+		session: {
+			id: "session-1",
+			cwd: "/project",
+			projectRoot: "/project",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+		},
+		entries: [],
+		messages: [],
+		turns: [],
+		queue: { revision: 0, waiting: [] },
+		cursor: { epoch: "epoch-1", sequence: 0 },
+	};
+}
+
+function admission(status: Protocol.AdmissionStatus): Protocol.PromptAdmission {
+	return {
+		status,
+		sessionId: "session-1",
+		turnId: "turn-1",
+		messageId: "message-1",
+		queueItemId: "queue-1",
+		queue: { revision: 1, waiting: [] },
+	};
+}
+
+function terminal(reason: Protocol.TurnTerminalReason): Protocol.TurnTerminalEvent {
+	return {
+		actor: "process",
+		sessionId: "session-1",
+		turnId: "turn-1",
+		type: "turn_terminal",
+		reason,
+	};
+}
+
+function end(): Protocol.EndEvent {
+	return { actor: "process", sessionId: "session-1", turnId: "turn-1", type: "end" };
 }
 
 function findNewSignalListener(before: Set<(signal: NodeJS.Signals) => void>): (signal: NodeJS.Signals) => void {
@@ -220,29 +228,5 @@ function findNewSignalListener(before: Set<(signal: NodeJS.Signals) => void>): (
 }
 
 function jsonResponse(body: object, status: number): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: { "content-type": "application/json" },
-	});
-}
-
-function submitted(queued: boolean): object {
-	return {
-		actor: "human",
-		sessionId: "session-1",
-		turnId: "turn-1",
-		type: "message_submitted",
-		messageId: "message-1",
-		text: "hello",
-		queued,
-	};
-}
-
-function end(): object {
-	return {
-		actor: "process",
-		sessionId: "session-1",
-		turnId: "turn-1",
-		type: "end",
-	};
+	return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }

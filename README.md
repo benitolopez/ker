@@ -21,16 +21,18 @@ Thank you for your interest and understanding.
 - A streaming tool-call loop using the OpenAI Responses API, with its own retry/backoff on
   transient failures before provider output starts.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
-- Conversation memory that lives in the daemon: start a turn in one terminal, continue from
-  another — it remembers, because the client is disposable and the daemon isn't.
-- Prompts sent while a turn is active join that turn in FIFO order. They enter model history
-  after the current response and its requested tools finish.
-- OpenAI API-key authentication and an optional ChatGPT OAuth login. A conversation stays bound
+- Durable sessions stored outside the repository. Restarting the daemon restores completed history,
+  interrupted turns, and waiting work.
+- Multiple sessions per project, with one project-wide execution queue. Ordinary prompts create
+  separate turns in arrival order.
+- Session snapshots and cursor-based event catch-up for attaching during a response or reconnecting
+  after a client disconnects.
+- OpenAI API-key authentication and an optional ChatGPT OAuth login. A session stays bound
   to the credential identity that started it.
 - Bounded tool output: `read` pages large files, and `bash` keeps a bounded tail while spilling
   the full stream to a private temporary file.
 
-Not there yet: saved sessions, a TUI, or any provider other than OpenAI.
+Not there yet: a TUI, queue editing, or any provider other than OpenAI.
 
 ## Requirements
 
@@ -80,9 +82,9 @@ npx ker logout
 
 When both are configured the subscription wins; `ker logout` reverts to the key. The daemon reads
 the stored login before every provider request, so login, refresh, and logout do not require a daemon
-restart. An existing conversation refuses a different OAuth account or a switch between OAuth and an
-API key; use `ker new` to clear its history and credential binding. Use `--json` when sending a prompt
-to inspect the authentication event and the rest of the raw event stream.
+restart. An existing session refuses a different OAuth account or a switch between OAuth and an API
+key; use `ker new` to create an empty session with a new credential binding. Use `--json` when sending
+a prompt to inspect the session snapshot and raw event envelopes.
 
 ## Usage
 
@@ -92,30 +94,42 @@ Run these from the repo root. Start the daemon in one terminal (it listens on `1
 npx ker daemon
 ```
 
-Send it a prompt from another terminal:
-
-```sh
-npx ker "my name is Beni"
-npx ker "what's my name?"
-```
-
-Start a fresh in-memory conversation with:
+Create a session and keep the printed ID:
 
 ```sh
 npx ker new
 ```
 
-Assistant text goes to stdout and errors go to stderr. Pass `--json` before the prompt to print
-every raw event, including tool calls, tool results, reasoning summaries, authentication, and
-token usage:
+Send prompts to that session:
 
 ```sh
-npx ker --json "my name is Beni"
+npx ker --session <session-id> "my name is Beni"
+npx ker --session <session-id> "what's my name?"
 ```
 
-If another terminal submits a prompt while a turn is running, that terminal prints a queue
-acknowledgement and exits. The terminal that started the turn keeps rendering the shared response.
-Ctrl-C aborts a turn only from the terminal that started it.
+List this project's sessions or attach to one. Attach prints saved model answers, any active partial
+answer, and future model output. Ctrl-C detaches without cancelling work:
 
-Stop the daemon with Ctrl-C; restarting it clears the conversation (nothing is saved yet). `ker new`
-also clears the current conversation without stopping the daemon, but only while no turn is running.
+```sh
+npx ker sessions
+npx ker attach <session-id>
+```
+
+Prompts submitted while work is active wait as separate turns. Use an exact running turn ID to place
+separate work immediately after it, or to add input to that same turn:
+
+```sh
+npx ker --session <session-id> --after-turn <turn-id> "do this next"
+npx ker --session <session-id> --to-turn <turn-id> "use this additional detail"
+```
+
+A prompt client waits until its turn finishes. Disconnecting it leaves the turn intact; Ctrl-C
+cancels a waiting turn or aborts a running one. Assistant text goes to stdout, while admission status
+and errors go to stderr. `--json` prints the full snapshot followed by raw event envelopes:
+
+```sh
+npx ker --json --session <session-id> "inspect the raw stream"
+```
+
+Sessions are stored under `KER_SESSION_DIR` when set. Otherwise ker uses the platform user-data
+directory, grouped by canonical Git root and session ID.

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
@@ -31,6 +32,11 @@ export interface TurnInput {
 	takeSteering(closeIfEmpty: boolean): UserMessage | undefined;
 }
 
+export interface HarnessState {
+	messages: Llm.Message[];
+	identity?: Protocol.Identity;
+}
+
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30_000;
@@ -41,9 +47,13 @@ const ABORTED_HISTORY_MARKER =
 // before the first user message enters history. After each assistant response and its complete tool
 // batch, the loop admits at most one steering message before deciding whether another model request is
 // needed. Cancellation repairs advertised tool calls and records the interruption for the next turn.
-export function createHarness(config: EngineConfig, dependencies: Dependencies = { stream: Llm.stream }) {
-	const messages: Llm.Message[] = [];
-	let identity: Protocol.Identity | undefined;
+export function createHarness(
+	config: EngineConfig,
+	dependencies: Dependencies = { stream: Llm.stream },
+	initial: HarnessState = { messages: [] },
+) {
+	const messages: Llm.Message[] = structuredClone(initial.messages);
+	let identity: Protocol.Identity | undefined = initial.identity;
 
 	async function* send(input: TurnInput, signal?: AbortSignal): AsyncGenerator<Protocol.TurnEvent> {
 		const scope = { sessionId: input.initial.sessionId, turnId: input.initial.turnId };
@@ -148,12 +158,11 @@ export function createHarness(config: EngineConfig, dependencies: Dependencies =
 		yield { actor: "process", ...scope, type: "end" };
 	}
 
-	function reset(): void {
-		messages.length = 0;
-		identity = undefined;
+	function snapshot(): HarnessState {
+		return { messages: structuredClone(messages), identity };
 	}
 
-	return { messages, reset, send };
+	return { messages, send, snapshot };
 }
 
 type StepOutcome =
@@ -172,6 +181,9 @@ async function* streamStep(
 	initialAuth?: Llm.Auth,
 	signal?: AbortSignal,
 ): AsyncGenerator<Protocol.TurnEvent, StepOutcome> {
+	const messageId = randomUUID();
+	let textOffset = 0;
+	let reasoningOffset = 0;
 	for (let attempt = 0; ; attempt++) {
 		if (signal?.aborted) return { kind: "aborted", toolCalls: [] };
 		const authResult: AuthResult =
@@ -206,7 +218,16 @@ async function* streamStep(
 			if (event.type !== "done" && event.type !== "error") sawOutput = true;
 			if (event.type === "delta") {
 				reply += event.text;
-				yield { actor: "agent", modelRole: "assistant", ...scope, type: "message_delta", text: event.text };
+				yield {
+					actor: "agent",
+					modelRole: "assistant",
+					...scope,
+					type: "message_delta",
+					messageId,
+					offset: textOffset,
+					text: event.text,
+				};
+				textOffset += event.text.length;
 			}
 			if (event.type === "tool_call") {
 				toolCalls.push({
@@ -220,13 +241,23 @@ async function* streamStep(
 					modelRole: "assistant",
 					...scope,
 					type: "tool_call",
+					messageId,
 					id: event.callId,
 					name: event.name,
 					arguments: event.arguments,
 				};
 			}
 			if (event.type === "reasoning_delta") {
-				yield { actor: "agent", modelRole: "assistant", ...scope, type: "reasoning_delta", text: event.text };
+				yield {
+					actor: "agent",
+					modelRole: "assistant",
+					...scope,
+					type: "reasoning_delta",
+					messageId,
+					offset: reasoningOffset,
+					text: event.text,
+				};
+				reasoningOffset += event.text.length;
 			}
 			if (event.type === "reasoning") reasoning.push(event.item);
 			if (event.type === "done") {
@@ -241,6 +272,14 @@ async function* streamStep(
 					return { kind: "stopped" };
 				}
 				messages.push({ role: "assistant", content: reply, toolCalls, reasoning });
+				yield {
+					actor: "agent",
+					modelRole: "assistant",
+					...scope,
+					type: "assistant_message_completed",
+					messageId,
+					reason: event.reason === "length" ? "length" : "completed",
+				};
 				yield { actor: "process", ...scope, type: "usage", ...event.usage };
 				return { kind: "done", toolCalls };
 			}
@@ -300,7 +339,7 @@ async function resolveAuth(
 					code: "identity_changed",
 					expected,
 					actual,
-					message: `Conversation belongs to ${describeIdentity(expected)}, but ${describeIdentity(actual)} is active.`,
+					message: `Session belongs to ${describeIdentity(expected)}, but ${describeIdentity(actual)} is active.`,
 				},
 			};
 		}

@@ -118,7 +118,7 @@ test("rejects a changed oauth account before admitting the prompt", async () => 
 			code: "identity_changed",
 			expected: { kind: "oauth", accountId: "acc_old" },
 			actual: { kind: "oauth", accountId: "acc_new" },
-			message: "Conversation belongs to OAuth account acc_old, but OAuth account acc_new is active.",
+			message: "Session belongs to OAuth account acc_old, but OAuth account acc_new is active.",
 		},
 		{ role: "assistant", type: "end" },
 	]);
@@ -157,7 +157,7 @@ test("rejects a change between oauth and api-key auth", async () => {
 			code: "identity_changed",
 			expected: { kind: "oauth", accountId: "acc_old" },
 			actual: { kind: "apikey" },
-			message: "Conversation belongs to OAuth account acc_old, but an API key is active.",
+			message: "Session belongs to OAuth account acc_old, but an API key is active.",
 		},
 		{ role: "assistant", type: "end" },
 	]);
@@ -188,35 +188,6 @@ test("allows the original oauth account after rejecting another account", async 
 	await collectEvents(send(harness, "second"));
 
 	assert.deepEqual(observed.providerUsers, [["first"], ["first", "second"]]);
-});
-
-test("reset clears history and lets the next prompt bind another account", async () => {
-	const observed = { accountId: "acc_old", providerUsers: [] as string[][] };
-	const harness = createHarness(
-		{
-			...createConfig(),
-			getAuth: async () => ({ kind: "oauth", accessToken: "token", accountId: observed.accountId }),
-		},
-		{
-			stream: async function* (_model, messages) {
-				observed.providerUsers.push(
-					messages.filter((message) => message.role === "user").map((message) => message.content),
-				);
-				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
-			},
-		},
-	);
-
-	await collectEvents(send(harness, "first"));
-	harness.reset();
-	observed.accountId = "acc_new";
-	await collectEvents(send(harness, "second"));
-
-	assert.deepEqual(observed.providerUsers, [["first"], ["second"]]);
-	assert.deepEqual(harness.messages, [
-		{ role: "user", content: "second" },
-		{ role: "assistant", content: "", toolCalls: [], reasoning: [] },
-	]);
 });
 
 test("stops before a tool follow-up when the oauth account changes mid-turn", async () => {
@@ -252,7 +223,7 @@ test("stops before a tool follow-up when the oauth account changes mid-turn", as
 		code: "identity_changed",
 		expected: { kind: "oauth", accountId: "acc_old" },
 		actual: { kind: "oauth", accountId: "acc_new" },
-		message: "Conversation belongs to OAuth account acc_old, but OAuth account acc_new is active.",
+		message: "Session belongs to OAuth account acc_old, but OAuth account acc_new is active.",
 	});
 	assert.deepEqual(events.at(-1), { role: "assistant", type: "end" });
 	assert.equal(observed.streamCalls, 1);
@@ -308,7 +279,7 @@ test("stops before a tool follow-up when auth changes from oauth to an api key",
 		code: "identity_changed",
 		expected: { kind: "oauth", accountId: "acc_old" },
 		actual: { kind: "apikey" },
-		message: "Conversation belongs to OAuth account acc_old, but an API key is active.",
+		message: "Session belongs to OAuth account acc_old, but an API key is active.",
 	});
 	assert.deepEqual(events.at(-1), { role: "assistant", type: "end" });
 	assert.equal(observed.streamCalls, 1);
@@ -417,7 +388,7 @@ test("stops a retry when auth changes from oauth to an api key", async () => {
 			code: "identity_changed",
 			expected: { kind: "oauth", accountId: "acc_old" },
 			actual: { kind: "apikey" },
-			message: "Conversation belongs to OAuth account acc_old, but an API key is active.",
+			message: "Session belongs to OAuth account acc_old, but an API key is active.",
 		},
 		{ role: "assistant", type: "end" },
 	]);
@@ -547,6 +518,25 @@ test("saves a length-limited response without reporting an error", async () => {
 		{ role: "assistant", content: "truncated response", toolCalls: [], reasoning: [] },
 	]);
 	assert.deepEqual(observed, { streamCalls: 1 });
+});
+
+test("assigns one stable assistant message id and contiguous offsets to a provider response", async () => {
+	const harness = createHarness(createConfig(), {
+		stream: async function* () {
+			yield { type: "delta", text: "hel" };
+			yield { type: "delta", text: "lo" };
+			yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+		},
+	});
+	const events = await collectProtocolEvents(send(harness, "hello"), true);
+	const deltas = events.filter((event) => event.type === "message_delta");
+	const completed = events.find((event) => event.type === "assistant_message_completed");
+
+	assert.equal(deltas.length, 2);
+	assert.equal(deltas[0].offset, 0);
+	assert.equal(deltas[1].offset, 3);
+	assert.equal(deltas[0].messageId, deltas[1].messageId);
+	assert.equal(completed?.messageId, deltas[0].messageId);
 });
 
 test("aborts before admission without saving the prompt or interruption marker", async () => {
@@ -834,6 +824,8 @@ test("delivers one steering message after the full tool batch with actor-aware e
 			return steering.shift();
 		}),
 	);
+	const response = events.find((event) => event.type === "message_delta");
+	assert(response);
 
 	assert.deepEqual(
 		events.map((event) => ({
@@ -845,10 +837,10 @@ test("delivers one steering message after the full tool batch with actor-aware e
 		[
 			{ type: "message_delivered", actor: "human", modelRole: "user", messageId: "message-1" },
 			{ type: "auth", actor: "process", modelRole: undefined, messageId: undefined },
-			{ type: "message_delta", actor: "agent", modelRole: "assistant", messageId: undefined },
-			{ type: "reasoning_delta", actor: "agent", modelRole: "assistant", messageId: undefined },
-			{ type: "tool_call", actor: "agent", modelRole: "assistant", messageId: undefined },
-			{ type: "tool_call", actor: "agent", modelRole: "assistant", messageId: undefined },
+			{ type: "message_delta", actor: "agent", modelRole: "assistant", messageId: response.messageId },
+			{ type: "reasoning_delta", actor: "agent", modelRole: "assistant", messageId: response.messageId },
+			{ type: "tool_call", actor: "agent", modelRole: "assistant", messageId: response.messageId },
+			{ type: "tool_call", actor: "agent", modelRole: "assistant", messageId: response.messageId },
 			{ type: "usage", actor: "process", modelRole: undefined, messageId: undefined },
 			{ type: "tool_result", actor: "process", modelRole: "tool", messageId: undefined },
 			{ type: "tool_result", actor: "process", modelRole: "tool", messageId: undefined },
@@ -927,14 +919,21 @@ function createConfig(tools: Tool[] = []): EngineConfig {
 async function collectEvents(events: AsyncIterable<Protocol.TurnEvent>): Promise<Array<Record<string, unknown>>> {
 	const collected: Array<Record<string, unknown>> = [];
 	for await (const event of events) {
-		if (event.type !== "message_delivered") collected.push(legacyEvent(event));
+		if (event.type !== "message_delivered" && event.type !== "assistant_message_completed") {
+			collected.push(legacyEvent(event));
+		}
 	}
 	return collected;
 }
 
-async function collectProtocolEvents(events: AsyncIterable<Protocol.TurnEvent>): Promise<Protocol.TurnEvent[]> {
+async function collectProtocolEvents(
+	events: AsyncIterable<Protocol.TurnEvent>,
+	includeCompletions = false,
+): Promise<Protocol.TurnEvent[]> {
 	const collected: Protocol.TurnEvent[] = [];
-	for await (const event of events) collected.push(event);
+	for await (const event of events) {
+		if (includeCompletions || event.type !== "assistant_message_completed") collected.push(event);
+	}
 	return collected;
 }
 
@@ -964,6 +963,10 @@ function legacyEvent(event: Protocol.TurnEvent): Record<string, unknown> {
 	delete rest.modelRole;
 	delete rest.sessionId;
 	delete rest.turnId;
+	if (event.type === "message_delta" || event.type === "reasoning_delta" || event.type === "tool_call") {
+		delete rest.messageId;
+	}
+	if (event.type === "message_delta" || event.type === "reasoning_delta") delete rest.offset;
 	const role = event.type === "tool_call" || event.type === "tool_result" ? "tool" : "assistant";
 	return { role, ...rest };
 }

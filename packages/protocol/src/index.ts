@@ -5,6 +5,95 @@ export type ModelRole = "user" | "assistant" | "tool";
 export type SessionId = string;
 export type TurnId = string;
 export type MessageId = string;
+export type QueueItemId = string;
+
+export type Placement =
+	| { type: "end" }
+	| { type: "after_turn"; turnId: TurnId }
+	| { type: "running_turn"; turnId: TurnId };
+
+export type AdmissionStatus = "running" | "waiting" | "added_to_running";
+export type TurnTerminalReason = "completed" | "aborted" | "error" | "interrupted" | "cancelled";
+export type AssistantTerminalReason = "completed" | "length" | "aborted" | "error";
+
+export interface SessionDescriptor {
+	id: SessionId;
+	cwd: string;
+	projectRoot: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface UnreadableSession {
+	id: SessionId;
+	error: string;
+}
+
+export interface QueueItem {
+	id: QueueItemId;
+	sessionId: SessionId;
+	turnId: TurnId;
+	messageId: MessageId;
+	text: string;
+	state: "running" | "waiting";
+	submittedAt: string;
+}
+
+export interface ProjectQueueSnapshot {
+	revision: number;
+	running?: QueueItem;
+	waiting: QueueItem[];
+}
+
+export interface Cursor {
+	epoch: string;
+	sequence: number;
+}
+
+export interface AssistantMessage {
+	id: MessageId;
+	turnId: TurnId;
+	text: string;
+	reason: AssistantTerminalReason;
+}
+
+export interface ActiveAssistantMessage {
+	id: MessageId;
+	turnId: TurnId;
+	text: string;
+}
+
+export interface TurnSnapshot {
+	id: TurnId;
+	status: "running" | "waiting" | TurnTerminalReason;
+}
+
+interface ConversationEntryBase {
+	id: string;
+	parentId: string | null;
+	turnId: TurnId;
+	messageId?: MessageId;
+}
+
+export type ConversationEntry =
+	| (ConversationEntryBase & { role: "user" | "developer"; content: string })
+	| (ConversationEntryBase & {
+			role: "assistant";
+			content: string;
+			toolCalls: Array<{ id: string; name: string; arguments: string }>;
+	  })
+	| (ConversationEntryBase & { role: "tool"; toolCallId: string; content: string });
+
+export interface SessionSnapshot {
+	session: SessionDescriptor;
+	identity?: Identity;
+	entries: ConversationEntry[];
+	messages: AssistantMessage[];
+	active?: ActiveAssistantMessage;
+	turns: TurnSnapshot[];
+	queue: ProjectQueueSnapshot;
+	cursor: Cursor;
+}
 
 export interface EventBase {
 	actor: Actor;
@@ -20,8 +109,11 @@ export interface MessageSubmittedEvent extends TurnEventBase {
 	actor: "human";
 	type: "message_submitted";
 	messageId: MessageId;
+	queueItemId: QueueItemId;
 	text: string;
-	queued: boolean;
+	placement: Placement["type"];
+	targetTurnId?: TurnId;
+	admission: AdmissionStatus;
 }
 
 export interface MessageDeliveredEvent extends TurnEventBase {
@@ -37,13 +129,15 @@ export interface MessageUndeliveredEvent extends TurnEventBase {
 	type: "message_undelivered";
 	messageId: MessageId;
 	text: string;
-	reason: "aborted" | "error";
+	reason: "aborted" | "error" | "interrupted" | "cancelled";
 }
 
 export interface MessageDeltaEvent extends TurnEventBase {
 	actor: "agent";
 	modelRole: "assistant";
 	type: "message_delta";
+	messageId: MessageId;
+	offset: number;
 	text: string;
 }
 
@@ -52,7 +146,17 @@ export interface ReasoningDeltaEvent extends TurnEventBase {
 	actor: "agent";
 	modelRole: "assistant";
 	type: "reasoning_delta";
+	messageId: MessageId;
+	offset: number;
 	text: string;
+}
+
+export interface AssistantMessageCompletedEvent extends TurnEventBase {
+	actor: "agent";
+	modelRole: "assistant";
+	type: "assistant_message_completed";
+	messageId: MessageId;
+	reason: "completed" | "length";
 }
 
 export interface UsageEvent extends TurnEventBase {
@@ -63,14 +167,12 @@ export interface UsageEvent extends TurnEventBase {
 	total: number;
 }
 
-// The credential a conversation is bound to. OAuth logins are told apart by account; API keys
-// all count as one identity.
+// The credential a session is bound to. OAuth logins are told apart by account; API keys all
+// count as one identity. Access tokens and API keys never enter this type.
 export type Identity = { kind: "apikey" } | { kind: "oauth"; accountId: string };
 
 export type ErrorCode = "identity_changed";
 
-// `code` marks failures a client can act on. An identity_changed error also carries the bound
-// (`expected`) and active (`actual`) identities, so each client writes its own remediation.
 export interface ErrorEvent extends TurnEventBase {
 	actor: "process";
 	type: "error";
@@ -89,8 +191,6 @@ export interface RetryEvent extends TurnEventBase {
 	message: string;
 }
 
-// The conversation-bound credential mode, emitted once per accepted turn. Retries and tool steps
-// keep that identity. A daemon /auth/status endpoint would let clients query this state instead.
 export interface AuthEvent extends TurnEventBase {
 	actor: "process";
 	type: "auth";
@@ -107,26 +207,38 @@ export interface AbortedEvent extends TurnEventBase {
 	type: "aborted";
 }
 
-// The daemon discarded the model context and removed its credential binding. Connected clients
-// receive this even when another client requested the reset.
-export interface ConversationResetEvent extends EventBase {
+export interface InterruptedEvent extends TurnEventBase {
 	actor: "process";
-	type: "conversation_reset";
+	type: "interrupted";
 }
 
-// The model asked to run a tool, before it runs. `id` is the provider call id, echoed on the
-// matching result so a client can pair the two.
+export interface CancelledEvent extends TurnEventBase {
+	actor: "process";
+	type: "cancelled";
+}
+
+export interface TurnTerminalEvent extends TurnEventBase {
+	actor: "process";
+	type: "turn_terminal";
+	reason: TurnTerminalReason;
+}
+
+export interface QueueChangedEvent extends EventBase {
+	actor: "process";
+	type: "queue_changed";
+	queue: ProjectQueueSnapshot;
+}
+
 export interface ToolCallEvent extends TurnEventBase {
 	actor: "agent";
 	modelRole: "assistant";
 	type: "tool_call";
+	messageId: MessageId;
 	id: string;
 	name: string;
 	arguments: string;
 }
 
-// The tool ran. `output` carries the full result the model saw, so every client renders it as it
-// likes; `status` is "error" when the tool threw (the model still receives the error as its result).
 export interface ToolResultEvent extends TurnEventBase {
 	actor: "process";
 	modelRole: "tool";
@@ -143,20 +255,38 @@ export type Event =
 	| MessageUndeliveredEvent
 	| MessageDeltaEvent
 	| ReasoningDeltaEvent
+	| AssistantMessageCompletedEvent
 	| UsageEvent
 	| ErrorEvent
 	| RetryEvent
 	| AuthEvent
 	| AbortedEvent
+	| InterruptedEvent
+	| CancelledEvent
+	| TurnTerminalEvent
+	| QueueChangedEvent
 	| EndEvent
-	| ConversationResetEvent
 	| ToolCallEvent
 	| ToolResultEvent;
 
-export type TurnEvent = Exclude<Event, ConversationResetEvent>;
+export type TurnEvent = Exclude<Event, QueueChangedEvent>;
 
-export const PROTOCOL_VERSION = "4" as const;
+export interface EventEnvelope {
+	epoch: string;
+	sequence: number;
+	event: Event;
+}
 
-// Fixed localhost port the daemon listens on. Daemon and clients must agree
-// on it, so it lives here rather than in config.
+export interface PromptAdmission {
+	status: AdmissionStatus;
+	sessionId: SessionId;
+	turnId: TurnId;
+	messageId: MessageId;
+	queueItemId: QueueItemId;
+	queue: ProjectQueueSnapshot;
+}
+
+export const PROTOCOL_VERSION = "5" as const;
+
+// Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;
