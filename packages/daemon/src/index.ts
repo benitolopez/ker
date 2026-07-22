@@ -24,6 +24,8 @@ const DEFAULT_EVENT_TAIL_SIZE = 2_000;
 const ALLOWED_HOSTS = new Set([`127.0.0.1:${DEFAULT_PORT}`, `localhost:${DEFAULT_PORT}`]);
 const INTERRUPTED_HISTORY_MARKER =
 	"The previous turn was interrupted by a daemon restart. Tools may have partially executed.";
+const CANCELLED_DURING_RESTART_HISTORY_MARKER =
+	"The previous turn was cancelled before a daemon restart finished cleanup. Tools may have partially executed.";
 
 export interface Harness {
 	send(input: Engine.TurnInput, signal?: AbortSignal): AsyncIterable<Protocol.TurnEvent>;
@@ -94,6 +96,7 @@ interface ActiveTurn {
 	controller: AbortController;
 	done: PromiseWithResolvers<void>;
 	terminal: boolean;
+	cancellationRequested: boolean;
 }
 
 interface SessionState {
@@ -159,7 +162,12 @@ class Registry {
 			}
 		}
 		const running = this.#queue.running ? this.#items.get(this.#queue.running.id) : undefined;
-		if (running) running.item = { ...running.item, state: "running" };
+		if (running && this.#queue.running) {
+			running.item = {
+				...running.item,
+				state: this.#queue.running.state === "cancelling" ? "cancelling" : "running",
+			};
+		}
 		this.#queue = {
 			revision: this.#queue.revision,
 			running: running?.item,
@@ -168,7 +176,7 @@ class Registry {
 				return restored ? [{ ...restored, state: "waiting" as const }] : [];
 			}),
 		};
-		if (this.#queue.running) await this.#recoverInterrupted(this.#queue.running);
+		if (this.#queue.running) await this.#recoverRunning(this.#queue.running);
 		await this.#startNext();
 	}
 
@@ -203,7 +211,10 @@ class Registry {
 		const turns = new Map<Protocol.TurnId, Protocol.TurnSnapshot>();
 		for (const [id, status] of state.turns) turns.set(id, { id, status });
 		if (this.#queue.running?.sessionId === sessionId) {
-			turns.set(this.#queue.running.turnId, { id: this.#queue.running.turnId, status: "running" });
+			turns.set(this.#queue.running.turnId, {
+				id: this.#queue.running.turnId,
+				status: this.#queue.running.state === "cancelling" ? "cancelling" : "running",
+			});
 		}
 		for (const item of this.#queue.waiting) {
 			if (item.sessionId === sessionId) turns.set(item.turnId, { id: item.turnId, status: "waiting" });
@@ -353,26 +364,49 @@ class Registry {
 	async cancel(
 		sessionId: Protocol.SessionId,
 		turnId: Protocol.TurnId,
-	): Promise<"aborting" | "cancelled" | "missing" | "turn_unavailable"> {
-		const result = await this.#withQueueLock(async () => {
-			if (!this.#stored.has(sessionId)) return { status: "missing" as const };
+	): Promise<Protocol.TurnCancellationResult | "missing" | "turn_unavailable"> {
+		return this.#withQueueLock(async () => {
+			if (!this.#stored.has(sessionId)) return "missing";
+			const state = await this.#state(sessionId);
+			const terminal = state.turns.get(turnId);
+			if (terminal === "aborted" || terminal === "cancelled") {
+				return { status: terminal, sessionId, turnId };
+			}
+			if (terminal) return "turn_unavailable";
+
 			const running = this.#queue.running;
 			if (running?.sessionId === sessionId && running.turnId === turnId) {
-				const state = await this.#state(sessionId);
+				if (running.state === "cancelling") return { status: "cancelling", sessionId, turnId };
 				const active = state.activeTurn;
-				if (!active || active.terminal) return { status: "turn_unavailable" as const };
+				if (!active || active.terminal) return "turn_unavailable";
 				active.accepting = false;
+				active.cancellationRequested = true;
+				const cancelling = { ...running, state: "cancelling" as const };
+				active.item.item = cancelling;
+				this.#queue.running = cancelling;
+				this.#queue.revision++;
+				await this.#appendAndPublish(state, [
+					{
+						type: "event",
+						event: { actor: "human", sessionId, turnId, type: "turn_cancel_requested" },
+					},
+					this.#queueChangedPayload(sessionId),
+				]);
+				await this.#publishQueue(sessionId);
 				active.controller.abort();
-				return { status: "aborting" as const, done: active.done.promise };
+				return { status: "cancelling", sessionId, turnId };
 			}
 			const index = this.#queue.waiting.findIndex((item) => item.sessionId === sessionId && item.turnId === turnId);
-			if (index === -1) return { status: "turn_unavailable" as const };
+			if (index === -1) return "turn_unavailable";
 			const [removed] = this.#queue.waiting.splice(index, 1);
 			const internal = this.#items.get(removed.id);
-			if (!internal) return { status: "turn_unavailable" as const };
+			if (!internal) return "turn_unavailable";
 			this.#queue.revision++;
-			const state = await this.#state(sessionId);
 			await this.#appendAndPublish(state, [
+				{
+					type: "event",
+					event: { actor: "human", sessionId, turnId, type: "turn_cancel_requested" },
+				},
 				{
 					type: "event",
 					event: {
@@ -391,13 +425,11 @@ class Registry {
 					event: { actor: "process", sessionId, turnId, type: "turn_terminal", reason: "cancelled" },
 				},
 				{ type: "event", event: { actor: "process", sessionId, turnId, type: "end" } },
+				this.#queueChangedPayload(sessionId),
 			]);
-			await this.#publishQueue();
-			return { status: "cancelled" as const };
+			await this.#publishQueue(sessionId);
+			return { status: "cancelled", sessionId, turnId };
 		});
-		if (result.status !== "aborting") return result.status;
-		await result.done;
-		return "aborting";
 	}
 
 	heartbeat(): void {
@@ -495,6 +527,7 @@ class Registry {
 			controller: new AbortController(),
 			done: Promise.withResolvers<void>(),
 			terminal: false,
+			cancellationRequested: false,
 		};
 		state.activeTurn = turn;
 		void this.#runTurn(state, turn);
@@ -529,6 +562,15 @@ class Registry {
 					failureReason = "error";
 				}
 				if (event.type === "end") {
+					if (turn.cancellationRequested && failureReason !== "aborted") {
+						failureReason = "aborted";
+						await this.#recordHarnessEvent(state, {
+							actor: "process",
+							sessionId: turn.initial.sessionId,
+							turnId: turn.initial.turnId,
+							type: "aborted",
+						});
+					}
 					await this.#finishTurn(state, turn, failureReason);
 					break;
 				}
@@ -556,7 +598,18 @@ class Registry {
 				});
 			}
 		} finally {
-			if (!turn.terminal) await this.#finishTurn(state, turn, failureReason ?? "error");
+			if (!turn.terminal) {
+				if (turn.cancellationRequested && failureReason !== "aborted") {
+					failureReason = "aborted";
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						sessionId: turn.initial.sessionId,
+						turnId: turn.initial.turnId,
+						type: "aborted",
+					});
+				}
+				await this.#finishTurn(state, turn, failureReason ?? "error");
+			}
 			if (state.activeTurn === turn) state.activeTurn = undefined;
 			await this.#withQueueLock(async () => {
 				if (this.#queue.running?.id !== turn.item.item.id) return;
@@ -682,26 +735,30 @@ class Registry {
 		if (event.type === "turn_terminal") state.turns.set(event.turnId, event.reason);
 	}
 
-	async #publishQueue(): Promise<void> {
+	async #publishQueue(excludedSessionId?: Protocol.SessionId): Promise<void> {
 		const loaded = await Promise.all(this.#states.values());
 		for (const state of loaded) {
-			await this.#appendAndPublish(state, [
-				{
-					type: "event",
-					event: {
-						actor: "process",
-						sessionId: state.stored.session.id,
-						type: "queue_changed",
-						queue: cloneQueue(this.#queue),
-					},
-				},
-			]);
+			if (state.stored.session.id === excludedSessionId) continue;
+			await this.#appendAndPublish(state, [this.#queueChangedPayload(state.stored.session.id)]);
 		}
 	}
 
-	async #recoverInterrupted(item: Protocol.QueueItem): Promise<void> {
+	#queueChangedPayload(sessionId: Protocol.SessionId): Extract<Payload, { type: "event" }> {
+		return {
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId,
+				type: "queue_changed",
+				queue: cloneQueue(this.#queue),
+			},
+		};
+	}
+
+	async #recoverRunning(item: Protocol.QueueItem): Promise<void> {
 		const state = await this.#state(item.sessionId);
 		const scope = { sessionId: item.sessionId, turnId: item.turnId };
+		const cancellation = item.state === "cancelling";
 		if (state.turns.has(item.turnId)) {
 			const hasEnd = state.stored.records.some(
 				(record) => record.type === "event" && record.event.type === "end" && record.event.turnId === item.turnId,
@@ -749,7 +806,10 @@ class Registry {
 			content: "Tool result unavailable because the daemon stopped during the turn.",
 		}));
 		if (delivered.size > 0 || repairs.length > 0) {
-			repairedMessages.push({ role: "developer", content: INTERRUPTED_HISTORY_MARKER });
+			repairedMessages.push({
+				role: "developer",
+				content: cancellation ? CANCELLED_DURING_RESTART_HISTORY_MARKER : INTERRUPTED_HISTORY_MARKER,
+			});
 		}
 
 		const payloads: Payload[] = [];
@@ -791,15 +851,23 @@ class Registry {
 					type: "message_undelivered",
 					messageId: event.messageId,
 					text: event.text,
-					reason: "interrupted",
+					reason: cancellation ? "aborted" : "interrupted",
 				},
 			});
 		}
 		payloads.push(
-			{ type: "event", event: { actor: "process", ...scope, type: "interrupted" } },
 			{
 				type: "event",
-				event: { actor: "process", ...scope, type: "turn_terminal", reason: "interrupted" },
+				event: { actor: "process", ...scope, type: cancellation ? "aborted" : "interrupted" },
+			},
+			{
+				type: "event",
+				event: {
+					actor: "process",
+					...scope,
+					type: "turn_terminal",
+					reason: cancellation ? "aborted" : "interrupted",
+				},
 			},
 			{ type: "event", event: { actor: "process", ...scope, type: "end" } },
 		);
@@ -945,7 +1013,7 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 				writeJson(res, 409, { code: "turn_unavailable" });
 				return;
 			}
-			res.writeHead(204).end();
+			writeJson(res, result.status === "cancelling" ? 202 : 200, result);
 			return;
 		}
 		res.writeHead(404).end();

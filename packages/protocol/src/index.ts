@@ -13,6 +13,7 @@ export type Placement =
 	| { type: "running_turn"; turnId: TurnId };
 
 export type AdmissionStatus = "running" | "waiting" | "added_to_running";
+export type CancellationStatus = "cancelling" | "cancelled" | "aborted";
 export type TurnTerminalReason = "completed" | "aborted" | "error" | "interrupted" | "cancelled";
 export type AssistantTerminalReason = "completed" | "length" | "aborted" | "error";
 
@@ -35,7 +36,7 @@ export interface QueueItem {
 	turnId: TurnId;
 	messageId: MessageId;
 	text: string;
-	state: "running" | "waiting";
+	state: "running" | "cancelling" | "waiting";
 	submittedAt: string;
 }
 
@@ -65,7 +66,7 @@ export interface ActiveAssistantMessage {
 
 export interface TurnSnapshot {
 	id: TurnId;
-	status: "running" | "waiting" | TurnTerminalReason;
+	status: "running" | "cancelling" | "waiting" | TurnTerminalReason;
 }
 
 interface ConversationEntryBase {
@@ -130,6 +131,11 @@ export interface MessageUndeliveredEvent extends TurnEventBase {
 	messageId: MessageId;
 	text: string;
 	reason: "aborted" | "error" | "interrupted" | "cancelled";
+}
+
+export interface TurnCancelRequestedEvent extends TurnEventBase {
+	actor: "human";
+	type: "turn_cancel_requested";
 }
 
 export interface MessageDeltaEvent extends TurnEventBase {
@@ -253,6 +259,7 @@ export type Event =
 	| MessageSubmittedEvent
 	| MessageDeliveredEvent
 	| MessageUndeliveredEvent
+	| TurnCancelRequestedEvent
 	| MessageDeltaEvent
 	| ReasoningDeltaEvent
 	| AssistantMessageCompletedEvent
@@ -286,7 +293,13 @@ export interface PromptAdmission {
 	queue: ProjectQueueSnapshot;
 }
 
-export const PROTOCOL_VERSION = "5" as const;
+export interface TurnCancellationResult {
+	status: CancellationStatus;
+	sessionId: SessionId;
+	turnId: TurnId;
+}
+
+export const PROTOCOL_VERSION = "6" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

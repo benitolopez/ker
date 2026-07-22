@@ -39,6 +39,10 @@ export async function run(): Promise<void> {
 		await runSessions(json);
 		return;
 	}
+	if (positional.length === 1 && positional[0] === "cancel") {
+		await runCancel(json);
+		return;
+	}
 	if (positional[0] === "attach" && positional.length === 2) {
 		await runAttach(positional[1], json);
 		return;
@@ -88,6 +92,40 @@ async function runSessions(json: boolean): Promise<void> {
 	}
 }
 
+async function runCancel(json: boolean): Promise<void> {
+	if (!(await checkHealth())) return;
+	const queueResponse = await fetch(`${BASE}/queue`);
+	if (!queueResponse.ok) {
+		process.stderr.write(`ker: daemon could not read the queue (HTTP ${queueResponse.status})\n`);
+		process.exitCode = 1;
+		return;
+	}
+	const queue = (await queueResponse.json()) as Protocol.ProjectQueueSnapshot;
+	const running = queue.running;
+	if (!running) {
+		process.stderr.write("ker: no running turn to cancel\n");
+		process.exitCode = 1;
+		return;
+	}
+	const response = await cancelTurn(running.sessionId, running.turnId);
+	if (response.status === 409 || response.status === 404) {
+		process.stderr.write(`ker: turn ${running.turnId} is no longer cancellable\n`);
+		process.exitCode = 1;
+		return;
+	}
+	if (!response.ok) {
+		process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${response.status})\n`);
+		process.exitCode = 1;
+		return;
+	}
+	const result = (await response.json()) as Protocol.TurnCancellationResult;
+	if (json) {
+		process.stdout.write(`${JSON.stringify(result)}\n`);
+		return;
+	}
+	writeTurnStatus(result.status, result.turnId);
+}
+
 // Signals stop new connections, abort the active turn cleanly, and leave waiting work persisted.
 function runDaemon(): void {
 	const server = Daemon.createDaemon();
@@ -123,7 +161,7 @@ async function runAttach(sessionId: Protocol.SessionId, json: boolean): Promise<
 		const initial = await fetchSnapshot(sessionId, controller.signal);
 		if (!initial) return;
 		if (json) process.stdout.write(`${JSON.stringify(initial)}\n`);
-		if (!json) renderer.snapshot(initial, () => true, true);
+		if (!json) renderer.snapshot(initial, () => true, true, true);
 		let cursor = initial.cursor;
 		while (!controller.signal.aborted) {
 			try {
@@ -176,10 +214,7 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 		interrupted = true;
 		controller.abort();
 		if (accepted) {
-			cancelRequest = fetch(
-				`${BASE}/sessions/${encodeURIComponent(accepted.sessionId)}/turns/${encodeURIComponent(accepted.turnId)}/cancel`,
-				{ method: "POST" },
-			);
+			cancelRequest = cancelTurn(accepted.sessionId, accepted.turnId);
 		}
 	};
 	process.on("SIGINT", onSigint);
@@ -188,14 +223,14 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 		const initial = await fetchSnapshot(prompt.sessionId, controller.signal);
 		if (!initial) return;
 		if (prompt.json) process.stdout.write(`${JSON.stringify(initial)}\n`);
-		renderer.snapshot(initial, () => true, false);
+		renderer.snapshot(initial, () => true, false, true);
 		let cursor = initial.cursor;
 		let events = await subscribe(prompt.sessionId, cursor, controller.signal);
 		if (events.status === 410) {
 			const replacement = await fetchSnapshot(prompt.sessionId, controller.signal);
 			if (!replacement) return;
 			if (prompt.json) process.stdout.write(`${JSON.stringify(replacement)}\n`);
-			renderer.snapshot(replacement, () => true, false);
+			renderer.snapshot(replacement, () => true, false, true);
 			cursor = replacement.cursor;
 			events = await subscribe(prompt.sessionId, cursor, controller.signal);
 		}
@@ -223,10 +258,7 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 		}
 		accepted = (await submitted.json()) as Protocol.PromptAdmission;
 		if (interrupted && !cancelRequest) {
-			cancelRequest = fetch(
-				`${BASE}/sessions/${encodeURIComponent(accepted.sessionId)}/turns/${encodeURIComponent(accepted.turnId)}/cancel`,
-				{ method: "POST" },
-			);
+			cancelRequest = cancelTurn(accepted.sessionId, accepted.turnId);
 		}
 		if (accepted.status !== "running") {
 			process.stderr.write(`ker: ${accepted.status} (turn ${accepted.turnId})\n`);
@@ -234,6 +266,7 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 		const matches = (turnId: Protocol.TurnId) => turnId === accepted?.turnId;
 		let terminal = false;
 		let failed = false;
+		let cancelled = false;
 		while (!terminal && !controller.signal.aborted) {
 			try {
 				if (!events.body) throw new Error("event stream has no body");
@@ -243,6 +276,7 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 					if (prompt.json) process.stdout.write(`${data}\n`);
 					if (!prompt.json) renderer.event(envelope.event, matches);
 					if (!("turnId" in envelope.event) || !matches(envelope.event.turnId)) continue;
+					if (envelope.event.type === "turn_cancel_requested") cancelled = true;
 					if (envelope.event.type === "error") {
 						failed = true;
 						if (!prompt.json) {
@@ -253,6 +287,7 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 					}
 					if (envelope.event.type === "turn_terminal") {
 						if (envelope.event.reason !== "completed") failed = true;
+						if (envelope.event.reason === "aborted" || envelope.event.reason === "cancelled") cancelled = true;
 					}
 					if (envelope.event.type === "end") terminal = true;
 					if (terminal) break;
@@ -264,7 +299,10 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 				if (!prompt.json) renderer.snapshot(snapshot, matches, true);
 				cursor = snapshot.cursor;
 				const turn = snapshot.turns.find((candidate) => matches(candidate.id));
-				if (turn && turn.status !== "running" && turn.status !== "waiting") {
+				if (turn?.status === "cancelling" || turn?.status === "aborted" || turn?.status === "cancelled") {
+					cancelled = true;
+				}
+				if (turn && turn.status !== "running" && turn.status !== "cancelling" && turn.status !== "waiting") {
 					terminal = true;
 					failed = turn.status !== "completed";
 					break;
@@ -283,10 +321,20 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 				if (prompt.json) process.stdout.write(`${JSON.stringify(snapshot)}\n`);
 				if (!prompt.json) renderer.snapshot(snapshot, matches, true);
 				cursor = snapshot.cursor;
+				const turn = snapshot.turns.find((candidate) => matches(candidate.id));
+				if (turn?.status === "cancelling" || turn?.status === "aborted" || turn?.status === "cancelled") {
+					cancelled = true;
+				}
+				if (turn && turn.status !== "running" && turn.status !== "cancelling" && turn.status !== "waiting") {
+					terminal = true;
+					failed = turn.status !== "completed";
+					break;
+				}
 				events = await subscribe(prompt.sessionId, cursor, controller.signal);
 			}
 		}
-		if (failed) process.exitCode = 1;
+		if (cancelled) process.exitCode = 130;
+		else if (failed) process.exitCode = 1;
 	} catch (error) {
 		if (!interrupted) {
 			process.stderr.write(`ker: prompt failed — ${error instanceof Error ? error.message : String(error)}\n`);
@@ -296,7 +344,10 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 		if (cancelRequest) {
 			try {
 				const response = await cancelRequest;
-				if (response.status !== 204 && response.status !== 409) {
+				if (response.ok) {
+					const result = (await response.json()) as Protocol.TurnCancellationResult;
+					writeTurnStatus(result.status, result.turnId);
+				} else if (response.status !== 409) {
 					process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${response.status})\n`);
 				}
 			} catch (error) {
@@ -314,8 +365,14 @@ class Renderer {
 	readonly #seen = new Map<Protocol.MessageId, number>();
 	readonly #ended = new Set<Protocol.MessageId>();
 	readonly #activeByTurn = new Map<Protocol.TurnId, Protocol.MessageId>();
+	readonly #turnStatuses = new Map<Protocol.TurnId, Protocol.TurnSnapshot["status"]>();
 
-	snapshot(snapshot: Protocol.SessionSnapshot, matches: (turnId: Protocol.TurnId) => boolean, render: boolean): void {
+	snapshot(
+		snapshot: Protocol.SessionSnapshot,
+		matches: (turnId: Protocol.TurnId) => boolean,
+		render: boolean,
+		initial = false,
+	): void {
 		for (const message of snapshot.messages) {
 			if (!matches(message.turnId)) continue;
 			this.#text(message.id, message.turnId, message.text, render);
@@ -324,16 +381,34 @@ class Renderer {
 		if (snapshot.active && matches(snapshot.active.turnId)) {
 			this.#text(snapshot.active.id, snapshot.active.turnId, snapshot.active.text, render);
 		}
+		for (const turn of snapshot.turns) {
+			if (!matches(turn.id)) continue;
+			if (initial) {
+				this.#turnStatuses.set(turn.id, turn.status);
+				if (render && turn.status === "cancelling") writeTurnStatus(turn.status, turn.id);
+				continue;
+			}
+			this.#transition(turn.id, turn.status);
+		}
 	}
 
 	event(event: Protocol.Event, matches: (turnId: Protocol.TurnId) => boolean): void {
 		if (!("turnId" in event) || !matches(event.turnId)) return;
+		if (event.type === "turn_cancel_requested") this.#transition(event.turnId, "cancelling");
+		if (event.type === "turn_terminal") this.#transition(event.turnId, event.reason);
 		if (event.type === "message_delta") this.#text(event.messageId, event.turnId, event.text, true, event.offset);
 		if (event.type === "assistant_message_completed") this.#finish(event.messageId, true);
 		if (event.type === "error" || event.type === "aborted" || event.type === "interrupted") {
 			const active = this.#activeByTurn.get(event.turnId);
 			if (active) this.#finish(active, true);
 		}
+	}
+
+	#transition(turnId: Protocol.TurnId, status: Protocol.TurnSnapshot["status"]): void {
+		if (this.#turnStatuses.get(turnId) === status) return;
+		this.#turnStatuses.set(turnId, status);
+		if (status === "running" || status === "waiting" || status === "completed") return;
+		writeTurnStatus(status, turnId);
 	}
 
 	#text(id: Protocol.MessageId, turnId: Protocol.TurnId, text: string, render: boolean, offset = 0): void {
@@ -386,6 +461,19 @@ async function subscribe(
 	return fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/events?${query}`, { signal });
 }
 
+function cancelTurn(sessionId: Protocol.SessionId, turnId: Protocol.TurnId): Promise<Response> {
+	return fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/cancel`, {
+		method: "POST",
+	});
+}
+
+function writeTurnStatus(
+	status: Protocol.CancellationStatus | Exclude<Protocol.TurnTerminalReason, "completed">,
+	turnId: string,
+): void {
+	process.stderr.write(`ker: ${status} (turn ${turnId})\n`);
+}
+
 async function fetchSnapshot(
 	sessionId: Protocol.SessionId,
 	signal?: AbortSignal,
@@ -427,6 +515,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions | attach <id>\n       ker [--json] --session <id> [--after-turn <id> | --to-turn <id>] <prompt>\n       ker daemon | login | logout\n",
+		"usage: ker [--json] new | sessions | cancel | attach <id>\n       ker [--json] --session <id> [--after-turn <id> | --to-turn <id>] <prompt>\n       ker daemon | login | logout\n",
 	);
 }

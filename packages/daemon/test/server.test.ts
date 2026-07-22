@@ -139,7 +139,18 @@ test("cancels a whole waiting turn without aborting the running turn", async (t)
 	const cancelled = await localFetch(`${running.url}/sessions/${session.id}/turns/${waiting.turnId}/cancel`, {
 		method: "POST",
 	});
-	assert.equal(cancelled.status, 204);
+	assert.equal(cancelled.status, 200);
+	assert.deepEqual(await readJson(cancelled.body), {
+		status: "cancelled",
+		sessionId: session.id,
+		turnId: waiting.turnId,
+	});
+	const afterCancellation = await getSnapshot(running.url, session.id);
+	const duplicate = await localFetch(`${running.url}/sessions/${session.id}/turns/${waiting.turnId}/cancel`, {
+		method: "POST",
+	});
+	assert.equal(duplicate.status, 200);
+	assert.equal((await getSnapshot(running.url, session.id)).queue.revision, afterCancellation.queue.revision);
 	controlled.release(0);
 	await controlled.finished(0);
 	const snapshot = await getSnapshot(running.url, session.id);
@@ -147,23 +158,110 @@ test("cancels a whole waiting turn without aborting the running turn", async (t)
 	assert.deepEqual(controlled.initials, ["A"]);
 });
 
-test("clean abort saves the active partial with its terminal reason", async (t) => {
-	const controlled = controlledFactory();
+test("active cancellation becomes durable and returns before cleanup", async (t) => {
+	const controlled = controlledFactory({ pauseAfterAbort: true });
 	const running = await startServer(t, controlled.factory);
 	const session = await createSession(running.url);
 	const admitted = await prompt(running.url, session.id, "A");
 	await controlled.deltaSeen(0);
+	const before = await getSnapshot(running.url, session.id);
+	const subscription = await localFetch(
+		`${running.url}/sessions/${session.id}/events?epoch=${before.cursor.epoch}&sequence=${before.cursor.sequence}`,
+	);
+	const frames = readEnvelopes(subscription.body)[Symbol.asyncIterator]();
 
 	const response = await localFetch(`${running.url}/sessions/${session.id}/turns/${admitted.turnId}/cancel`, {
 		method: "POST",
 	});
-	assert.equal(response.status, 204);
+	assert.equal(response.status, 202);
+	assert.deepEqual(await readJson(response.body), {
+		status: "cancelling",
+		sessionId: session.id,
+		turnId: admitted.turnId,
+	});
+	const cancelling = await getSnapshot(running.url, session.id);
+	assert.equal(cancelling.turns.find((turn) => turn.id === admitted.turnId)?.status, "cancelling");
+	assert.equal(cancelling.queue.running?.state, "cancelling");
+	assert.equal(
+		await Promise.race([controlled.finished(0).then(() => "finished"), Promise.resolve("cleaning")]),
+		"cleaning",
+	);
+
+	const duplicate = await localFetch(`${running.url}/sessions/${session.id}/turns/${admitted.turnId}/cancel`, {
+		method: "POST",
+	});
+	assert.equal(duplicate.status, 202);
+	assert.equal((await getSnapshot(running.url, session.id)).queue.revision, cancelling.queue.revision);
+
+	controlled.releaseCleanup(0);
+	const observed: Protocol.Event["type"][] = [];
+	while (observed.at(-1) !== "end") {
+		const next = await frames.next();
+		assert.equal(next.done, false);
+		const event = next.value.event;
+		if ("turnId" in event && event.turnId === admitted.turnId) observed.push(event.type);
+	}
+	assert.deepEqual(
+		observed.filter((type) => ["turn_cancel_requested", "aborted", "turn_terminal", "end"].includes(type)),
+		["turn_cancel_requested", "aborted", "turn_terminal", "end"],
+	);
+	await frames.return?.(undefined);
+
 	const snapshot = await getSnapshot(running.url, session.id);
 	assert.equal(snapshot.messages.length, 1);
 	assert.deepEqual(
 		{ ...snapshot.messages[0], id: undefined },
 		{ id: undefined, turnId: admitted.turnId, text: "answer:A", reason: "aborted" },
 	);
+	const late = await localFetch(`${running.url}/sessions/${session.id}/turns/${admitted.turnId}/cancel`, {
+		method: "POST",
+	});
+	assert.equal(late.status, 200);
+	assert.deepEqual(await readJson(late.body), {
+		status: "aborted",
+		sessionId: session.id,
+		turnId: admitted.turnId,
+	});
+	assert.equal((await getSnapshot(running.url, session.id)).queue.revision, snapshot.queue.revision);
+});
+
+test("cancellation keeps successors waiting until abort cleanup finishes", async (t) => {
+	const controlled = controlledFactory({ pauseAfterAbort: true });
+	const running = await startServer(t, controlled.factory);
+	const session = await createSession(running.url);
+	const first = await prompt(running.url, session.id, "A");
+	await controlled.deltaSeen(0);
+	await prompt(running.url, session.id, "B");
+
+	const response = await localFetch(`${running.url}/sessions/${session.id}/turns/${first.turnId}/cancel`, {
+		method: "POST",
+	});
+	assert.equal(response.status, 202);
+	await readJson(response.body);
+	assert.equal(
+		await Promise.race([controlled.started(1).then(() => "started"), Promise.resolve("waiting")]),
+		"waiting",
+	);
+
+	controlled.releaseCleanup(0);
+	await controlled.started(1);
+	controlled.release(1);
+	await controlled.finished(1);
+	assert.deepEqual(controlled.initials, ["A", "B"]);
+});
+
+test("completed and unknown turns cannot be cancelled", async (t) => {
+	const running = await startServer(t, immediateFactory());
+	const session = await createSession(running.url);
+	const admitted = await prompt(running.url, session.id, "done");
+	await waitForTerminal(running.url, session.id, admitted.turnId);
+
+	const completed = await localFetch(`${running.url}/sessions/${session.id}/turns/${admitted.turnId}/cancel`, {
+		method: "POST",
+	});
+	assert.equal(completed.status, 409);
+	const stale = await localFetch(`${running.url}/sessions/${session.id}/turns/stale/cancel`, { method: "POST" });
+	assert.equal(stale.status, 409);
 });
 
 test("a snapshot exposes saved answers, an active partial, and a race-free cursor", async (t) => {
@@ -265,6 +363,44 @@ test("restart repairs an advertised tool call without executing it again", async
 	assert.equal(restored?.at(-1)?.role, "developer");
 });
 
+test("restart finalizes a durable cancellation as aborted without repeating tools", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cancelling-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const seeded = await seedRunning(
+		store,
+		[
+			{
+				type: "conversation",
+				id: "entry-assistant",
+				parentId: "entry-user",
+				turnId: "turn-1",
+				message: {
+					role: "assistant",
+					content: "",
+					toolCalls: [{ callId: "call-1", name: "write", arguments: "{}" }],
+					reasoning: [],
+				},
+			},
+		],
+		"cancelling",
+	);
+	const captured: Engine.HarnessState[] = [];
+	const running = await startServer(t, passiveFactory(captured), { sessionDir });
+	const snapshot = await getSnapshot(running.url, seeded.session.id);
+
+	assert.equal(snapshot.turns.find((turn) => turn.id === "turn-1")?.status, "aborted");
+	assert.equal(snapshot.queue.running, undefined);
+	assert.deepEqual(captured.at(-1)?.messages.at(-2), {
+		role: "tool",
+		toolCallId: "call-1",
+		content: "Tool result unavailable because the daemon stopped during the turn.",
+	});
+	const marker = captured.at(-1)?.messages.at(-1);
+	assert.equal(marker?.role, "developer");
+	if (marker?.role === "developer") assert.match(marker.content, /cancelled before a daemon restart finished cleanup/);
+});
+
 function immediateFactory(): NonNullable<DaemonOptions["harnessFactory"]> {
 	return (initial) => {
 		const state = structuredClone(initial);
@@ -303,7 +439,7 @@ function passiveFactory(captured: Engine.HarnessState[]): NonNullable<DaemonOpti
 	};
 }
 
-async function seedRunning(store: SessionStore, extra: Payload[]) {
+async function seedRunning(store: SessionStore, extra: Payload[], state: "running" | "cancelling" = "running") {
 	const session = await store.create("/project");
 	const item: Protocol.QueueItem = {
 		id: "queue-1",
@@ -311,7 +447,7 @@ async function seedRunning(store: SessionStore, extra: Payload[]) {
 		turnId: "turn-1",
 		messageId: "message-1",
 		text: "hello",
-		state: "running",
+		state,
 		submittedAt: "2026-01-01T00:00:00.000Z",
 	};
 	const scopedExtra = extra.map((payload) => {
@@ -339,7 +475,7 @@ async function seedRunning(store: SessionStore, extra: Payload[]) {
 				actor: "process",
 				sessionId: session.session.id,
 				type: "queue_changed",
-				queue: { revision: 1, running: item, waiting: [] },
+				queue: { revision: 1, running: { ...item, state: "running" }, waiting: [] },
 			},
 		},
 		{
@@ -363,11 +499,33 @@ async function seedRunning(store: SessionStore, extra: Payload[]) {
 			message: { role: "user", content: "hello" },
 		},
 		...scopedExtra,
+		...(state === "cancelling"
+			? ([
+					{
+						type: "event",
+						event: {
+							actor: "human",
+							sessionId: session.session.id,
+							turnId: item.turnId,
+							type: "turn_cancel_requested",
+						},
+					},
+					{
+						type: "event",
+						event: {
+							actor: "process",
+							sessionId: session.session.id,
+							type: "queue_changed",
+							queue: { revision: 2, running: item, waiting: [] },
+						},
+					},
+				] satisfies Payload[])
+			: []),
 	]);
 	return session;
 }
 
-function controlledFactory(options: { pauseAfterDelta?: boolean } = {}): {
+function controlledFactory(options: { pauseAfterDelta?: boolean; pauseAfterAbort?: boolean } = {}): {
 	factory: NonNullable<DaemonOptions["harnessFactory"]>;
 	initials: string[];
 	inputs: string[];
@@ -375,6 +533,7 @@ function controlledFactory(options: { pauseAfterDelta?: boolean } = {}): {
 	deltaSeen(index: number): Promise<void>;
 	finished(index: number): Promise<void>;
 	release(index: number): void;
+	releaseCleanup(index: number): void;
 } {
 	const initials: string[] = [];
 	const inputs: string[] = [];
@@ -382,6 +541,7 @@ function controlledFactory(options: { pauseAfterDelta?: boolean } = {}): {
 	const deltas: PromiseWithResolvers<void>[] = [];
 	const finishes: PromiseWithResolvers<void>[] = [];
 	const releases: PromiseWithResolvers<void>[] = [];
+	const cleanupReleases: PromiseWithResolvers<void>[] = [];
 	const factory = (initial: Engine.HarnessState): Harness => {
 		const state = structuredClone(initial);
 		return {
@@ -404,6 +564,8 @@ function controlledFactory(options: { pauseAfterDelta?: boolean } = {}): {
 				if (options.pauseAfterDelta) await releases[index].promise;
 				if (!options.pauseAfterDelta) await Promise.race([releases[index].promise, waitForAbort(signal)]);
 				if (signal?.aborted) {
+					cleanupReleases[index] ??= Promise.withResolvers<void>();
+					if (options.pauseAfterAbort) await cleanupReleases[index].promise;
 					yield { actor: "process", sessionId: input.initial.sessionId, turnId: input.initial.turnId, type: "aborted" };
 					finishes[index].resolve();
 					yield end(input.initial);
@@ -445,6 +607,10 @@ function controlledFactory(options: { pauseAfterDelta?: boolean } = {}): {
 		release: (index) => {
 			releases[index] ??= Promise.withResolvers<void>();
 			releases[index].resolve();
+		},
+		releaseCleanup: (index) => {
+			cleanupReleases[index] ??= Promise.withResolvers<void>();
+			cleanupReleases[index].resolve();
 		},
 	};
 }

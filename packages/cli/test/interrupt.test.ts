@@ -61,6 +61,24 @@ test("SIGINT racing admission cancels the exact returned turn", async (t) => {
 	await running;
 
 	assert.deepEqual(controlled.cancelBodies, [{ sessionId: "session-1", turnId: "turn-1" }]);
+	assert.equal(controlled.stderr.join(""), "ker: cancelling (turn turn-1)\n");
+	assert.equal(process.exitCode, 130);
+});
+
+test("external cancellation reports both transitions and exits 130", async (t) => {
+	const controlled = controlPrompt(t, "running");
+	const running = run();
+	await controlled.promptStarted.promise;
+	controlled.promptResponse.resolve(jsonResponse(admission("running"), 202));
+	controlled.complete([
+		{ actor: "human", sessionId: "session-1", turnId: "turn-1", type: "turn_cancel_requested" },
+		{ actor: "process", sessionId: "session-1", turnId: "turn-1", type: "aborted" },
+		terminal("aborted"),
+		end(),
+	]);
+	await running;
+
+	assert.equal(controlled.stderr.join(""), "ker: cancelling (turn turn-1)\nker: aborted (turn turn-1)\n");
 	assert.equal(process.exitCode, 130);
 });
 
@@ -149,7 +167,7 @@ function controlPrompt(
 		}
 		if (path === "/sessions/session-1/turns/turn-1/cancel") {
 			cancelBodies.push({ sessionId: "session-1", turnId: "turn-1" });
-			return new Response(null, { status: 204 });
+			return jsonResponse({ status: "cancelling", sessionId: "session-1", turnId: "turn-1" }, 202);
 		}
 		throw new Error(`Unexpected request to ${path}`);
 	};

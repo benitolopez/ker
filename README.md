@@ -25,6 +25,8 @@ Thank you for your interest and understanding.
   interrupted turns, and waiting work.
 - Multiple sessions per project, with one project-wide execution queue. Ordinary prompts create
   separate turns in arrival order.
+- Session-owned cancellation that every attached client can observe. Waiting turns cancel
+  immediately; running turns stay visibly `cancelling` until abort cleanup finishes.
 - Session snapshots and cursor-based event catch-up for attaching during a response or reconnecting
   after a client disconnects.
 - OpenAI API-key authentication and an optional ChatGPT OAuth login. A session stays bound
@@ -110,12 +112,25 @@ npx ker --session "$SESSION_ID" "what's my name?"
 ```
 
 List this project's sessions or attach to one. Attach prints saved model answers, any active partial
-answer, and future model output. Ctrl-C detaches without cancelling work:
+answer, and future model output. It stays attached after turns complete or fail. Current and future
+cancellation or failure transitions go to stderr; historical status banners are suppressed. Ctrl-C
+only detaches and never cancels work:
 
 ```sh
 npx ker sessions
 npx ker attach "$SESSION_ID"
 ```
+
+Cancel the exact turn that is running in this project's queue:
+
+```sh
+npx ker cancel
+npx ker --json cancel
+```
+
+The command captures the running session and turn IDs before sending the request, so a race never
+retargets the next turn. An idle queue or a target that finished during that race exits nonzero
+without taking action.
 
 Prompts submitted while work is active wait as separate turns. Use an exact running turn ID to place
 separate work immediately after it, or to add input to that same turn:
@@ -126,8 +141,10 @@ npx ker --session "$SESSION_ID" --to-turn <turn-id> "use this additional detail"
 ```
 
 A prompt client waits until its turn finishes. Disconnecting it leaves the turn intact; Ctrl-C
-cancels a waiting turn or aborts a running one. Assistant text goes to stdout, while queue status and
-errors go to stderr. `--json` prints the full snapshot followed by raw event envelopes:
+cancels its exact waiting or running turn and exits 130. Cancellation from another local client also
+makes the owning prompt command exit 130. Successful turns exit 0, while other failures exit nonzero.
+Assistant text goes to stdout; queue and lifecycle status and errors go to stderr. `--json` prints the
+full snapshot followed by raw event envelopes:
 
 ```sh
 npx ker --json --session "$SESSION_ID" "inspect the raw stream"
