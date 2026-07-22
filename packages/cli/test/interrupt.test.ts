@@ -35,7 +35,7 @@ test("an admitted prompt waits for its turn and prints only assistant text", asy
 	await running;
 
 	assert.equal(controlled.stdout.join(""), "answer\n");
-	assert.equal(controlled.stderr.join(""), "ker: running (turn turn-1)\n");
+	assert.equal(controlled.stderr.join(""), "");
 	assert.deepEqual(controlled.cancelBodies, []);
 });
 

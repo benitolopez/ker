@@ -228,7 +228,9 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 				{ method: "POST" },
 			);
 		}
-		process.stderr.write(`ker: ${accepted.status} (turn ${accepted.turnId})\n`);
+		if (accepted.status !== "running") {
+			process.stderr.write(`ker: ${accepted.status} (turn ${accepted.turnId})\n`);
+		}
 		const matches = (turnId: Protocol.TurnId) => turnId === accepted?.turnId;
 		let terminal = false;
 		let failed = false;

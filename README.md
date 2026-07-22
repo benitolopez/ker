@@ -94,17 +94,19 @@ Run these from the repo root. Start the daemon in one terminal (it listens on `1
 npx ker daemon
 ```
 
-Create a session and keep the printed ID:
+Create a session and save its printed ID in a shell variable:
 
 ```sh
-npx ker new
+SESSION_ID="$(npx ker new)"
+echo "$SESSION_ID"
 ```
 
-Send prompts to that session:
+To find an existing session ID later, run `npx ker sessions`; the ID is the first column. Send
+prompts to the selected session with:
 
 ```sh
-npx ker --session <session-id> "my name is Beni"
-npx ker --session <session-id> "what's my name?"
+npx ker --session "$SESSION_ID" "my name is Beni"
+npx ker --session "$SESSION_ID" "what's my name?"
 ```
 
 List this project's sessions or attach to one. Attach prints saved model answers, any active partial
@@ -112,23 +114,23 @@ answer, and future model output. Ctrl-C detaches without cancelling work:
 
 ```sh
 npx ker sessions
-npx ker attach <session-id>
+npx ker attach "$SESSION_ID"
 ```
 
 Prompts submitted while work is active wait as separate turns. Use an exact running turn ID to place
 separate work immediately after it, or to add input to that same turn:
 
 ```sh
-npx ker --session <session-id> --after-turn <turn-id> "do this next"
-npx ker --session <session-id> --to-turn <turn-id> "use this additional detail"
+npx ker --session "$SESSION_ID" --after-turn <turn-id> "do this next"
+npx ker --session "$SESSION_ID" --to-turn <turn-id> "use this additional detail"
 ```
 
 A prompt client waits until its turn finishes. Disconnecting it leaves the turn intact; Ctrl-C
-cancels a waiting turn or aborts a running one. Assistant text goes to stdout, while admission status
-and errors go to stderr. `--json` prints the full snapshot followed by raw event envelopes:
+cancels a waiting turn or aborts a running one. Assistant text goes to stdout, while queue status and
+errors go to stderr. `--json` prints the full snapshot followed by raw event envelopes:
 
 ```sh
-npx ker --json --session <session-id> "inspect the raw stream"
+npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
 Sessions are stored under `KER_SESSION_DIR` when set. Otherwise ker uses the platform user-data
