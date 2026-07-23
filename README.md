@@ -23,11 +23,11 @@ Thank you for your interest and understanding.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
 - Durable sessions stored outside the repository. Restarting the daemon restores completed history,
   interrupted turns, and waiting work.
-- Multiple sessions per project, with one project-wide execution queue. Ordinary prompts create
-  separate turns in arrival order.
-- Session-owned cancellation that every attached client can observe. Waiting turns cancel
+- Multiple sessions per project, each with its own FIFO queue. One turn runs at a time in a session,
+  while different sessions can run concurrently.
+- Session-owned cancellation that every monitoring client can observe. Waiting turns cancel
   immediately; running turns stay visibly `cancelling` until abort cleanup finishes.
-- Session snapshots and cursor-based event catch-up for attaching during a response or reconnecting
+- Session snapshots and cursor-based event catch-up for monitoring during a response or reconnecting
   after a client disconnects.
 - OpenAI API-key authentication and an optional ChatGPT OAuth login. A session stays bound
   to the credential identity that started it.
@@ -111,38 +111,34 @@ npx ker --session "$SESSION_ID" "my name is Beni"
 npx ker --session "$SESSION_ID" "what's my name?"
 ```
 
-List this project's sessions or attach to one. Attach prints saved model answers, any active partial
-answer, and future model output. It stays attached after turns complete or fail. Current and future
+List this project's sessions or monitor one. Monitor prints saved model answers, any active partial
+answer, and future model output. It keeps following after turns complete or fail. Current and future
 cancellation or failure transitions go to stderr; historical status banners are suppressed. Ctrl-C
-only detaches and never cancels work:
+only stops the monitor and never cancels work. An idle monitor prints `ker: waiting for turns` to
+stderr and continues following:
 
 ```sh
 npx ker sessions
-npx ker attach "$SESSION_ID"
+npx ker monitor "$SESSION_ID"
 ```
 
-Cancel the exact turn that is running in this project's queue:
+Cancel the exact running or cancelling turn captured from one session:
 
 ```sh
-npx ker cancel
-npx ker --json cancel
+npx ker cancel "$SESSION_ID"
+npx ker --json cancel "$SESSION_ID"
 ```
 
-The command captures the running session and turn IDs before sending the request, so a race never
-retargets the next turn. An idle queue or a target that finished during that race exits nonzero
-without taking action.
+The command captures the running turn ID from that session's snapshot before sending the request, so
+a race never retargets its successor. A missing or unreadable session, an idle session, or a target
+that finished during that race exits 1 without taking action.
 
-Prompts submitted while work is active wait as separate turns. Use an exact running turn ID to place
-separate work immediately after it, or to add input to that same turn:
-
-```sh
-npx ker --session "$SESSION_ID" --after-turn <turn-id> "do this next"
-npx ker --session "$SESSION_ID" --to-turn <turn-id> "use this additional detail"
-```
+Prompts submitted while that session is active wait as separate turns in FIFO order. There is no
+steering or turn placement; every prompt creates one turn.
 
 A prompt client waits until its turn finishes. Disconnecting it leaves the turn intact; Ctrl-C
 cancels its exact waiting or running turn and exits 130. Cancellation from another local client also
-makes the owning prompt command exit 130. Successful turns exit 0, while other failures exit nonzero.
+makes the owning prompt command exit 130. Successful turns exit 0, while other failures exit 1.
 Assistant text goes to stdout; queue and lifecycle status and errors go to stderr. `--json` prints the
 full snapshot followed by raw event envelopes:
 
@@ -151,4 +147,11 @@ npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
 Sessions are stored under `KER_SESSION_DIR` when set. Otherwise ker uses the platform user-data
-directory, grouped by canonical Git root and session ID.
+directory, grouped by canonical Git root and session ID. Protocol v7 uses session-local queue
+snapshots, and session logs use record format v2. Older v1 logs are reported as unreadable and left
+byte-for-byte unchanged until manually removed.
+
+Concurrent sessions intentionally use their recorded working directories without worktree isolation.
+Running two sessions against the same files can therefore conflict. Cooperative cancellation cannot
+force-stop code that ignores its abort signal; safe force stopping remains deferred until turns run in
+isolated processes.
