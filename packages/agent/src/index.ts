@@ -12,159 +12,173 @@ const DEFAULT_TIMEOUT_SECS = 120;
 const KILL_GRACE_MS = 2000;
 const IDLE_GRACE_MS = 100;
 
-// The coding agent's system prompt. Kept short on purpose: each tool's own description (sent in the API
-// tools array) carries its usage, so this only sets identity, the working directory, and a few habits.
-export const systemPrompt = [
-	"You are ker, a terminal coding agent working in the user's project.",
-	`The working directory is ${process.cwd()}; paths you pass to tools resolve against it.`,
-	"Read files before answering questions about them — don't guess at code you haven't seen.",
-	"When you cite code, give its path and line number (e.g. packages/engine/src/index.ts:24).",
-	"Be concise and direct.",
-].join("\n");
-
-const read: Tool = {
-	name: "read",
-	description:
-		"Read a UTF-8 text file from disk. Returns the contents with each line prefixed by its 1-indexed " +
-		`line number. Output is capped at ${MAX_OUTPUT_LINES} lines or ${MAX_OUTPUT_BYTES / 1024}KB, whichever ` +
-		"comes first; use offset and limit to page through longer files.",
-	parameters: {
-		type: "object",
-		properties: {
-			path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
-			offset: { type: "number", description: "1-indexed line to start reading from. Defaults to the first line." },
-			limit: { type: "number", description: "Maximum number of lines to read." },
-		},
-		required: ["path"],
-		additionalProperties: false,
-	},
-	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
-		const { path, offset, limit } = args as { path?: unknown; offset?: unknown; limit?: unknown };
-		if (typeof path !== "string" || path.trim() === "") throw new Error("read: 'path' must be a non-empty string");
-		if (offset !== undefined && (typeof offset !== "number" || offset < 1)) {
-			throw new Error("read: 'offset' must be a number >= 1");
-		}
-		if (limit !== undefined && (typeof limit !== "number" || limit < 1)) {
-			throw new Error("read: 'limit' must be a number >= 1");
-		}
-		signal?.throwIfAborted();
-		const raw = await readFile(resolve(path), { encoding: "utf8", signal });
-		return formatRead(raw, offset, limit, path);
-	},
-};
-
-const write: Tool = {
-	name: "write",
-	description:
-		"Write a UTF-8 text file to disk. Creates the file if it doesn't exist, or overwrites it in full " +
-		"if it does; parent directories are created as needed. Content is written verbatim, so pass the " +
-		"complete file. Use write to create a new file or replace one in full; to change part of an " +
-		"existing file, use edit instead.",
-	parameters: {
-		type: "object",
-		properties: {
-			path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
-			content: { type: "string", description: "The full file contents to write, verbatim." },
-		},
-		required: ["path", "content"],
-		additionalProperties: false,
-	},
-	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
-		const { path, content } = args as { path?: unknown; content?: unknown };
-		if (typeof path !== "string" || path.trim() === "") throw new Error("write: 'path' must be a non-empty string");
-		if (typeof content !== "string") throw new Error("write: 'content' must be a string");
-		const resolved = resolve(path);
-		const existed = existsSync(resolved);
-		signal?.throwIfAborted();
-		await mkdir(dirname(resolved), { recursive: true });
-		signal?.throwIfAborted();
-		await writeFile(resolved, content, "utf8");
-		return `${existed ? "Wrote" : "Created"} ${path} (${Buffer.byteLength(content, "utf8")} bytes)`;
-	},
-};
-
-const edit: Tool = {
-	name: "edit",
-	description:
-		"Edit a UTF-8 text file by replacing an exact substring. old_string must match the file verbatim — " +
-		"including whitespace and indentation — and must be unique; keep it as small as possible while still " +
-		"unique. If it is missing or appears more than once the edit is rejected, so add surrounding context " +
-		"to make it unique, or pass replaceAll to change every occurrence. When copying text the read tool " +
-		"showed you, match only the content after its `N: ` line-number prefix, never the number itself. Use " +
-		"edit to change part of an existing file; use write to create a new file or replace one in full.",
-	parameters: {
-		type: "object",
-		properties: {
-			path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
-			old_string: {
-				type: "string",
-				description: "The exact text to replace. Must match the file verbatim and be unique unless replaceAll is set.",
+function createRead(cwd: string): Tool {
+	return {
+		name: "read",
+		description:
+			"Read a UTF-8 text file from disk. Returns the contents with each line prefixed by its 1-indexed " +
+			`line number. Output is capped at ${MAX_OUTPUT_LINES} lines or ${MAX_OUTPUT_BYTES / 1024}KB, whichever ` +
+			"comes first; use offset and limit to page through longer files.",
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
+				offset: { type: "number", description: "1-indexed line to start reading from. Defaults to the first line." },
+				limit: { type: "number", description: "Maximum number of lines to read." },
 			},
-			new_string: { type: "string", description: "The text to replace it with." },
-			replaceAll: {
-				type: "boolean",
-				description: "Replace every occurrence of old_string instead of requiring a unique match. Defaults to false.",
+			required: ["path"],
+			additionalProperties: false,
+		},
+		async execute(args: unknown, signal?: AbortSignal): Promise<string> {
+			const { path, offset, limit } = args as { path?: unknown; offset?: unknown; limit?: unknown };
+			if (typeof path !== "string" || path.trim() === "") throw new Error("read: 'path' must be a non-empty string");
+			if (offset !== undefined && (typeof offset !== "number" || offset < 1)) {
+				throw new Error("read: 'offset' must be a number >= 1");
+			}
+			if (limit !== undefined && (typeof limit !== "number" || limit < 1)) {
+				throw new Error("read: 'limit' must be a number >= 1");
+			}
+			signal?.throwIfAborted();
+			const raw = await readFile(resolve(cwd, path), { encoding: "utf8", signal });
+			return formatRead(raw, offset, limit, path);
+		},
+	};
+}
+
+function createWrite(cwd: string): Tool {
+	return {
+		name: "write",
+		description:
+			"Write a UTF-8 text file to disk. Creates the file if it doesn't exist, or overwrites it in full " +
+			"if it does; parent directories are created as needed. Content is written verbatim, so pass the " +
+			"complete file. Use write to create a new file or replace one in full; to change part of an " +
+			"existing file, use edit instead.",
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
+				content: { type: "string", description: "The full file contents to write, verbatim." },
 			},
+			required: ["path", "content"],
+			additionalProperties: false,
 		},
-		required: ["path", "old_string", "new_string"],
-		additionalProperties: false,
-	},
-	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
-		const { path, old_string, new_string, replaceAll } = args as {
-			path?: unknown;
-			old_string?: unknown;
-			new_string?: unknown;
-			replaceAll?: unknown;
-		};
-		if (typeof path !== "string" || path.trim() === "") throw new Error("edit: 'path' must be a non-empty string");
-		if (typeof old_string !== "string") throw new Error("edit: 'old_string' must be a string");
-		if (typeof new_string !== "string") throw new Error("edit: 'new_string' must be a string");
-		if (replaceAll !== undefined && typeof replaceAll !== "boolean") {
-			throw new Error("edit: 'replaceAll' must be a boolean");
-		}
-		if (old_string === new_string) throw new Error("old_string and new_string are identical — no change to make.");
-		const resolved = resolve(path);
-		signal?.throwIfAborted();
-		const original = await readFile(resolved, { encoding: "utf8", signal });
-		const { content, count } = applyEdit(original, old_string, new_string, replaceAll ?? false);
-		signal?.throwIfAborted();
-		await writeFile(resolved, content, "utf8");
-		return `Edited ${path} (${count} ${count === 1 ? "occurrence" : "occurrences"})`;
-	},
-};
-
-const bash: Tool = {
-	name: "bash",
-	description:
-		"Run a bash command in the working directory and return its combined stdout and stderr. Output is " +
-		`capped at the last ${MAX_OUTPUT_LINES} lines or ${MAX_OUTPUT_BYTES / 1024}KB, whichever comes first; ` +
-		"when truncated, the full output is written to a private temp file whose path is included so you can " +
-		"read it. A command is killed with " +
-		"its child processes if that file reaches 1 GiB. Provide an optional timeout in seconds (default 120); " +
-		"a command that runs longer is also killed with its child processes. Use this for shell work and for " +
-		"discovery — ls, grep, find, git, running builds and tests.",
-	parameters: {
-		type: "object",
-		properties: {
-			command: { type: "string", description: "The bash command to run." },
-			timeout: { type: "number", description: "Seconds before the command is killed. Defaults to 120." },
+		async execute(args: unknown, signal?: AbortSignal): Promise<string> {
+			const { path, content } = args as { path?: unknown; content?: unknown };
+			if (typeof path !== "string" || path.trim() === "") throw new Error("write: 'path' must be a non-empty string");
+			if (typeof content !== "string") throw new Error("write: 'content' must be a string");
+			const resolved = resolve(cwd, path);
+			const existed = existsSync(resolved);
+			signal?.throwIfAborted();
+			await mkdir(dirname(resolved), { recursive: true });
+			signal?.throwIfAborted();
+			await writeFile(resolved, content, "utf8");
+			return `${existed ? "Wrote" : "Created"} ${path} (${Buffer.byteLength(content, "utf8")} bytes)`;
 		},
-		required: ["command"],
-		additionalProperties: false,
-	},
-	async execute(args: unknown, signal?: AbortSignal): Promise<string> {
-		const { command, timeout } = args as { command?: unknown; timeout?: unknown };
-		if (typeof command !== "string" || command.trim() === "") {
-			throw new Error("bash: 'command' must be a non-empty string");
-		}
-		if (timeout !== undefined && (typeof timeout !== "number" || timeout <= 0)) {
-			throw new Error("bash: 'timeout' must be a positive number of seconds");
-		}
-		return runBash(command, timeout ?? DEFAULT_TIMEOUT_SECS, signal);
-	},
-};
+	};
+}
 
-export const tools: Tool[] = [read, write, edit, bash];
+function createEdit(cwd: string): Tool {
+	return {
+		name: "edit",
+		description:
+			"Edit a UTF-8 text file by replacing an exact substring. old_string must match the file verbatim — " +
+			"including whitespace and indentation — and must be unique; keep it as small as possible while still " +
+			"unique. If it is missing or appears more than once the edit is rejected, so add surrounding context " +
+			"to make it unique, or pass replaceAll to change every occurrence. When copying text the read tool " +
+			"showed you, match only the content after its `N: ` line-number prefix, never the number itself. Use " +
+			"edit to change part of an existing file; use write to create a new file or replace one in full.",
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "Path to the file, relative to the working directory or absolute." },
+				old_string: {
+					type: "string",
+					description:
+						"The exact text to replace. Must match the file verbatim and be unique unless replaceAll is set.",
+				},
+				new_string: { type: "string", description: "The text to replace it with." },
+				replaceAll: {
+					type: "boolean",
+					description: "Replace every occurrence of old_string instead of requiring a unique match. Defaults to false.",
+				},
+			},
+			required: ["path", "old_string", "new_string"],
+			additionalProperties: false,
+		},
+		async execute(args: unknown, signal?: AbortSignal): Promise<string> {
+			const { path, old_string, new_string, replaceAll } = args as {
+				path?: unknown;
+				old_string?: unknown;
+				new_string?: unknown;
+				replaceAll?: unknown;
+			};
+			if (typeof path !== "string" || path.trim() === "") throw new Error("edit: 'path' must be a non-empty string");
+			if (typeof old_string !== "string") throw new Error("edit: 'old_string' must be a string");
+			if (typeof new_string !== "string") throw new Error("edit: 'new_string' must be a string");
+			if (replaceAll !== undefined && typeof replaceAll !== "boolean") {
+				throw new Error("edit: 'replaceAll' must be a boolean");
+			}
+			if (old_string === new_string) throw new Error("old_string and new_string are identical — no change to make.");
+			const resolved = resolve(cwd, path);
+			signal?.throwIfAborted();
+			const original = await readFile(resolved, { encoding: "utf8", signal });
+			const { content, count } = applyEdit(original, old_string, new_string, replaceAll ?? false);
+			signal?.throwIfAborted();
+			await writeFile(resolved, content, "utf8");
+			return `Edited ${path} (${count} ${count === 1 ? "occurrence" : "occurrences"})`;
+		},
+	};
+}
+
+function createBash(cwd: string): Tool {
+	return {
+		name: "bash",
+		description:
+			"Run a bash command in the working directory and return its combined stdout and stderr. Output is " +
+			`capped at the last ${MAX_OUTPUT_LINES} lines or ${MAX_OUTPUT_BYTES / 1024}KB, whichever comes first; ` +
+			"when truncated, the full output is written to a private temp file whose path is included so you can " +
+			"read it. A command is killed with " +
+			"its child processes if that file reaches 1 GiB. Provide an optional timeout in seconds (default 120); " +
+			"a command that runs longer is also killed with its child processes. Use this for shell work and for " +
+			"discovery — ls, grep, find, git, running builds and tests.",
+		parameters: {
+			type: "object",
+			properties: {
+				command: { type: "string", description: "The bash command to run." },
+				timeout: { type: "number", description: "Seconds before the command is killed. Defaults to 120." },
+			},
+			required: ["command"],
+			additionalProperties: false,
+		},
+		async execute(args: unknown, signal?: AbortSignal): Promise<string> {
+			const { command, timeout } = args as { command?: unknown; timeout?: unknown };
+			if (typeof command !== "string" || command.trim() === "") {
+				throw new Error("bash: 'command' must be a non-empty string");
+			}
+			if (timeout !== undefined && (typeof timeout !== "number" || timeout <= 0)) {
+				throw new Error("bash: 'timeout' must be a positive number of seconds");
+			}
+			return runBash(command, timeout ?? DEFAULT_TIMEOUT_SECS, cwd, signal);
+		},
+	};
+}
+
+export function createDefinition(cwd: string): { systemPrompt: string; tools: Tool[] } {
+	return {
+		systemPrompt: [
+			"You are ker, a terminal coding agent working in the user's project.",
+			`The working directory is ${cwd}; paths you pass to tools resolve against it.`,
+			"Read files before answering questions about them — don't guess at code you haven't seen.",
+			"When you cite code, give its path and line number (e.g. packages/engine/src/index.ts:24).",
+			"Be concise and direct.",
+		].join("\n"),
+		tools: [createRead(cwd), createWrite(cwd), createEdit(cwd), createBash(cwd)],
+	};
+}
+
+const definition = createDefinition(process.cwd());
+export const systemPrompt = definition.systemPrompt;
+export const tools = definition.tools;
 
 // Number every line while keeping the complete result within both output caps. An oversized first line
 // is cut at a UTF-8 boundary and carries a byte-exact bash command for reading the remainder.
@@ -288,10 +302,10 @@ function stripBom(content: string): { bom: string; text: string } {
 // stream moves to a private file once it exceeds the preview. A non-zero exit comes back as data, while
 // signal termination, timeout, spill failure, output-limit, and spawn errors throw so the model sees a
 // failed tool call.
-async function runBash(command: string, timeoutSecs: number, signal?: AbortSignal): Promise<string> {
+async function runBash(command: string, timeoutSecs: number, cwd: string, signal?: AbortSignal): Promise<string> {
 	signal?.throwIfAborted();
 	const child = spawn(resolveShell(), ["-c", command], {
-		cwd: process.cwd(),
+		cwd,
 		env: process.env,
 		detached: true,
 		stdio: ["ignore", "pipe", "pipe"],
