@@ -5,7 +5,7 @@ import { dirname, join, parse } from "node:path";
 import type * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
 
-const STORE_VERSION = 1 as const;
+const STORE_VERSION = 2 as const;
 const SESSION_FILE = "session.jsonl";
 
 interface RecordBase {
@@ -200,7 +200,7 @@ export function defaultSessionDir(): string {
 	return join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "ker", "sessions");
 }
 
-// A torn final JSON fragment is discarded. Every complete malformed line invalidates the session.
+// A torn final JSON fragment in a v2 log is discarded. Every complete malformed line invalidates the session.
 async function readRecords(path: string): Promise<StoredRecord[]> {
 	const contents = await readFile(path);
 	const records: StoredRecord[] = [];
@@ -217,13 +217,11 @@ async function readRecords(path: string): Promise<StoredRecord[]> {
 	}
 	if (offset === contents.length) return records;
 	const finalLine = contents.subarray(offset).toString("utf8");
+	let parsed: unknown;
 	try {
-		const record = parseRecord(finalLine, path);
-		if (record.previousRecordId !== previousId) throw new Error(`Broken record chain in ${path}`);
-		records.push(record);
-		await appendFile(path, "\n", "utf8");
-		return records;
-	} catch {
+		parsed = JSON.parse(finalLine) as unknown;
+	} catch (error) {
+		if (records.length === 0 || !isIncompleteJson(finalLine, error)) throw error;
 		const handle = await open(path, "r+");
 		try {
 			await handle.truncate(offset);
@@ -232,10 +230,25 @@ async function readRecords(path: string): Promise<StoredRecord[]> {
 		}
 		return records;
 	}
+	const record = validateRecord(parsed, path);
+	if (record.previousRecordId !== previousId) throw new Error(`Broken record chain in ${path}`);
+	records.push(record);
+	await appendFile(path, "\n", "utf8");
+	return records;
+}
+
+function isIncompleteJson(value: string, error: unknown): boolean {
+	if (!(error instanceof SyntaxError)) return false;
+	if (error.message.includes("Unexpected end of JSON input")) return true;
+	const position = error.message.match(/position (\d+)/)?.[1];
+	return position !== undefined && Number(position) === value.length;
 }
 
 function parseRecord(line: string, path: string): StoredRecord {
-	const parsed: unknown = JSON.parse(line);
+	return validateRecord(JSON.parse(line) as unknown, path);
+}
+
+function validateRecord(parsed: unknown, path: string): StoredRecord {
 	if (
 		typeof parsed !== "object" ||
 		parsed === null ||

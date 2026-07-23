@@ -27,11 +27,6 @@ export interface UserMessage {
 	text: string;
 }
 
-export interface TurnInput {
-	initial: UserMessage;
-	takeSteering(closeIfEmpty: boolean): UserMessage | undefined;
-}
-
 export interface HarnessState {
 	messages: Llm.Message[];
 	identity?: Protocol.Identity;
@@ -44,9 +39,8 @@ const ABORTED_HISTORY_MARKER =
 	"The previous turn was interrupted by the user. Aborted tools may have partially executed.";
 
 // Holds one credential-bound conversation in memory and runs the agent loop. Initial auth is checked
-// before the first user message enters history. After each assistant response and its complete tool
-// batch, the loop admits at most one steering message before deciding whether another model request is
-// needed. Cancellation repairs advertised tool calls and records the interruption for the next turn.
+// before the user message enters history. Completed tool calls always trigger the next model request.
+// Cancellation repairs advertised tool calls and records the interruption for the next turn.
 export function createHarness(
 	config: EngineConfig,
 	dependencies: Dependencies = { stream: Llm.stream },
@@ -55,8 +49,8 @@ export function createHarness(
 	const messages: Llm.Message[] = structuredClone(initial.messages);
 	let identity: Protocol.Identity | undefined = initial.identity;
 
-	async function* send(input: TurnInput, signal?: AbortSignal): AsyncGenerator<Protocol.TurnEvent> {
-		const scope = { sessionId: input.initial.sessionId, turnId: input.initial.turnId };
+	async function* send(input: UserMessage, signal?: AbortSignal): AsyncGenerator<Protocol.TurnEvent> {
+		const scope = { sessionId: input.sessionId, turnId: input.turnId };
 		const initialAuth = await resolveAuth(config, scope, identity, signal);
 		if (initialAuth.kind === "aborted") {
 			yield { actor: "process", ...scope, type: "aborted" };
@@ -70,14 +64,14 @@ export function createHarness(
 		}
 
 		identity ??= identityOf(initialAuth.auth);
-		messages.push({ role: "user", content: input.initial.text });
+		messages.push({ role: "user", content: input.text });
 		yield {
 			actor: "human",
 			modelRole: "user",
 			...scope,
 			type: "message_delivered",
-			messageId: input.initial.messageId,
-			text: input.initial.text,
+			messageId: input.messageId,
+			text: input.text,
 		};
 
 		let firstStep = true;
@@ -139,20 +133,7 @@ export function createHarness(
 				return;
 			}
 
-			const hasToolFollowUp = outcome.toolCalls.length > 0;
-			const steering = input.takeSteering(!hasToolFollowUp);
-			if (steering) {
-				messages.push({ role: "user", content: steering.text });
-				yield {
-					actor: "human",
-					modelRole: "user",
-					...scope,
-					type: "message_delivered",
-					messageId: steering.messageId,
-					text: steering.text,
-				};
-			}
-			if (!hasToolFollowUp && !steering) break;
+			if (outcome.toolCalls.length === 0) break;
 		}
 
 		yield { actor: "process", ...scope, type: "end" };

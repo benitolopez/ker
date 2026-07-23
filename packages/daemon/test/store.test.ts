@@ -21,7 +21,6 @@ test("writes chained versioned records and keeps conversation ancestry explicit"
 				messageId: "message-1",
 				queueItemId: "queue-1",
 				text: "hello",
-				placement: "end",
 				admission: "running",
 			},
 		},
@@ -41,7 +40,7 @@ test("writes chained versioned records and keeps conversation ancestry explicit"
 	assert.equal(delivered.previousRecordId, submitted.recordId);
 	assert.equal(delivered.type, "conversation");
 	if (delivered.type === "conversation") assert.equal(delivered.parentId, null);
-	assert.equal(session.records[0].version, 1);
+	assert.equal(session.records[0].version, 2);
 });
 
 test("serializes concurrent appends within one session", async (t) => {
@@ -64,11 +63,43 @@ test("truncates only a malformed final partial line", async (t) => {
 	const store = new SessionStore({ baseDir, projectRoot: "/project" });
 	const session = await store.create("/project");
 	const completeSize = (await stat(session.log.path)).size;
-	await appendFile(session.log.path, '{"version":1,"id":"torn"');
+	await appendFile(session.log.path, '{"version":2,"id":"torn"');
 
 	const loaded = await store.loadAll();
 	assert.equal(loaded.length, 1);
 	assert.equal((await stat(session.log.path)).size, completeSize);
+});
+
+test("keeps v1 sessions unreadable without changing their bytes", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-v1-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir, projectRoot: "/project" });
+	const session = await store.create("/project");
+	const v1 = `${JSON.stringify({
+		version: 1,
+		recordId: "record-1",
+		previousRecordId: null,
+		at: "2026-01-01T00:00:00.000Z",
+		type: "session",
+		session: session.session,
+	})}\n`;
+	await writeFile(session.log.path, v1);
+
+	assert.deepEqual(await store.loadAll(), []);
+	assert.equal(store.unreadableSessions[0]?.id, session.session.id);
+	assert.equal(await readFile(session.log.path, "utf8"), v1);
+});
+
+test("keeps a malformed complete tail without repairing it", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-complete-tail-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir, projectRoot: "/project" });
+	const session = await store.create("/project");
+	await appendFile(session.log.path, '{"version":2,}');
+	const before = await readFile(session.log.path);
+
+	assert.deepEqual(await store.loadAll(), []);
+	assert.deepEqual(await readFile(session.log.path), before);
 });
 
 test("repairs a valid final record that is missing its newline", async (t) => {

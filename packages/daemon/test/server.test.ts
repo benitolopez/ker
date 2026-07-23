@@ -56,7 +56,7 @@ test("keeps healthy sessions available when another session log is unreadable", 
 	assert.equal((await readJson<{ code: string }>(corruptSnapshot.body)).code, "session_unreadable");
 });
 
-test("normal prompts preserve project-wide arrival order", async (t) => {
+test("different sessions run concurrently while each session keeps FIFO order", async (t) => {
 	const controlled = controlledFactory();
 	const running = await startServer(t, controlled.factory);
 	const firstSession = await createSession(running.url);
@@ -67,34 +67,99 @@ test("normal prompts preserve project-wide arrival order", async (t) => {
 	await controlled.started(0);
 	const second = await prompt(running.url, secondSession.id, "B");
 	const third = await prompt(running.url, firstSession.id, "A2");
-	assert.equal(second.status, "waiting");
+	assert.equal(second.status, "running");
 	assert.equal(third.status, "waiting");
-	assert.equal(second.queue.revision, first.queue.revision + 1);
-	assert.equal(third.queue.revision, second.queue.revision + 1);
+	assert.equal(second.queue.revision, 1);
+	assert.equal(third.queue.revision, first.queue.revision + 1);
 	assert.deepEqual(
 		third.queue.waiting.map((item) => item.text),
-		["B", "A2"],
+		["A2"],
 	);
-
-	controlled.release(0);
+	assert.equal("sessionId" in third.queue.waiting[0], false);
 	await controlled.started(1);
+
 	controlled.release(1);
+	await controlled.finished(1);
+	assert.equal(
+		await Promise.race([controlled.started(2).then(() => "started"), Promise.resolve("waiting")]),
+		"waiting",
+	);
+	controlled.release(0);
 	await controlled.started(2);
 	controlled.release(2);
 	await controlled.finished(2);
 	assert.deepEqual(controlled.initials, ["A", "B", "A2"]);
 });
 
-test("after_turn inserts directly after the exact running turn", async (t) => {
+test("session event streams publish only their own queue revisions", async (t) => {
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory);
+	const firstSession = await createSession(running.url);
+	const secondSession = await createSession(running.url);
+	const firstSnapshot = await getSnapshot(running.url, firstSession.id);
+	const secondSnapshot = await getSnapshot(running.url, secondSession.id);
+	const firstStream = await localFetch(
+		`${running.url}/sessions/${firstSession.id}/events?epoch=${firstSnapshot.cursor.epoch}&sequence=${firstSnapshot.cursor.sequence}`,
+	);
+	const secondStream = await localFetch(
+		`${running.url}/sessions/${secondSession.id}/events?epoch=${secondSnapshot.cursor.epoch}&sequence=${secondSnapshot.cursor.sequence}`,
+	);
+	const firstFrames = readEnvelopes(firstStream.body)[Symbol.asyncIterator]();
+	const secondFrames = readEnvelopes(secondStream.body)[Symbol.asyncIterator]();
+
+	await prompt(running.url, firstSession.id, "A");
+	await prompt(running.url, secondSession.id, "B");
+	const firstQueue = await readUntil(firstFrames, (event) => event.type === "queue_changed");
+	const secondQueue = await readUntil(secondFrames, (event) => event.type === "queue_changed");
+	assert.equal(firstQueue.event.sessionId, firstSession.id);
+	assert.equal(secondQueue.event.sessionId, secondSession.id);
+	assert.equal(firstQueue.event.type, "queue_changed");
+	assert.equal(secondQueue.event.type, "queue_changed");
+	if (firstQueue.event.type === "queue_changed") assert.equal(firstQueue.event.queue.running?.text, "A");
+	if (secondQueue.event.type === "queue_changed") assert.equal(secondQueue.event.queue.running?.text, "B");
+
+	controlled.release(0);
+	controlled.release(1);
+	await Promise.all([controlled.finished(0), controlled.finished(1)]);
+	await firstFrames.return?.(undefined);
+	await secondFrames.return?.(undefined);
+});
+
+test("active cancellation in one session does not delay another session", async (t) => {
+	const controlled = controlledFactory({ pauseAfterAbort: true });
+	const running = await startServer(t, controlled.factory);
+	const firstSession = await createSession(running.url);
+	const secondSession = await createSession(running.url);
+	const first = await prompt(running.url, firstSession.id, "A");
+	await controlled.deltaSeen(0);
+	const second = await prompt(running.url, secondSession.id, "B");
+	await controlled.deltaSeen(1);
+
+	const cancellation = await localFetch(`${running.url}/sessions/${firstSession.id}/turns/${first.turnId}/cancel`, {
+		method: "POST",
+	});
+	assert.equal(cancellation.status, 202);
+	await readJson(cancellation.body);
+	controlled.release(1);
+	await controlled.finished(1);
+	await waitForTerminal(running.url, secondSession.id, second.turnId);
+	assert.equal((await getSnapshot(running.url, secondSession.id)).queue.running, undefined);
+	assert.equal((await getSnapshot(running.url, firstSession.id)).queue.running?.state, "cancelling");
+
+	controlled.releaseCleanup(0);
+	await controlled.finished(0);
+});
+
+test("same-session prompts run in admission order", async (t) => {
 	const controlled = controlledFactory();
 	const running = await startServer(t, controlled.factory);
 	const session = await createSession(running.url);
 
-	const first = await prompt(running.url, session.id, "A");
+	await prompt(running.url, session.id, "A");
 	await controlled.started(0);
 	await prompt(running.url, session.id, "B");
-	const inserted = await prompt(running.url, session.id, "A2", { type: "after_turn", turnId: first.turnId });
-	assert.equal(inserted.status, "waiting");
+	const third = await prompt(running.url, session.id, "C");
+	assert.equal(third.status, "waiting");
 
 	controlled.release(0);
 	await controlled.started(1);
@@ -102,30 +167,23 @@ test("after_turn inserts directly after the exact running turn", async (t) => {
 	await controlled.started(2);
 	controlled.release(2);
 	await controlled.finished(2);
-	assert.deepEqual(controlled.initials, ["A", "A2", "B"]);
+	assert.deepEqual(controlled.initials, ["A", "B", "C"]);
 });
 
-test("running_turn targets one live turn and never falls through to another", async (t) => {
-	const controlled = controlledFactory();
-	const running = await startServer(t, controlled.factory);
+test("rejects obsolete prompt fields and removes the project queue route", async (t) => {
+	const running = await startServer(t, immediateFactory());
 	const session = await createSession(running.url);
-	const first = await prompt(running.url, session.id, "A");
-	await controlled.started(0);
-
-	const wrong = await rawPrompt(running.url, session.id, "wrong", { type: "running_turn", turnId: "stale" });
-	assert.equal(wrong.status, 409);
-	const steering = await prompt(running.url, session.id, "A2", { type: "running_turn", turnId: first.turnId });
-	assert.equal(steering.status, "added_to_running");
-	assert.equal(steering.turnId, first.turnId);
-
-	controlled.release(0);
-	await controlled.finished(0);
-	assert.deepEqual(controlled.inputs, ["A", "A2"]);
-	const stale = await rawPrompt(running.url, session.id, "late", {
-		type: "running_turn",
-		turnId: first.turnId,
-	});
-	assert.equal(stale.status, 409);
+	for (const body of [
+		{ text: "hello", placement: "end" },
+		{ text: "hello", turnId: "turn-1" },
+		{ text: "hello", extra: true },
+		{ text: "  " },
+	]) {
+		const response = await rawPrompt(running.url, session.id, body);
+		assert.equal(response.status, 400);
+		assert.deepEqual(await readJson(response.body), { code: "invalid_prompt" });
+	}
+	assert.equal((await localFetch(`${running.url}/queue`)).status, 404);
 });
 
 test("cancels a whole waiting turn without aborting the running turn", async (t) => {
@@ -406,6 +464,26 @@ test("completed history loads after a daemon restart", async (t) => {
 	await second.close();
 });
 
+test("restored sessions configure their harness with the recorded cwd", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cwd-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const session = await store.create("/project/nested");
+	const captured: string[] = [];
+	const factory = immediateFactory();
+	const running = await startServer(
+		t,
+		(state, cwd) => {
+			captured.push(cwd);
+			return factory(state, cwd);
+		},
+		{ sessionDir },
+	);
+
+	await getSnapshot(running.url, session.session.id);
+	assert.deepEqual(captured, ["/project/nested"]);
+});
+
 test("restart marks an active turn interrupted without repeating its work", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-interrupted-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
@@ -511,20 +589,56 @@ test("restart finishes cancellation cleanup before starting its queued successor
 	assert.equal(completed.turns.find((turn) => turn.id === seeded.waiting.turnId)?.status, "completed");
 });
 
+test("restart recovers and promotes each session independently", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-multi-recovery-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const first = await seedCancellingWithWaiting(store);
+	const second = await seedCancellingWithWaiting(store);
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory, { sessionDir });
+	await Promise.all([controlled.started(0), controlled.started(1)]);
+
+	for (const seeded of [first, second]) {
+		const snapshot = await getSnapshot(running.url, seeded.session.session.id);
+		assert.equal(snapshot.turns.find((turn) => turn.id === "turn-1")?.status, "aborted");
+		assert.equal(snapshot.turns.find((turn) => turn.id === seeded.waiting.turnId)?.status, "running");
+	}
+	controlled.release(0);
+	controlled.release(1);
+	await Promise.all([controlled.finished(0), controlled.finished(1)]);
+});
+
+test("shutdown aborts and awaits active turns in every session", async (t) => {
+	const controlled = controlledFactory({ pauseAfterAbort: true });
+	const running = await startServer(t, controlled.factory, {}, false);
+	const firstSession = await createSession(running.url);
+	const secondSession = await createSession(running.url);
+	await prompt(running.url, firstSession.id, "A");
+	await prompt(running.url, secondSession.id, "B");
+	await Promise.all([controlled.deltaSeen(0), controlled.deltaSeen(1)]);
+
+	const closing = running.close();
+	controlled.releaseCleanup(0);
+	controlled.releaseCleanup(1);
+	await closing;
+	await Promise.all([controlled.finished(0), controlled.finished(1)]);
+});
+
 function immediateFactory(): NonNullable<DaemonOptions["harnessFactory"]> {
 	return (initial) => {
 		const state = structuredClone(initial);
 		return {
 			snapshot: () => structuredClone(state),
 			async *send(input) {
-				state.messages.push({ role: "user", content: input.initial.text });
-				yield delivered(input.initial);
+				state.messages.push({ role: "user", content: input.text });
+				yield delivered(input);
 				const messageId = randomUUID();
-				const text = `answer:${input.initial.text}`;
-				yield delta(input.initial, messageId, text);
+				const text = `answer:${input.text}`;
+				yield delta(input, messageId, text);
 				state.messages.push({ role: "assistant", content: text, toolCalls: [], reasoning: [] });
-				yield completed(input.initial, messageId);
-				yield end(input.initial);
+				yield completed(input, messageId);
+				yield end(input);
 			},
 		};
 	};
@@ -553,7 +667,6 @@ async function seedRunning(store: SessionStore, extra: Payload[], state: "runnin
 	const session = await store.create("/project");
 	const item: Protocol.QueueItem = {
 		id: "queue-1",
-		sessionId: session.session.id,
 		turnId: "turn-1",
 		messageId: "message-1",
 		text: "hello",
@@ -575,7 +688,6 @@ async function seedRunning(store: SessionStore, extra: Payload[], state: "runnin
 				messageId: item.messageId,
 				queueItemId: item.id,
 				text: "hello",
-				placement: "end",
 				admission: "running",
 			},
 		},
@@ -639,7 +751,6 @@ async function seedCancellingWithWaiting(store: SessionStore) {
 	const session = await seedRunning(store, [], "cancelling");
 	const running: Protocol.QueueItem = {
 		id: "queue-1",
-		sessionId: session.session.id,
 		turnId: "turn-1",
 		messageId: "message-1",
 		text: "hello",
@@ -648,7 +759,6 @@ async function seedCancellingWithWaiting(store: SessionStore) {
 	};
 	const waiting: Protocol.QueueItem = {
 		id: "queue-2",
-		sessionId: session.session.id,
 		turnId: "turn-2",
 		messageId: "message-2",
 		text: "next",
@@ -666,7 +776,6 @@ async function seedCancellingWithWaiting(store: SessionStore) {
 				messageId: waiting.messageId,
 				queueItemId: waiting.id,
 				text: waiting.text,
-				placement: "end",
 				admission: "waiting",
 			},
 		},
@@ -686,7 +795,6 @@ async function seedCancellingWithWaiting(store: SessionStore) {
 function controlledFactory(options: { pauseAfterDelta?: boolean; pauseAfterAbort?: boolean } = {}): {
 	factory: NonNullable<DaemonOptions["harnessFactory"]>;
 	initials: string[];
-	inputs: string[];
 	started(index: number): Promise<void>;
 	deltaSeen(index: number): Promise<void>;
 	finished(index: number): Promise<void>;
@@ -694,7 +802,6 @@ function controlledFactory(options: { pauseAfterDelta?: boolean; pauseAfterAbort
 	releaseCleanup(index: number): void;
 } {
 	const initials: string[] = [];
-	const inputs: string[] = [];
 	const starts: PromiseWithResolvers<void>[] = [];
 	const deltas: PromiseWithResolvers<void>[] = [];
 	const finishes: PromiseWithResolvers<void>[] = [];
@@ -706,50 +813,38 @@ function controlledFactory(options: { pauseAfterDelta?: boolean; pauseAfterAbort
 			snapshot: () => structuredClone(state),
 			async *send(input, signal) {
 				const index = initials.length;
-				initials.push(input.initial.text);
-				inputs.push(input.initial.text);
+				initials.push(input.text);
 				starts[index] ??= Promise.withResolvers<void>();
 				deltas[index] ??= Promise.withResolvers<void>();
 				finishes[index] ??= Promise.withResolvers<void>();
 				releases[index] ??= Promise.withResolvers<void>();
-				state.messages.push({ role: "user", content: input.initial.text });
-				yield delivered(input.initial);
+				state.messages.push({ role: "user", content: input.text });
+				yield delivered(input);
 				starts[index].resolve();
 				const messageId = randomUUID();
-				const text = `answer:${input.initial.text}`;
-				yield delta(input.initial, messageId, text);
+				const text = `answer:${input.text}`;
+				yield delta(input, messageId, text);
 				deltas[index].resolve();
 				if (options.pauseAfterDelta) await releases[index].promise;
 				if (!options.pauseAfterDelta) await Promise.race([releases[index].promise, waitForAbort(signal)]);
 				if (signal?.aborted) {
 					cleanupReleases[index] ??= Promise.withResolvers<void>();
 					if (options.pauseAfterAbort) await cleanupReleases[index].promise;
-					yield { actor: "process", sessionId: input.initial.sessionId, turnId: input.initial.turnId, type: "aborted" };
+					yield { actor: "process", sessionId: input.sessionId, turnId: input.turnId, type: "aborted" };
 					finishes[index].resolve();
-					yield end(input.initial);
+					yield end(input);
 					return;
 				}
 				state.messages.push({ role: "assistant", content: text, toolCalls: [], reasoning: [] });
-				yield completed(input.initial, messageId);
-				for (let steering = input.takeSteering(true); steering; steering = input.takeSteering(true)) {
-					inputs.push(steering.text);
-					state.messages.push({ role: "user", content: steering.text });
-					yield delivered(steering);
-					const steeringId = randomUUID();
-					const steeringText = `answer:${steering.text}`;
-					yield delta(steering, steeringId, steeringText);
-					state.messages.push({ role: "assistant", content: steeringText, toolCalls: [], reasoning: [] });
-					yield completed(steering, steeringId);
-				}
+				yield completed(input, messageId);
 				finishes[index].resolve();
-				yield end(input.initial);
+				yield end(input);
 			},
 		};
 	};
 	return {
 		factory,
 		initials,
-		inputs,
 		started: async (index) => {
 			while (!starts[index]) await new Promise<void>((resolve) => setImmediate(resolve));
 			return starts[index].promise;
@@ -861,26 +956,17 @@ async function getSnapshot(url: string, sessionId: string): Promise<Protocol.Ses
 	return readJson(response.body);
 }
 
-async function prompt(
-	url: string,
-	sessionId: string,
-	text: string,
-	placement: Protocol.Placement = { type: "end" },
-): Promise<Protocol.PromptAdmission> {
-	const response = await rawPrompt(url, sessionId, text, placement);
+async function prompt(url: string, sessionId: string, text: string): Promise<Protocol.PromptAdmission> {
+	const response = await rawPrompt(url, sessionId, { text });
 	assert.equal(response.status, 202);
 	return readJson(response.body);
 }
 
-function rawPrompt(url: string, sessionId: string, text: string, placement: Protocol.Placement): Promise<TestResponse> {
+function rawPrompt(url: string, sessionId: string, body: object): Promise<TestResponse> {
 	return localFetch(`${url}/sessions/${sessionId}/prompts`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			text,
-			placement: placement.type,
-			turnId: placement.type === "end" ? undefined : placement.turnId,
-		}),
+		body: JSON.stringify(body),
 	});
 }
 

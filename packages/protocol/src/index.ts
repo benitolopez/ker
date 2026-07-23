@@ -7,12 +7,7 @@ export type TurnId = string;
 export type MessageId = string;
 export type QueueItemId = string;
 
-export type Placement =
-	| { type: "end" }
-	| { type: "after_turn"; turnId: TurnId }
-	| { type: "running_turn"; turnId: TurnId };
-
-export type AdmissionStatus = "running" | "waiting" | "added_to_running";
+export type AdmissionStatus = "running" | "waiting";
 export type CancellationStatus = "cancelling" | "cancelled" | "aborted";
 export type TurnTerminalReason = "completed" | "aborted" | "error" | "interrupted" | "cancelled";
 export type AssistantTerminalReason = "completed" | "length" | "aborted" | "error";
@@ -32,7 +27,6 @@ export interface UnreadableSession {
 
 export interface QueueItem {
 	id: QueueItemId;
-	sessionId: SessionId;
 	turnId: TurnId;
 	messageId: MessageId;
 	text: string;
@@ -40,7 +34,7 @@ export interface QueueItem {
 	submittedAt: string;
 }
 
-export interface ProjectQueueSnapshot {
+export interface QueueSnapshot {
 	revision: number;
 	running?: QueueItem;
 	waiting: QueueItem[];
@@ -92,7 +86,7 @@ export interface SessionSnapshot {
 	messages: AssistantMessage[];
 	active?: ActiveAssistantMessage;
 	turns: TurnSnapshot[];
-	queue: ProjectQueueSnapshot;
+	queue: QueueSnapshot;
 	cursor: Cursor;
 }
 
@@ -112,8 +106,6 @@ export interface MessageSubmittedEvent extends TurnEventBase {
 	messageId: MessageId;
 	queueItemId: QueueItemId;
 	text: string;
-	placement: Placement["type"];
-	targetTurnId?: TurnId;
 	admission: AdmissionStatus;
 }
 
@@ -232,7 +224,7 @@ export interface TurnTerminalEvent extends TurnEventBase {
 export interface QueueChangedEvent extends EventBase {
 	actor: "process";
 	type: "queue_changed";
-	queue: ProjectQueueSnapshot;
+	queue: QueueSnapshot;
 }
 
 export interface ToolCallEvent extends TurnEventBase {
@@ -290,7 +282,7 @@ export interface PromptAdmission {
 	turnId: TurnId;
 	messageId: MessageId;
 	queueItemId: QueueItemId;
-	queue: ProjectQueueSnapshot;
+	queue: QueueSnapshot;
 }
 
 export interface TurnCancellationResult {
@@ -299,7 +291,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "6" as const;
+export const PROTOCOL_VERSION = "7" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

@@ -28,12 +28,12 @@ const CANCELLED_DURING_RESTART_HISTORY_MARKER =
 	"The previous turn was cancelled before a daemon restart finished cleanup. Tools may have partially executed.";
 
 export interface Harness {
-	send(input: Engine.TurnInput, signal?: AbortSignal): AsyncIterable<Protocol.TurnEvent>;
+	send(input: Engine.UserMessage, signal?: AbortSignal): AsyncIterable<Protocol.TurnEvent>;
 	snapshot(): Engine.HarnessState;
 }
 
 export interface DaemonOptions {
-	harnessFactory?: (state: Engine.HarnessState) => Harness;
+	harnessFactory?: (state: Engine.HarnessState, cwd: string) => Harness;
 	sessionDir?: string;
 	cwd?: string;
 	projectRoot?: string;
@@ -76,23 +76,14 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 interface RegistryOptions {
 	cwd: string;
 	store: SessionStore;
-	harnessFactory: (state: Engine.HarnessState) => Harness;
+	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	eventTailSize: number;
 }
 
-interface InternalQueueItem {
-	item: Protocol.QueueItem;
-	text: string;
-	placement: Protocol.Placement["type"];
-	targetTurnId?: Protocol.TurnId;
-}
-
 interface ActiveTurn {
-	item: InternalQueueItem;
-	initial: Engine.UserMessage;
-	pending: Engine.UserMessage[];
-	steering: Engine.UserMessage[];
-	accepting: boolean;
+	item: Protocol.QueueItem;
+	message: Engine.UserMessage;
+	delivered: boolean;
 	controller: AbortController;
 	done: PromiseWithResolvers<void>;
 	terminal: boolean;
@@ -112,19 +103,19 @@ interface SessionState {
 	sequence: number;
 	tail: Protocol.EventEnvelope[];
 	subscribers: Set<ServerResponse>;
+	items: Map<Protocol.QueueItemId, Protocol.QueueItem>;
+	queue: Protocol.QueueSnapshot;
+	queueLock: Promise<void>;
 	activeTurn?: ActiveTurn;
 }
 
 class Registry {
 	readonly #cwd: string;
 	readonly #store: SessionStore;
-	readonly #harnessFactory: (state: Engine.HarnessState) => Harness;
+	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #eventTailSize: number;
 	readonly #stored = new Map<Protocol.SessionId, StoredSession>();
 	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
-	readonly #items = new Map<Protocol.QueueItemId, InternalQueueItem>();
-	#queue: Protocol.ProjectQueueSnapshot = { revision: 0, waiting: [] };
-	#queueLock = Promise.resolve();
 	#stopping = false;
 
 	constructor(options: RegistryOptions) {
@@ -136,48 +127,19 @@ class Registry {
 
 	async initialize(): Promise<void> {
 		const sessions = await this.#store.loadAll();
-		for (const stored of sessions) {
-			this.#stored.set(stored.session.id, stored);
-			for (const record of stored.records) {
-				if (record.type !== "event") continue;
-				if (record.event.type === "message_submitted" && record.event.admission !== "added_to_running") {
-					this.#items.set(record.event.queueItemId, {
-						item: {
-							id: record.event.queueItemId,
-							sessionId: record.event.sessionId,
-							turnId: record.event.turnId,
-							messageId: record.event.messageId,
-							text: record.event.text,
-							state: record.event.admission === "running" ? "running" : "waiting",
-							submittedAt: record.at,
-						},
-						text: record.event.text,
-						placement: record.event.placement,
-						targetTurnId: record.event.targetTurnId,
-					});
-				}
-				if (record.event.type === "queue_changed" && record.event.queue.revision > this.#queue.revision) {
-					this.#queue = cloneQueue(record.event.queue);
-				}
-			}
-		}
-		const running = this.#queue.running ? this.#items.get(this.#queue.running.id) : undefined;
-		if (running && this.#queue.running) {
-			running.item = {
-				...running.item,
-				state: this.#queue.running.state === "cancelling" ? "cancelling" : "running",
-			};
-		}
-		this.#queue = {
-			revision: this.#queue.revision,
-			running: running?.item,
-			waiting: this.#queue.waiting.flatMap((item) => {
-				const restored = this.#items.get(item.id)?.item;
-				return restored ? [{ ...restored, state: "waiting" as const }] : [];
-			}),
-		};
-		if (this.#queue.running) await this.#recoverRunning(this.#queue.running);
-		await this.#startNext();
+		for (const stored of sessions) this.#stored.set(stored.session.id, stored);
+		const states = await Promise.all(sessions.map((stored) => this.#state(stored.session.id)));
+		await Promise.all(
+			states.map((state) =>
+				this.#withQueueLock(state, async () => {
+					if (state.queue.running) {
+						await this.#recoverRunning(state, state.queue.running);
+						return;
+					}
+					await this.#startNext(state);
+				}),
+			),
+		);
 	}
 
 	listUnreadableSessions(): Protocol.UnreadableSession[] {
@@ -201,36 +163,32 @@ class Registry {
 			.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 	}
 
-	queue(): Protocol.ProjectQueueSnapshot {
-		return cloneQueue(this.#queue);
-	}
-
 	async snapshot(sessionId: Protocol.SessionId): Promise<Protocol.SessionSnapshot | undefined> {
 		if (!this.#stored.has(sessionId)) return undefined;
 		const state = await this.#state(sessionId);
-		const turns = new Map<Protocol.TurnId, Protocol.TurnSnapshot>();
-		for (const [id, status] of state.turns) turns.set(id, { id, status });
-		if (this.#queue.running?.sessionId === sessionId) {
-			turns.set(this.#queue.running.turnId, {
-				id: this.#queue.running.turnId,
-				status: this.#queue.running.state === "cancelling" ? "cancelling" : "running",
-			});
-		}
-		for (const item of this.#queue.waiting) {
-			if (item.sessionId === sessionId) turns.set(item.turnId, { id: item.turnId, status: "waiting" });
-		}
-		return {
-			session: { ...state.stored.session },
-			identity: state.identity,
-			entries: state.stored.records
-				.filter((record): record is ConversationRecord => record.type === "conversation")
-				.map(toConversationEntry),
-			messages: state.messages.map((message) => ({ ...message })),
-			active: state.active ? { ...state.active } : undefined,
-			turns: [...turns.values()],
-			queue: cloneQueue(this.#queue),
-			cursor: { epoch: state.epoch, sequence: state.sequence },
-		};
+		return this.#withQueueLock(state, async () => {
+			const turns = new Map<Protocol.TurnId, Protocol.TurnSnapshot>();
+			for (const [id, status] of state.turns) turns.set(id, { id, status });
+			if (state.queue.running) {
+				turns.set(state.queue.running.turnId, {
+					id: state.queue.running.turnId,
+					status: state.queue.running.state === "cancelling" ? "cancelling" : "running",
+				});
+			}
+			for (const item of state.queue.waiting) turns.set(item.turnId, { id: item.turnId, status: "waiting" });
+			return {
+				session: { ...state.stored.session },
+				identity: state.identity,
+				entries: state.stored.records
+					.filter((record): record is ConversationRecord => record.type === "conversation")
+					.map(toConversationEntry),
+				messages: state.messages.map((message) => ({ ...message })),
+				active: state.active ? { ...state.active } : undefined,
+				turns: [...turns.values()],
+				queue: cloneQueue(state.queue),
+				cursor: { epoch: state.epoch, sequence: state.sequence },
+			};
+		});
 	}
 
 	async subscribe(
@@ -246,91 +204,26 @@ class Registry {
 		return { state, replay: state.tail.filter((envelope) => envelope.sequence > cursor.sequence) };
 	}
 
-	async admit(
-		sessionId: Protocol.SessionId,
-		text: string,
-		placement: Protocol.Placement,
-	): Promise<Protocol.PromptAdmission | "missing" | "turn_unavailable"> {
-		return this.#withQueueLock(async () => {
-			if (!this.#stored.has(sessionId)) return "missing";
-			const state = await this.#state(sessionId);
-			if (placement.type === "running_turn") {
-				const running = this.#queue.running;
-				const active = state.activeTurn;
-				if (
-					!running ||
-					running.sessionId !== sessionId ||
-					running.turnId !== placement.turnId ||
-					!active ||
-					active.item.item.id !== running.id ||
-					!active.accepting
-				) {
-					return "turn_unavailable";
-				}
-				const message: Engine.UserMessage = {
-					sessionId,
-					turnId: running.turnId,
-					messageId: randomUUID(),
-					text,
-				};
-				active.pending.push(message);
-				active.steering.push(message);
-				await this.#appendAndPublish(state, [
-					{
-						type: "event",
-						event: {
-							actor: "human",
-							sessionId,
-							turnId: running.turnId,
-							type: "message_submitted",
-							messageId: message.messageId,
-							queueItemId: running.id,
-							text,
-							placement: placement.type,
-							targetTurnId: placement.turnId,
-							admission: "added_to_running",
-						},
-					},
-				]);
-				return {
-					status: "added_to_running",
-					sessionId,
-					turnId: running.turnId,
-					messageId: message.messageId,
-					queueItemId: running.id,
-					queue: cloneQueue(this.#queue),
-				};
-			}
-
-			if (placement.type === "after_turn") {
-				const running = this.#queue.running;
-				if (!running || running.sessionId !== sessionId || running.turnId !== placement.turnId) {
-					return "turn_unavailable";
-				}
-			}
-
+	async admit(sessionId: Protocol.SessionId, text: string): Promise<Protocol.PromptAdmission | "missing"> {
+		if (!this.#stored.has(sessionId)) return "missing";
+		const state = await this.#state(sessionId);
+		return this.#withQueueLock(state, async () => {
 			const messageId = randomUUID();
 			const turnId = randomUUID();
 			const queueItemId = randomUUID();
-			const status: Protocol.AdmissionStatus = this.#queue.running ? "waiting" : "running";
-			const item: InternalQueueItem = {
-				item: {
-					id: queueItemId,
-					sessionId,
-					turnId,
-					messageId,
-					text,
-					state: status,
-					submittedAt: new Date().toISOString(),
-				},
+			const status: Protocol.AdmissionStatus = state.queue.running || this.#stopping ? "waiting" : "running";
+			const item: Protocol.QueueItem = {
+				id: queueItemId,
+				turnId,
+				messageId,
 				text,
-				placement: placement.type,
-				targetTurnId: placement.type === "after_turn" ? placement.turnId : undefined,
+				state: status,
+				submittedAt: new Date().toISOString(),
 			};
-			this.#items.set(queueItemId, item);
-			if (status === "running") this.#queue.running = item.item;
-			if (status === "waiting") this.#insertWaiting(item);
-			this.#queue.revision++;
+			state.items.set(queueItemId, item);
+			if (status === "running") state.queue.running = item;
+			if (status === "waiting") state.queue.waiting.push(item);
+			state.queue.revision++;
 			await this.#appendAndPublish(state, [
 				{
 					type: "event",
@@ -342,13 +235,11 @@ class Registry {
 						messageId,
 						queueItemId,
 						text,
-						placement: placement.type,
-						targetTurnId: placement.type === "after_turn" ? placement.turnId : undefined,
 						admission: status,
 					},
 				},
+				this.#queueChangedPayload(state),
 			]);
-			await this.#publishQueue();
 			if (status === "running") this.#start(item, state);
 			return {
 				status,
@@ -356,7 +247,7 @@ class Registry {
 				turnId,
 				messageId,
 				queueItemId,
-				queue: cloneQueue(this.#queue),
+				queue: cloneQueue(state.queue),
 			};
 		});
 	}
@@ -365,43 +256,41 @@ class Registry {
 		sessionId: Protocol.SessionId,
 		turnId: Protocol.TurnId,
 	): Promise<Protocol.TurnCancellationResult | "missing" | "turn_unavailable"> {
-		return this.#withQueueLock(async () => {
-			if (!this.#stored.has(sessionId)) return "missing";
-			const state = await this.#state(sessionId);
+		if (!this.#stored.has(sessionId)) return "missing";
+		const state = await this.#state(sessionId);
+		return this.#withQueueLock(state, async () => {
 			const terminal = state.turns.get(turnId);
 			if (terminal === "aborted" || terminal === "cancelled") {
 				return { status: terminal, sessionId, turnId };
 			}
 			if (terminal) return "turn_unavailable";
 
-			const running = this.#queue.running;
-			if (running?.sessionId === sessionId && running.turnId === turnId) {
+			const running = state.queue.running;
+			if (running?.turnId === turnId) {
 				if (running.state === "cancelling") return { status: "cancelling", sessionId, turnId };
 				const active = state.activeTurn;
-				if (!active || active.terminal) return "turn_unavailable";
-				active.accepting = false;
+				if (!active || active.item.id !== running.id || active.terminal) return "turn_unavailable";
 				active.cancellationRequested = true;
 				const cancelling = { ...running, state: "cancelling" as const };
-				active.item.item = cancelling;
-				this.#queue.running = cancelling;
-				this.#queue.revision++;
+				active.item = cancelling;
+				state.items.set(cancelling.id, cancelling);
+				state.queue.running = cancelling;
+				state.queue.revision++;
 				await this.#appendAndPublish(state, [
 					{
 						type: "event",
 						event: { actor: "human", sessionId, turnId, type: "turn_cancel_requested" },
 					},
-					this.#queueChangedPayload(sessionId),
+					this.#queueChangedPayload(state),
 				]);
-				await this.#publishQueue(sessionId);
 				active.controller.abort();
 				return { status: "cancelling", sessionId, turnId };
 			}
-			const index = this.#queue.waiting.findIndex((item) => item.sessionId === sessionId && item.turnId === turnId);
+			const index = state.queue.waiting.findIndex((item) => item.turnId === turnId);
 			if (index === -1) return "turn_unavailable";
-			const [removed] = this.#queue.waiting.splice(index, 1);
-			const internal = this.#items.get(removed.id);
-			if (!internal) return "turn_unavailable";
-			this.#queue.revision++;
+			const [removed] = state.queue.waiting.splice(index, 1);
+			if (!state.items.has(removed.id)) return "turn_unavailable";
+			state.queue.revision++;
 			await this.#appendAndPublish(state, [
 				{
 					type: "event",
@@ -415,7 +304,7 @@ class Registry {
 						turnId,
 						type: "message_undelivered",
 						messageId: removed.messageId,
-						text: internal.text,
+						text: removed.text,
 						reason: "cancelled",
 					},
 				},
@@ -425,9 +314,8 @@ class Registry {
 					event: { actor: "process", sessionId, turnId, type: "turn_terminal", reason: "cancelled" },
 				},
 				{ type: "event", event: { actor: "process", sessionId, turnId, type: "end" } },
-				this.#queueChangedPayload(sessionId),
+				this.#queueChangedPayload(state),
 			]);
-			await this.#publishQueue(sessionId);
 			return { status: "cancelled", sessionId, turnId };
 		});
 	}
@@ -444,14 +332,18 @@ class Registry {
 
 	async shutdown(): Promise<void> {
 		this.#stopping = true;
-		const running = this.#queue.running;
-		if (!running) return;
-		const state = await this.#state(running.sessionId);
-		const active = state.activeTurn;
-		if (!active) return;
-		active.accepting = false;
-		active.controller.abort();
-		await active.done.promise;
+		const states = await Promise.all(this.#states.values());
+		await Promise.all(
+			states.map(async (state) => {
+				const active = await this.#withQueueLock(state, async () => {
+					const active = state.activeTurn;
+					if (!active) return undefined;
+					active.controller.abort();
+					return active;
+				});
+				await active?.done.promise;
+			}),
+		);
 	}
 
 	async #state(sessionId: Protocol.SessionId): Promise<SessionState> {
@@ -475,18 +367,44 @@ class Registry {
 			.filter((record): record is AssistantRecord => record.type === "assistant")
 			.map((record) => ({ ...record.message }));
 		const turns = new Map<Protocol.TurnId, Protocol.TurnTerminalReason>();
+		const items = new Map<Protocol.QueueItemId, Protocol.QueueItem>();
+		let queue: Protocol.QueueSnapshot = { revision: 0, waiting: [] };
 		for (const record of stored.records) {
 			if (record.type !== "event") continue;
 			const event = record.event;
 			if (event.type === "turn_terminal") turns.set(event.turnId, event.reason);
+			if (event.type === "message_submitted") {
+				items.set(event.queueItemId, {
+					id: event.queueItemId,
+					turnId: event.turnId,
+					messageId: event.messageId,
+					text: event.text,
+					state: event.admission,
+					submittedAt: record.at,
+				});
+			}
+			if (event.type === "queue_changed" && event.queue.revision > queue.revision) queue = cloneQueue(event.queue);
 		}
+		const running = queue.running ? items.get(queue.running.id) : undefined;
+		const restoredRunning: Protocol.QueueItem | undefined =
+			running && queue.running
+				? { ...running, state: queue.running.state === "cancelling" ? "cancelling" : "running" }
+				: undefined;
+		if (restoredRunning) items.set(restoredRunning.id, restoredRunning);
+		const waiting = queue.waiting.flatMap((queued) => {
+			const item = items.get(queued.id);
+			if (!item) return [];
+			const restored = { ...item, state: "waiting" as const };
+			items.set(restored.id, restored);
+			return [restored];
+		});
 		const state: Engine.HarnessState = {
 			messages: conversation.map((record) => record.message),
 			identity,
 		};
 		return {
 			stored,
-			harness: this.#harnessFactory(state),
+			harness: this.#harnessFactory(state, stored.session.cwd),
 			persistedMessageCount: state.messages.length,
 			lastConversationEntryId: conversation.at(-1)?.id ?? null,
 			identity,
@@ -496,34 +414,23 @@ class Registry {
 			sequence: 0,
 			tail: [],
 			subscribers: new Set(),
+			items,
+			queue: { revision: queue.revision, running: restoredRunning, waiting },
+			queueLock: Promise.resolve(),
 		};
 	}
 
-	#insertWaiting(item: InternalQueueItem): void {
-		if (item.placement !== "after_turn" || !item.targetTurnId) {
-			this.#queue.waiting.push({ ...item.item, state: "waiting" });
-			return;
-		}
-		const index = this.#queue.waiting.findLastIndex((queued) => {
-			const internal = this.#items.get(queued.id);
-			return internal?.placement === "after_turn" && internal.targetTurnId === item.targetTurnId;
-		});
-		this.#queue.waiting.splice(index + 1, 0, { ...item.item, state: "waiting" });
-	}
-
-	#start(item: InternalQueueItem, state: SessionState): void {
-		const initial: Engine.UserMessage = {
-			sessionId: item.item.sessionId,
-			turnId: item.item.turnId,
-			messageId: item.item.messageId,
+	#start(item: Protocol.QueueItem, state: SessionState): void {
+		const message: Engine.UserMessage = {
+			sessionId: state.stored.session.id,
+			turnId: item.turnId,
+			messageId: item.messageId,
 			text: item.text,
 		};
 		const turn: ActiveTurn = {
 			item,
-			initial,
-			pending: [initial],
-			steering: [],
-			accepting: true,
+			message,
+			delivered: false,
 			controller: new AbortController(),
 			done: Promise.withResolvers<void>(),
 			terminal: false,
@@ -536,54 +443,28 @@ class Registry {
 	async #runTurn(state: SessionState, turn: ActiveTurn): Promise<void> {
 		let failureReason: "aborted" | "error" | undefined;
 		try {
-			for await (const event of state.harness.send(
-				{
-					initial: turn.initial,
-					takeSteering: (closeIfEmpty) => {
-						const message = turn.steering.shift();
-						if (message) return message;
-						if (closeIfEmpty) turn.accepting = false;
-						return undefined;
-					},
-				},
-				turn.controller.signal,
-			)) {
+			for await (const event of state.harness.send(turn.message, turn.controller.signal)) {
 				if (turn.terminal) continue;
-				if (event.type === "message_delivered") {
-					const index = turn.pending.findIndex((message) => message.messageId === event.messageId);
-					if (index !== -1) turn.pending.splice(index, 1);
-				}
+				if (event.type === "message_delivered" && event.messageId === turn.message.messageId) turn.delivered = true;
 				if (event.type === "aborted") {
-					turn.accepting = false;
 					failureReason = "aborted";
 				}
 				if (event.type === "error") {
-					turn.accepting = false;
 					failureReason = "error";
 				}
 				if (event.type === "end") {
-					if (turn.cancellationRequested && failureReason !== "aborted") {
-						failureReason = "aborted";
-						await this.#recordHarnessEvent(state, {
-							actor: "process",
-							sessionId: turn.initial.sessionId,
-							turnId: turn.initial.turnId,
-							type: "aborted",
-						});
-					}
-					await this.#finishTurn(state, turn, failureReason);
-					break;
+					await this.#completeTurn(state, turn, failureReason);
+					return;
 				}
 				await this.#recordHarnessEvent(state, event);
 			}
 		} catch (error) {
-			turn.accepting = false;
 			if (!failureReason && turn.controller.signal.aborted) {
 				failureReason = "aborted";
 				await this.#recordHarnessEvent(state, {
 					actor: "process",
-					sessionId: turn.initial.sessionId,
-					turnId: turn.initial.turnId,
+					sessionId: turn.message.sessionId,
+					turnId: turn.message.turnId,
 					type: "aborted",
 				});
 			}
@@ -591,41 +472,43 @@ class Registry {
 				failureReason = "error";
 				await this.#recordHarnessEvent(state, {
 					actor: "process",
-					sessionId: turn.initial.sessionId,
-					turnId: turn.initial.turnId,
+					sessionId: turn.message.sessionId,
+					turnId: turn.message.turnId,
 					type: "error",
 					message: error instanceof Error ? error.message : String(error),
 				});
 			}
 		} finally {
-			if (!turn.terminal) {
-				if (turn.cancellationRequested && failureReason !== "aborted") {
-					failureReason = "aborted";
-					await this.#recordHarnessEvent(state, {
-						actor: "process",
-						sessionId: turn.initial.sessionId,
-						turnId: turn.initial.turnId,
-						type: "aborted",
-					});
-				}
-				await this.#finishTurn(state, turn, failureReason ?? "error");
+			try {
+				if (!turn.terminal) await this.#completeTurn(state, turn, failureReason ?? "error");
+			} finally {
+				turn.done.resolve();
 			}
-			if (state.activeTurn === turn) state.activeTurn = undefined;
-			await this.#withQueueLock(async () => {
-				if (this.#queue.running?.id !== turn.item.item.id) return;
-				this.#queue.running = undefined;
-				this.#queue.revision++;
-				await this.#publishQueue();
-				if (!this.#stopping) await this.#startNext();
-			});
-			turn.done.resolve();
 		}
 	}
 
+	async #completeTurn(state: SessionState, turn: ActiveTurn, failureReason?: "aborted" | "error"): Promise<void> {
+		await this.#withQueueLock(state, async () => {
+			if (state.activeTurn !== turn || turn.terminal) return;
+			const aborted = turn.cancellationRequested || turn.controller.signal.aborted;
+			const finalFailure = aborted ? "aborted" : failureReason;
+			if (aborted && failureReason !== "aborted") {
+				await this.#recordHarnessEvent(state, {
+					actor: "process",
+					sessionId: turn.message.sessionId,
+					turnId: turn.message.turnId,
+					type: "aborted",
+				});
+			}
+			await this.#finishTurn(state, turn, finalFailure);
+			state.activeTurn = undefined;
+			await this.#advanceQueue(state, turn.item.id);
+		});
+	}
+
 	async #finishTurn(state: SessionState, turn: ActiveTurn, failureReason?: "aborted" | "error"): Promise<void> {
-		turn.accepting = false;
-		const scope = { sessionId: turn.initial.sessionId, turnId: turn.initial.turnId };
-		const reason = failureReason ?? (turn.pending.length > 0 || state.active ? "error" : "completed");
+		const scope = { sessionId: turn.message.sessionId, turnId: turn.message.turnId };
+		const reason = failureReason ?? (!turn.delivered || state.active ? "error" : "completed");
 		if (!failureReason && reason === "error") {
 			await this.#recordHarnessEvent(state, {
 				actor: "process",
@@ -634,19 +517,17 @@ class Registry {
 				message: "The turn ended before all submitted input and model output became terminal",
 			});
 		}
-		for (const message of turn.pending) {
+		if (!turn.delivered) {
 			const undeliveredReason = reason === "completed" ? "error" : reason;
 			await this.#recordHarnessEvent(state, {
 				actor: "process",
 				...scope,
 				type: "message_undelivered",
-				messageId: message.messageId,
-				text: message.text,
+				messageId: turn.message.messageId,
+				text: turn.message.text,
 				reason: undeliveredReason,
 			});
 		}
-		turn.pending.length = 0;
-		turn.steering.length = 0;
 		await this.#appendAndPublish(state, [
 			{ type: "event", event: { actor: "process", ...scope, type: "turn_terminal", reason } },
 			{ type: "event", event: { actor: "process", ...scope, type: "end" } },
@@ -735,29 +616,20 @@ class Registry {
 		if (event.type === "turn_terminal") state.turns.set(event.turnId, event.reason);
 	}
 
-	async #publishQueue(excludedSessionId?: Protocol.SessionId): Promise<void> {
-		const loaded = await Promise.all(this.#states.values());
-		for (const state of loaded) {
-			if (state.stored.session.id === excludedSessionId) continue;
-			await this.#appendAndPublish(state, [this.#queueChangedPayload(state.stored.session.id)]);
-		}
-	}
-
-	#queueChangedPayload(sessionId: Protocol.SessionId): Extract<Payload, { type: "event" }> {
+	#queueChangedPayload(state: SessionState): Extract<Payload, { type: "event" }> {
 		return {
 			type: "event",
 			event: {
 				actor: "process",
-				sessionId,
+				sessionId: state.stored.session.id,
 				type: "queue_changed",
-				queue: cloneQueue(this.#queue),
+				queue: cloneQueue(state.queue),
 			},
 		};
 	}
 
-	async #recoverRunning(item: Protocol.QueueItem): Promise<void> {
-		const state = await this.#state(item.sessionId);
-		const scope = { sessionId: item.sessionId, turnId: item.turnId };
+	async #recoverRunning(state: SessionState, item: Protocol.QueueItem): Promise<void> {
+		const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
 		const cancellation = item.state === "cancelling";
 		if (state.turns.has(item.turnId)) {
 			const hasEnd = state.stored.records.some(
@@ -766,9 +638,7 @@ class Registry {
 			if (!hasEnd) {
 				await this.#appendAndPublish(state, [{ type: "event", event: { actor: "process", ...scope, type: "end" } }]);
 			}
-			this.#queue.running = undefined;
-			this.#queue.revision++;
-			await this.#publishQueue();
+			await this.#advanceQueue(state, item.id);
 			return;
 		}
 		const submitted = state.stored.records
@@ -874,31 +744,44 @@ class Registry {
 		await this.#appendAndPublish(state, payloads);
 		state.lastConversationEntryId = parent;
 		const nextHistory = [...history.messages, ...repairedMessages];
-		state.harness = this.#harnessFactory({ messages: nextHistory, identity: history.identity });
+		state.harness = this.#harnessFactory(
+			{ messages: nextHistory, identity: history.identity },
+			state.stored.session.cwd,
+		);
 		state.persistedMessageCount = nextHistory.length;
-		this.#queue.running = undefined;
-		this.#queue.revision++;
-		await this.#publishQueue();
+		await this.#advanceQueue(state, item.id);
 	}
 
-	async #startNext(): Promise<void> {
-		if (this.#stopping || this.#queue.running || this.#queue.waiting.length === 0) return;
-		const next = this.#queue.waiting[0];
+	async #advanceQueue(state: SessionState, finishedItemId: Protocol.QueueItemId): Promise<void> {
+		if (state.queue.running?.id !== finishedItemId) return;
+		const next = this.#stopping ? undefined : state.queue.waiting.shift();
+		const item = next ? state.items.get(next.id) : undefined;
+		if (next && !item) throw new Error(`Queue item ${next.id} has no submitted prompt`);
+		const running = item ? { ...item, state: "running" as const } : undefined;
+		if (running) state.items.set(running.id, running);
+		state.queue.running = running;
+		state.queue.revision++;
+		await this.#appendAndPublish(state, [this.#queueChangedPayload(state)]);
+		if (running) this.#start(running, state);
+	}
+
+	async #startNext(state: SessionState): Promise<void> {
+		if (this.#stopping || state.queue.running || state.queue.waiting.length === 0) return;
+		const next = state.queue.waiting.shift();
 		if (!next) return;
-		const item = this.#items.get(next.id);
+		const item = state.items.get(next.id);
 		if (!item) throw new Error(`Queue item ${next.id} has no submitted prompt`);
-		const state = await this.#state(item.item.sessionId);
-		this.#queue.waiting.shift();
-		item.item = { ...item.item, state: "running" };
-		this.#queue.running = item.item;
-		this.#queue.revision++;
-		await this.#publishQueue();
-		this.#start(item, state);
+		const running = { ...item, state: "running" as const };
+		state.items.set(running.id, running);
+		state.queue.running = running;
+		state.queue.revision++;
+		await this.#appendAndPublish(state, [this.#queueChangedPayload(state)]);
+		this.#start(running, state);
 	}
 
-	#withQueueLock<T>(operation: () => Promise<T>): Promise<T> {
-		const running = this.#queueLock.then(operation, operation);
-		this.#queueLock = running.then(
+	#withQueueLock<T>(state: SessionState, operation: () => Promise<T>): Promise<T> {
+		const running = state.queueLock.then(operation, operation);
+		state.queueLock = running.then(
 			() => undefined,
 			() => undefined,
 		);
@@ -929,11 +812,6 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 			});
 			return;
 		}
-		if (req.method === "GET" && url.pathname === "/queue") {
-			writeJson(res, 200, manager.queue());
-			return;
-		}
-
 		const snapshotMatch = url.pathname.match(/^\/sessions\/([^/]+)$/);
 		if (req.method === "GET" && snapshotMatch) {
 			const sessionId = decodeURIComponent(snapshotMatch[1]);
@@ -987,13 +865,9 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 				writeJson(res, 400, { code: "invalid_prompt" });
 				return;
 			}
-			const admitted = await manager.admit(sessionId, prompt.text, prompt.placement);
+			const admitted = await manager.admit(sessionId, prompt.text);
 			if (admitted === "missing") {
 				res.writeHead(404).end();
-				return;
-			}
-			if (admitted === "turn_unavailable") {
-				writeJson(res, 409, { code: "turn_unavailable" });
 				return;
 			}
 			writeJson(res, 202, admitted);
@@ -1078,14 +952,15 @@ function toConversationEntry(record: ConversationRecord): Protocol.ConversationE
 	};
 }
 
-function createConfiguredHarness(state: Engine.HarnessState): Harness {
+function createConfiguredHarness(state: Engine.HarnessState, cwd: string): Harness {
 	const config = Config.loadConfig();
+	const definition = Agent.createDefinition(cwd);
 	return Engine.createHarness(
 		{
 			model: config.model,
 			getAuth: (signal) => Auth.resolveAuth(config.apiKey, signal),
-			tools: Agent.tools,
-			systemPrompt: Agent.systemPrompt,
+			tools: definition.tools,
+			systemPrompt: definition.systemPrompt,
 			reasoningEffort: config.reasoningEffort,
 		},
 		undefined,
@@ -1095,35 +970,18 @@ function createConfiguredHarness(state: Engine.HarnessState): Harness {
 
 interface PromptRequest {
 	text: string;
-	placement: Protocol.Placement;
 }
 
 function parsePromptRequest(value: unknown): PromptRequest | undefined {
-	if (
-		typeof value !== "object" ||
-		value === null ||
-		Array.isArray(value) ||
-		!("text" in value) ||
-		typeof value.text !== "string" ||
-		value.text.trim() === ""
-	) {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const prompt = value as Record<string, unknown>;
+	if (Object.keys(prompt).length !== 1 || typeof prompt.text !== "string" || prompt.text.trim() === "") {
 		return undefined;
 	}
-	const placement = "placement" in value ? value.placement : undefined;
-	if (placement === undefined || placement === "end") {
-		return { text: value.text, placement: { type: "end" } };
-	}
-	if (
-		(placement === "after_turn" || placement === "running_turn") &&
-		"turnId" in value &&
-		typeof value.turnId === "string"
-	) {
-		return { text: value.text, placement: { type: placement, turnId: value.turnId } };
-	}
-	return undefined;
+	return { text: prompt.text };
 }
 
-function cloneQueue(queue: Protocol.ProjectQueueSnapshot): Protocol.ProjectQueueSnapshot {
+function cloneQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {
 	return {
 		revision: queue.revision,
 		running: queue.running ? { ...queue.running } : undefined,
