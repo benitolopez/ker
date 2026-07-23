@@ -11,7 +11,6 @@ const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
 interface ParsedPrompt {
 	json: boolean;
 	sessionId: Protocol.SessionId;
-	placement: Protocol.Placement;
 	text: string;
 }
 
@@ -39,12 +38,12 @@ export async function run(): Promise<void> {
 		await runSessions(json);
 		return;
 	}
-	if (positional.length === 1 && positional[0] === "cancel") {
-		await runCancel(json);
+	if (positional[0] === "cancel" && positional.length === 2) {
+		await runCancel(positional[1], json);
 		return;
 	}
-	if (positional[0] === "attach" && positional.length === 2) {
-		await runAttach(positional[1], json);
+	if (positional[0] === "monitor" && positional.length === 2) {
+		await runMonitor(positional[1], json);
 		return;
 	}
 	const prompt = parsePrompt(args);
@@ -92,22 +91,27 @@ async function runSessions(json: boolean): Promise<void> {
 	}
 }
 
-async function runCancel(json: boolean): Promise<void> {
+async function runCancel(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
-	const queueResponse = await fetch(`${BASE}/queue`);
-	if (!queueResponse.ok) {
-		process.stderr.write(`ker: daemon could not read the queue (HTTP ${queueResponse.status})\n`);
+	const snapshotResponse = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`);
+	if (snapshotResponse.status === 404) {
+		process.stderr.write(`ker: session ${sessionId} was not found\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const queue = (await queueResponse.json()) as Protocol.ProjectQueueSnapshot;
-	const running = queue.running;
+	if (!snapshotResponse.ok) {
+		process.stderr.write(`ker: session ${sessionId} is unreadable (HTTP ${snapshotResponse.status})\n`);
+		process.exitCode = 1;
+		return;
+	}
+	const snapshot = (await snapshotResponse.json()) as Protocol.SessionSnapshot;
+	const running = snapshot.queue.running;
 	if (!running) {
-		process.stderr.write("ker: no running turn to cancel\n");
+		process.stderr.write(`ker: session ${sessionId} has no running turn to cancel\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const response = await cancelTurn(running.sessionId, running.turnId);
+	const response = await cancelTurn(sessionId, running.turnId);
 	if (response.status === 409 || response.status === 404) {
 		process.stderr.write(`ker: turn ${running.turnId} is no longer cancellable\n`);
 		process.exitCode = 1;
@@ -151,7 +155,7 @@ function runDaemon(): void {
 	process.once("SIGTERM", shutdown);
 }
 
-async function runAttach(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
+async function runMonitor(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
 	const controller = new AbortController();
 	const renderer = new Renderer();
@@ -162,6 +166,8 @@ async function runAttach(sessionId: Protocol.SessionId, json: boolean): Promise<
 		if (!initial) return;
 		if (json) process.stdout.write(`${JSON.stringify(initial)}\n`);
 		if (!json) renderer.snapshot(initial, () => true, true, true);
+		let idle = queueIsIdle(initial.queue);
+		if (!json && idle) writeIdle();
 		let cursor = initial.cursor;
 		while (!controller.signal.aborted) {
 			try {
@@ -171,6 +177,9 @@ async function runAttach(sessionId: Protocol.SessionId, json: boolean): Promise<
 					if (!snapshot) return;
 					if (json) process.stdout.write(`${JSON.stringify(snapshot)}\n`);
 					if (!json) renderer.snapshot(snapshot, () => true, true);
+					const nextIdle = queueIsIdle(snapshot.queue);
+					if (!json && nextIdle && !idle) writeIdle();
+					idle = nextIdle;
 					cursor = snapshot.cursor;
 					continue;
 				}
@@ -180,18 +189,23 @@ async function runAttach(sessionId: Protocol.SessionId, json: boolean): Promise<
 					cursor = { epoch: envelope.epoch, sequence: envelope.sequence };
 					if (json) process.stdout.write(`${data}\n`);
 					if (!json) renderer.event(envelope.event, () => true);
+					if (envelope.event.type === "queue_changed") {
+						const nextIdle = queueIsIdle(envelope.event.queue);
+						if (!json && nextIdle && !idle) writeIdle();
+						idle = nextIdle;
+					}
 				}
 			} catch (error) {
 				if (controller.signal.aborted) break;
 				process.stderr.write(
-					`ker: attach disconnected — ${error instanceof Error ? error.message : String(error)}; reconnecting\n`,
+					`ker: monitor disconnected — ${error instanceof Error ? error.message : String(error)}; reconnecting\n`,
 				);
 				await sleep(1_000, undefined, { signal: controller.signal });
 			}
 		}
 	} catch (error) {
 		if (!controller.signal.aborted) {
-			process.stderr.write(`ker: attach failed — ${error instanceof Error ? error.message : String(error)}\n`);
+			process.stderr.write(`ker: monitor failed — ${error instanceof Error ? error.message : String(error)}\n`);
 			process.exitCode = 1;
 		}
 	} finally {
@@ -199,7 +213,7 @@ async function runAttach(sessionId: Protocol.SessionId, json: boolean): Promise<
 	}
 }
 
-// A prompt subscribes before admission, waits through the project queue, and cancels only its exact turn.
+// A prompt subscribes before admission, waits through its session queue, and cancels only its exact turn.
 async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 	const controller = new AbortController();
 	const renderer = new Renderer();
@@ -240,18 +254,13 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({
 				text: prompt.text,
-				placement: prompt.placement.type,
-				turnId: prompt.placement.type === "end" ? undefined : prompt.placement.turnId,
 			}),
 		});
 		if (submitted.status !== 202) {
-			const body = (await submitted.json().catch(() => undefined)) as { code?: string } | undefined;
 			process.stderr.write(
-				body?.code === "turn_unavailable"
-					? "ker: the named turn is no longer running in this session\n"
-					: submitted.status === 404
-						? `ker: session ${prompt.sessionId} was not found\n`
-						: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
+				submitted.status === 404
+					? `ker: session ${prompt.sessionId} was not found\n`
+					: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
 			);
 			process.exitCode = 1;
 			return;
@@ -435,21 +444,17 @@ function parsePrompt(args: string[]): ParsedPrompt | undefined {
 	if (sessionIndex === -1 || !values[sessionIndex + 1]) return undefined;
 	const sessionId = values[sessionIndex + 1];
 	values.splice(sessionIndex, 2);
-	const afterIndex = values.indexOf("--after-turn");
-	const toIndex = values.indexOf("--to-turn");
-	if (afterIndex !== -1 && toIndex !== -1) return undefined;
-	if ((afterIndex !== -1 && !values[afterIndex + 1]) || (toIndex !== -1 && !values[toIndex + 1])) return undefined;
-	const placement: Protocol.Placement =
-		afterIndex !== -1 && values[afterIndex + 1]
-			? { type: "after_turn", turnId: values[afterIndex + 1] }
-			: toIndex !== -1 && values[toIndex + 1]
-				? { type: "running_turn", turnId: values[toIndex + 1] }
-				: { type: "end" };
-	const placementIndex = afterIndex !== -1 ? afterIndex : toIndex;
-	if (placementIndex !== -1) values.splice(placementIndex, 2);
 	const text = values.join(" ").trim();
 	if (!text || values.some((value) => value.startsWith("--"))) return undefined;
-	return { json, sessionId, placement, text };
+	return { json, sessionId, text };
+}
+
+function queueIsIdle(queue: Protocol.QueueSnapshot): boolean {
+	return !queue.running && queue.waiting.length === 0;
+}
+
+function writeIdle(): void {
+	process.stderr.write("ker: waiting for turns\n");
 }
 
 async function subscribe(
@@ -515,6 +520,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions | cancel | attach <id>\n       ker [--json] --session <id> [--after-turn <id> | --to-turn <id>] <prompt>\n       ker daemon | login | logout\n",
+		"usage: ker [--json] new | sessions | cancel <id> | monitor <id>\n       ker [--json] --session <id> <prompt>\n       ker daemon | login | logout\n",
 	);
 }

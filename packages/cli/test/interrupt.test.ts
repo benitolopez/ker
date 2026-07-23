@@ -37,9 +37,10 @@ test("an admitted prompt waits for its turn and prints only assistant text", asy
 	assert.equal(controlled.stdout.join(""), "answer\n");
 	assert.equal(controlled.stderr.join(""), "");
 	assert.deepEqual(controlled.cancelBodies, []);
+	assert.deepEqual(controlled.promptBodies, [{ text: "hello" }]);
 });
 
-test("a waiting prompt remains attached until its own turn finishes", async (t) => {
+test("a waiting prompt remains connected until its own turn finishes", async (t) => {
 	const controlled = controlPrompt(t, "waiting");
 	const running = run();
 	await controlled.promptStarted.promise;
@@ -82,15 +83,29 @@ test("external cancellation reports both transitions and exits 130", async (t) =
 	assert.equal(process.exitCode, 130);
 });
 
-test("--to-turn sends exact running-turn placement", async (t) => {
-	const controlled = controlPrompt(t, "added_to_running", ["--session", "session-1", "--to-turn", "turn-1", "steer"]);
-	const running = run();
-	await controlled.promptStarted.promise;
-	controlled.promptResponse.resolve(jsonResponse(admission("added_to_running"), 202));
-	controlled.complete([terminal("completed"), end()]);
-	await running;
-
-	assert.deepEqual(controlled.promptBodies, [{ text: "steer", placement: "running_turn", turnId: "turn-1" }]);
+test("rejects attach and obsolete placement flags through usage handling", async (t) => {
+	const originalArgv = process.argv;
+	const originalExitCode = process.exitCode;
+	const stderr: string[] = [];
+	t.mock.method(process.stderr, "write", (chunk: string | Uint8Array) => {
+		stderr.push(String(chunk));
+		return true;
+	});
+	t.after(() => {
+		process.argv = originalArgv;
+		process.exitCode = originalExitCode;
+	});
+	for (const args of [
+		["attach", "session-1"],
+		["--session", "session-1", "--to-turn", "turn-1", "steer"],
+		["--session", "session-1", "--after-turn", "turn-1", "next"],
+	]) {
+		process.argv = [process.execPath, "ker", ...args];
+		process.exitCode = undefined;
+		await run();
+		assert.equal(process.exitCode, 1);
+	}
+	assert.equal(stderr.filter((line) => line.startsWith("usage: ker")).length, 3);
 });
 
 test("--json prints the snapshot and raw event envelopes", async (t) => {

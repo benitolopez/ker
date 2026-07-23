@@ -4,43 +4,80 @@ import type * as Protocol from "@ker-ai/protocol";
 import { PROTOCOL_VERSION } from "@ker-ai/protocol";
 import { run } from "../src/index.ts";
 
-test("attach renders live and resnapshot lifecycle transitions once and keeps following", async (t) => {
-	const controlled = controlAttach(t);
-	const running = run();
-	await controlled.firstSubscribed.promise;
+test("monitor", async (t) => {
+	await t.test("renders live and resnapshot lifecycle transitions once and keeps following", async (t) => {
+		const controlled = controlMonitor(t);
+		const running = run();
+		await controlled.firstSubscribed.promise;
 
-	controlled.emit([
-		terminal("current", "aborted"),
-		{ actor: "human", sessionId: "session-1", turnId: "live", type: "turn_cancel_requested" },
-		terminal("live", "cancelled"),
-		{ actor: "process", sessionId: "session-1", turnId: "live", type: "end" },
-	]);
-	controlled.closeFirst();
-	await controlled.followingSubscribed.promise;
+		controlled.emit([
+			terminal("current", "aborted"),
+			{ actor: "human", sessionId: "session-1", turnId: "live", type: "turn_cancel_requested" },
+			terminal("live", "cancelled"),
+			{ actor: "process", sessionId: "session-1", turnId: "live", type: "end" },
+		]);
+		controlled.closeFirst();
+		await controlled.followingSubscribed.promise;
 
-	assert.equal(controlled.stdout.join(""), "saved\n");
-	assert.equal(
-		controlled.stderr.join(""),
-		[
-			"ker: cancelling (turn current)\n",
-			"ker: aborted (turn current)\n",
-			"ker: cancelling (turn live)\n",
-			"ker: cancelled (turn live)\n",
-			"ker: error (turn missed)\n",
-		].join(""),
-	);
-	assert.equal(await Promise.race([running.then(() => "detached"), Promise.resolve("attached")]), "attached");
+		assert.equal(controlled.stdout.join(""), "saved\n");
+		assert.equal(
+			controlled.stderr.join(""),
+			[
+				"ker: cancelling (turn current)\n",
+				"ker: aborted (turn current)\n",
+				"ker: cancelling (turn live)\n",
+				"ker: cancelled (turn live)\n",
+				"ker: error (turn missed)\n",
+				"ker: waiting for turns\n",
+			].join(""),
+		);
+		assert.equal(await Promise.race([running.then(() => "detached"), Promise.resolve("monitoring")]), "monitoring");
 
-	const detach = findNewSignalListener(controlled.signalListeners);
-	detach("SIGINT");
-	await running;
-	assert.equal(
-		controlled.paths.some((path) => path.endsWith("/cancel")),
-		false,
-	);
+		const detach = findNewSignalListener(controlled.signalListeners);
+		detach("SIGINT");
+		await running;
+		assert.equal(
+			controlled.paths.some((path) => path.endsWith("/cancel")),
+			false,
+		);
+	});
+
+	await t.test("reports an initially idle session once", async (t) => {
+		const controlled = controlMonitor(t, { initial: recoveredSnapshot(), recovered: recoveredSnapshot() });
+		const running = run();
+		await controlled.firstSubscribed.promise;
+		controlled.closeFirst();
+		await controlled.followingSubscribed.promise;
+
+		assert.equal(controlled.stderr.join(""), "ker: waiting for turns\n");
+		findNewSignalListener(controlled.signalListeners)("SIGINT");
+		await running;
+	});
+
+	await t.test("JSON output contains only snapshots and event envelopes", async (t) => {
+		const controlled = controlMonitor(t, { json: true });
+		const running = run();
+		await controlled.firstSubscribed.promise;
+		controlled.emit([terminal("current", "aborted")]);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		controlled.closeFirst();
+		await controlled.followingSubscribed.promise;
+		findNewSignalListener(controlled.signalListeners)("SIGINT");
+		await running;
+
+		const lines = controlled.stdout
+			.filter((chunk) => chunk.startsWith("{"))
+			.flatMap((chunk) => chunk.trim().split("\n"))
+			.map((line) => JSON.parse(line) as Protocol.SessionSnapshot | Protocol.EventEnvelope);
+		assert.equal(lines.length, 3);
+		assert.equal("session" in lines[0], true);
+		assert.equal("event" in lines[1], true);
+		assert.equal("session" in lines[2], true);
+		assert.equal(controlled.stderr.join(""), "");
+	});
 });
 
-interface ControlledAttach {
+interface ControlledMonitor {
 	firstSubscribed: PromiseWithResolvers<void>;
 	followingSubscribed: PromiseWithResolvers<void>;
 	paths: string[];
@@ -51,7 +88,10 @@ interface ControlledAttach {
 	closeFirst(): void;
 }
 
-function controlAttach(t: TestContext): ControlledAttach {
+function controlMonitor(
+	t: TestContext,
+	options: { json?: boolean; initial?: Protocol.SessionSnapshot; recovered?: Protocol.SessionSnapshot } = {},
+): ControlledMonitor {
 	const originalFetch = globalThis.fetch;
 	const originalArgv = process.argv;
 	const originalExitCode = process.exitCode;
@@ -71,7 +111,7 @@ function controlAttach(t: TestContext): ControlledAttach {
 	let snapshotCalls = 0;
 	let eventCalls = 0;
 
-	process.argv = [process.execPath, "ker", "attach", "session-1"];
+	process.argv = [process.execPath, "ker", ...(options.json ? ["--json"] : []), "monitor", "session-1"];
 	process.exitCode = undefined;
 	t.mock.method(process.stderr, "write", (chunk: string | Uint8Array) => {
 		stderr.push(String(chunk));
@@ -87,7 +127,10 @@ function controlAttach(t: TestContext): ControlledAttach {
 		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION }, 200);
 		if (path === "/sessions/session-1") {
 			snapshotCalls++;
-			return jsonResponse(snapshotCalls === 1 ? initialSnapshot() : recoveredSnapshot(), 200);
+			return jsonResponse(
+				snapshotCalls === 1 ? (options.initial ?? initialSnapshot()) : (options.recovered ?? recoveredSnapshot()),
+				200,
+			);
 		}
 		if (path === "/sessions/session-1/events") {
 			eventCalls++;
@@ -180,7 +223,6 @@ function session(): Protocol.SessionDescriptor {
 function queueItem(turnId: string, state: Protocol.QueueItem["state"]): Protocol.QueueItem {
 	return {
 		id: `queue-${turnId}`,
-		sessionId: "session-1",
 		turnId,
 		messageId: `message-${turnId}`,
 		text: "hello",

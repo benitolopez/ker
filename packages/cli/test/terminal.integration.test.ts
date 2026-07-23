@@ -17,11 +17,9 @@ const PROJECT_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const CLI_PATH = join(PROJECT_ROOT, "packages/cli/src/cli.ts");
 const REDIRECT_PATH = join(PROJECT_ROOT, "packages/cli/test/fixtures/redirect-fetch.ts");
 
-test("prompt SIGINT cancels for an attached client without detaching it", { timeout: 20_000 }, async (t) => {
+test("session FIFO runs beside another session and survives exact cancellation", { timeout: 20_000 }, async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-cli-terminal-"));
 	const providerStarted = Promise.withResolvers<void>();
-	const firstDelta = Promise.withResolvers<void>();
-	const secondDelta = Promise.withResolvers<void>();
 	const harnessFactory: NonNullable<DaemonOptions["harnessFactory"]> = (initial) =>
 		createHarness(
 			{
@@ -31,20 +29,26 @@ test("prompt SIGINT cancels for an attached client without detaching it", { time
 				systemPrompt: "Test system prompt",
 			},
 			{
-				stream: async function* (_model, _messages, _auth, options) {
-					providerStarted.resolve();
-					if (!(await waitForRelease(firstDelta.promise, options?.signal))) {
+				stream: async function* (_model, messages, _auth, options) {
+					const text = messages.findLast((message) => message.role === "user")?.content;
+					if (text === "hold session A") {
+						providerStarted.resolve();
+						yield { type: "delta", text: "A running" };
+						await waitForAbort(options?.signal);
 						yield { type: "aborted" };
 						return;
 					}
-					yield { type: "delta", text: "one" };
-					if (!(await waitForRelease(secondDelta.promise, options?.signal))) {
-						yield { type: "aborted" };
+					if (text === "reply with second") {
+						yield { type: "delta", text: "reply with second" };
+						yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
 						return;
 					}
-					yield { type: "delta", text: "two" };
-					await waitForAbort(options?.signal);
-					yield { type: "aborted" };
+					if (text === "reply with session B") {
+						yield { type: "delta", text: "reply with session B" };
+						yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+						return;
+					}
+					yield { type: "error", message: `Unexpected test prompt: ${text}`, retryable: false };
 				},
 			},
 			initial,
@@ -70,30 +74,57 @@ test("prompt SIGINT cancels for an attached client without detaching it", { time
 		await rm(sessionDir, { recursive: true, force: true });
 	});
 
-	const session = await createSession(daemonUrl);
-	const prompt = startCli(["--session", session.id, "hello"], daemonUrl);
-	children.add(prompt.child);
-	await waitForProvider(providerStarted.promise, prompt);
+	const sessionA = await createSession(daemonUrl);
+	const sessionB = await createSession(daemonUrl);
+	assert.equal((await localRequest(daemonUrl, "/queue")).status, 404);
+	const obsoletePrompt = await localRequest(daemonUrl, `/sessions/${sessionA.id}/prompts`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ text: "hello", placement: "end" }),
+	});
+	assert.equal(obsoletePrompt.status, 400);
+	assert.deepEqual(JSON.parse(obsoletePrompt.body) as object, { code: "invalid_prompt" });
 
-	const attach = startCli(["attach", session.id], daemonUrl);
-	children.add(attach.child);
-	firstDelta.resolve();
-	await waitForOutput(attach, "one");
-	secondDelta.resolve();
-	await waitForOutput(attach, "onetwo");
+	const firstA = startCli(["--session", sessionA.id, "hold session A"], daemonUrl);
+	children.add(firstA.child);
+	await waitForProvider(providerStarted.promise, firstA);
 
-	assert.equal(prompt.child.kill("SIGINT"), true);
-	const promptExit = await waitForClose(prompt);
-	assert.deepEqual(promptExit, { code: 130, signal: null });
-	assert.match(prompt.stderr.join(""), /ker: cancelling \(turn .+\)/);
-	await waitForOutput(attach, "ker: aborted", "stderr");
-	assert.match(attach.stderr.join(""), /ker: cancelling \(turn .+\)\nker: aborted \(turn .+\)/);
-	assert.equal(attach.child.exitCode, null);
-	assert.equal(attach.child.signalCode, null);
+	const monitor = startCli(["monitor", sessionA.id], daemonUrl);
+	children.add(monitor.child);
+	await waitForOutput(monitor, "A running");
 
-	assert.equal(attach.child.kill("SIGINT"), true);
-	const attachExit = await waitForClose(attach);
-	assert.deepEqual(attachExit, { code: 0, signal: null });
+	const secondA = startCli(["--session", sessionA.id, "reply with second"], daemonUrl);
+	children.add(secondA.child);
+	await waitForOutput(secondA, "ker: waiting", "stderr");
+	assert.equal(secondA.child.exitCode, null);
+
+	const promptB = startCli(["--session", sessionB.id, "reply with session B"], daemonUrl);
+	children.add(promptB.child);
+	assert.deepEqual(await waitForClose(promptB), { code: 0, signal: null });
+	assert.equal(promptB.stdout.join(""), "reply with session B\n");
+	assert.doesNotMatch(monitor.stdout.join(""), /session B/);
+	assert.equal(firstA.child.exitCode, null);
+
+	const cancel = startCli(["cancel", sessionA.id], daemonUrl);
+	children.add(cancel.child);
+	const cancelExit = await waitForClose(cancel);
+	assert.deepEqual(cancelExit, { code: 0, signal: null });
+	assert.match(cancel.stderr.join(""), /ker: cancelling \(turn .+\)/);
+	const firstAExit = await waitForClose(firstA);
+	assert.deepEqual(firstAExit, { code: 130, signal: null });
+	assert.match(firstA.stderr.join(""), /ker: cancelling \(turn .+\)/);
+	await waitForOutput(monitor, "ker: aborted", "stderr");
+	assert.match(monitor.stderr.join(""), /ker: cancelling \(turn .+\)\nker: aborted \(turn .+\)/);
+	assert.deepEqual(await waitForClose(secondA), { code: 0, signal: null });
+	assert.equal(secondA.stdout.join(""), "reply with second\n");
+	await waitForOutput(monitor, "reply with second");
+	await waitForOutput(monitor, "ker: waiting for turns", "stderr");
+	assert.equal(monitor.child.exitCode, null);
+	assert.equal(monitor.child.signalCode, null);
+
+	assert.equal(monitor.child.kill("SIGINT"), true);
+	const monitorExit = await waitForClose(monitor);
+	assert.deepEqual(monitorExit, { code: 0, signal: null });
 });
 
 interface RunningCli {
@@ -122,23 +153,32 @@ function startCli(args: string[], daemonUrl: string): RunningCli {
 	return { child, closed, stderr, stdout };
 }
 
-function createSession(daemonUrl: string): Promise<Protocol.SessionDescriptor> {
+async function createSession(daemonUrl: string): Promise<Protocol.SessionDescriptor> {
+	const response = await localRequest(daemonUrl, "/sessions", { method: "POST" });
+	assert.equal(response.status, 201);
+	return JSON.parse(response.body) as Protocol.SessionDescriptor;
+}
+
+function localRequest(
+	daemonUrl: string,
+	path: string,
+	init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+): Promise<{ status: number; body: string }> {
 	return new Promise((resolve, reject) => {
 		const req = request(
-			`${daemonUrl}/sessions`,
-			{ method: "POST", headers: { host: `127.0.0.1:${DEFAULT_PORT}` } },
+			`${daemonUrl}${path}`,
+			{ method: init.method, headers: { ...init.headers, host: `127.0.0.1:${DEFAULT_PORT}` } },
 			(res) => {
 				const chunks: Buffer[] = [];
 				res.on("data", (chunk: Buffer) => chunks.push(chunk));
 				res.once("error", reject);
 				res.once("end", () => {
-					assert.equal(res.statusCode, 201);
-					resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Protocol.SessionDescriptor);
+					resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") });
 				});
 			},
 		);
 		req.once("error", reject);
-		req.end();
+		req.end(init.body);
 	});
 }
 
@@ -178,9 +218,4 @@ async function waitForProvider(started: Promise<void>, cli: RunningCli): Promise
 function waitForAbort(signal?: AbortSignal): Promise<void> {
 	if (signal?.aborted) return Promise.resolve();
 	return new Promise((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
-}
-
-async function waitForRelease(release: Promise<void>, signal?: AbortSignal): Promise<boolean> {
-	if (signal?.aborted) return false;
-	return Promise.race([release.then(() => true), waitForAbort(signal).then(() => false)]);
 }
