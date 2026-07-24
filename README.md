@@ -111,16 +111,23 @@ npx ker --session "$SESSION_ID" "my name is Beni"
 npx ker --session "$SESSION_ID" "what's my name?"
 ```
 
-List this project's sessions or monitor one. Monitor prints saved model answers, any active partial
-answer, and future model output. It keeps following after turns complete or fail. Current and future
-cancellation or failure transitions go to stderr; historical status banners are suppressed. Ctrl-C
-only stops the monitor and never cancels work. An idle monitor prints `ker: waiting for turns` to
-stderr and continues following:
+List this project's sessions or monitor one. Monitor renders the current conversation state in turn
+order, then follows new turns. Assistant text is the only monitor output written to stdout. Delivered,
+running, and waiting prompts are prefixed with `> ` on stderr; developer notices, lifecycle status,
+and errors are prefixed with `ker: ` there. Tool calls, tool results, reasoning, usage, retries, and
+authentication events stay omitted from human output. Historical status banners are suppressed, but
+current and future cancellation or failure transitions remain visible. Ctrl-C only stops the monitor
+and never cancels work. An idle monitor prints `ker: waiting for turns` to stderr and continues
+following:
 
 ```sh
 npx ker sessions
 npx ker monitor "$SESSION_ID"
 ```
+
+`npx ker --json monitor "$SESSION_ID"` keeps the diagnostic wire view unchanged: it prints the initial
+`SessionSnapshot`, raw event envelopes, and another snapshot line whenever the event cursor requires a
+resync. The event tail is bounded, so this feed does not promise a complete historical replay.
 
 Cancel the exact running or cancelling turn captured from one session:
 
@@ -139,8 +146,8 @@ steering or turn placement; every prompt creates one turn.
 A prompt client waits until its turn finishes. Disconnecting it leaves the turn intact; Ctrl-C
 cancels its exact waiting or running turn and exits 130. Cancellation from another local client also
 makes the owning prompt command exit 130. Successful turns exit 0, while other failures exit 1.
-Assistant text goes to stdout; queue and lifecycle status and errors go to stderr. `--json` prints the
-full snapshot followed by raw event envelopes:
+Assistant text goes to stdout; queue and lifecycle status and errors go to stderr. Prompt commands do
+not echo prompt attribution. `--json` prints the full snapshot followed by raw event envelopes:
 
 ```sh
 npx ker --json --session "$SESSION_ID" "inspect the raw stream"

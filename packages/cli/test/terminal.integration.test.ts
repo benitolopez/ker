@@ -92,10 +92,12 @@ test("session FIFO runs beside another session and survives exact cancellation",
 	const monitor = startCli(["monitor", sessionA.id], daemonUrl);
 	children.add(monitor.child);
 	await waitForOutput(monitor, "A running");
+	await waitForOutput(monitor, "> hold session A", "stderr");
 
 	const secondA = startCli(["--session", sessionA.id, "reply with second"], daemonUrl);
 	children.add(secondA.child);
 	await waitForOutput(secondA, "ker: waiting", "stderr");
+	await waitForOutput(monitor, "> reply with second", "stderr");
 	assert.equal(secondA.child.exitCode, null);
 
 	const promptB = startCli(["--session", sessionB.id, "reply with session B"], daemonUrl);
@@ -119,6 +121,8 @@ test("session FIFO runs beside another session and survives exact cancellation",
 	assert.equal(secondA.stdout.join(""), "reply with second\n");
 	await waitForOutput(monitor, "reply with second");
 	await waitForOutput(monitor, "ker: waiting for turns", "stderr");
+	assert.equal(monitor.stdout.join(""), "A running\nreply with second\n");
+	assert.doesNotMatch(monitor.stdout.join(""), /hold session A/);
 	assert.equal(monitor.child.exitCode, null);
 	assert.equal(monitor.child.signalCode, null);
 

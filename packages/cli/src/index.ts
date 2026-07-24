@@ -158,7 +158,7 @@ function runDaemon(): void {
 async function runMonitor(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
 	const controller = new AbortController();
-	const renderer = new Renderer();
+	const renderer = new Renderer(true);
 	const onSigint = () => controller.abort();
 	process.once("SIGINT", onSigint);
 	try {
@@ -288,11 +288,7 @@ async function runPrompt(prompt: ParsedPrompt): Promise<void> {
 					if (envelope.event.type === "turn_cancel_requested") cancelled = true;
 					if (envelope.event.type === "error") {
 						failed = true;
-						if (!prompt.json) {
-							process.stderr.write(`ker: ${envelope.event.message}\n`);
-							const remediation = identityChangeRemediation(envelope.event);
-							if (remediation) process.stderr.write(`ker: ${remediation}\n`);
-						}
+						if (!prompt.json) writeError(envelope.event);
 					}
 					if (envelope.event.type === "turn_terminal") {
 						if (envelope.event.reason !== "completed") failed = true;
@@ -375,6 +371,14 @@ class Renderer {
 	readonly #ended = new Set<Protocol.MessageId>();
 	readonly #activeByTurn = new Map<Protocol.TurnId, Protocol.MessageId>();
 	readonly #turnStatuses = new Map<Protocol.TurnId, Protocol.TurnSnapshot["status"]>();
+	readonly #promptMessageIds = new Set<Protocol.MessageId>();
+	readonly #developerEntryIds = new Set<string>();
+	readonly #undeliveredMessageIds = new Set<Protocol.MessageId>();
+	readonly #monitor: boolean;
+
+	constructor(monitor = false) {
+		this.#monitor = monitor;
+	}
 
 	snapshot(
 		snapshot: Protocol.SessionSnapshot,
@@ -382,13 +386,16 @@ class Renderer {
 		render: boolean,
 		initial = false,
 	): void {
-		for (const message of snapshot.messages) {
-			if (!matches(message.turnId)) continue;
-			this.#text(message.id, message.turnId, message.text, render);
-			this.#finish(message.id, render);
-		}
-		if (snapshot.active && matches(snapshot.active.turnId)) {
-			this.#text(snapshot.active.id, snapshot.active.turnId, snapshot.active.text, render);
+		if (this.#monitor) this.#conversation(snapshot, matches, render);
+		if (!this.#monitor) {
+			for (const message of snapshot.messages) {
+				if (!matches(message.turnId)) continue;
+				this.#text(message.id, message.turnId, message.text, render);
+				this.#finish(message.id, render);
+			}
+			if (snapshot.active && matches(snapshot.active.turnId)) {
+				this.#text(snapshot.active.id, snapshot.active.turnId, snapshot.active.text, render);
+			}
 		}
 		for (const turn of snapshot.turns) {
 			if (!matches(turn.id)) continue;
@@ -410,6 +417,76 @@ class Renderer {
 		if (event.type === "error" || event.type === "aborted" || event.type === "interrupted") {
 			const active = this.#activeByTurn.get(event.turnId);
 			if (active) this.#finish(active, true);
+		}
+		if (!this.#monitor) return;
+		if (event.type === "message_submitted" || event.type === "message_delivered") {
+			this.#prompt(event.messageId, event.text, true);
+		}
+		if (event.type === "message_undelivered") {
+			if (this.#undeliveredMessageIds.has(event.messageId)) return;
+			this.#undeliveredMessageIds.add(event.messageId);
+			process.stderr.write(`ker: prompt was not delivered: ${event.reason} (turn ${event.turnId})\n`);
+		}
+		if (event.type === "error") writeError(event);
+	}
+
+	#conversation(
+		snapshot: Protocol.SessionSnapshot,
+		matches: (turnId: Protocol.TurnId) => boolean,
+		render: boolean,
+	): void {
+		const entries = snapshot.entries.filter((entry) => matches(entry.turnId));
+		const messages = new Map(
+			snapshot.messages.filter((message) => matches(message.turnId)).map((message) => [message.id, message]),
+		);
+		const linkedMessageIds = new Set(
+			entries.flatMap((entry) => (entry.role === "assistant" && entry.messageId ? [entry.messageId] : [])),
+		);
+		const pendingByTurn = new Map<
+			Protocol.TurnId,
+			Array<Protocol.AssistantMessage | Protocol.ActiveAssistantMessage>
+		>();
+		for (const message of snapshot.messages) {
+			if (!matches(message.turnId) || linkedMessageIds.has(message.id)) continue;
+			pendingByTurn.set(message.turnId, [...(pendingByTurn.get(message.turnId) ?? []), message]);
+		}
+		if (snapshot.active && matches(snapshot.active.turnId)) {
+			pendingByTurn.set(snapshot.active.turnId, [
+				...(pendingByTurn.get(snapshot.active.turnId) ?? []),
+				snapshot.active,
+			]);
+		}
+		const flush = (turnId: Protocol.TurnId) => {
+			const pending = pendingByTurn.get(turnId);
+			if (!pending) return;
+			for (const message of pending) {
+				this.#text(message.id, message.turnId, message.text, render);
+				if ("reason" in message) this.#finish(message.id, render);
+			}
+			pendingByTurn.delete(turnId);
+		};
+
+		for (const [index, entry] of entries.entries()) {
+			if (entry.role === "user" && entry.messageId) {
+				this.#prompt(entry.messageId, entry.content, render);
+			}
+			if (entry.role === "assistant" && entry.messageId) {
+				const message = messages.get(entry.messageId);
+				if (message) {
+					this.#text(message.id, message.turnId, message.text, render);
+					this.#finish(message.id, render);
+				}
+			}
+			if (entry.role === "developer") {
+				flush(entry.turnId);
+				this.#developer(entry.id, entry.content, render);
+			}
+			if (entries[index + 1]?.turnId !== entry.turnId) flush(entry.turnId);
+		}
+		for (const turnId of pendingByTurn.keys()) flush(turnId);
+		for (const item of [snapshot.queue.running, ...snapshot.queue.waiting]) {
+			if (!item || !matches(item.turnId)) continue;
+			this.#prompt(item.messageId, item.text, render);
 		}
 	}
 
@@ -435,6 +512,18 @@ class Renderer {
 		if (render && (this.#seen.get(id) ?? 0) > 0) process.stdout.write("\n");
 		this.#ended.add(id);
 	}
+
+	#prompt(id: Protocol.MessageId, text: string, render: boolean): void {
+		if (this.#promptMessageIds.has(id) || this.#undeliveredMessageIds.has(id)) return;
+		this.#promptMessageIds.add(id);
+		if (render) writeAttributed("> ", text);
+	}
+
+	#developer(id: string, text: string, render: boolean): void {
+		if (this.#developerEntryIds.has(id)) return;
+		this.#developerEntryIds.add(id);
+		if (render) writeAttributed("ker: ", text);
+	}
 }
 
 function parsePrompt(args: string[]): ParsedPrompt | undefined {
@@ -455,6 +544,17 @@ function queueIsIdle(queue: Protocol.QueueSnapshot): boolean {
 
 function writeIdle(): void {
 	process.stderr.write("ker: waiting for turns\n");
+}
+
+function writeAttributed(prefix: string, text: string): void {
+	const lines = text.endsWith("\n") ? text.split("\n").slice(0, -1) : text.split("\n");
+	for (const line of lines) process.stderr.write(`${prefix}${line}\n`);
+}
+
+function writeError(event: Protocol.ErrorEvent): void {
+	process.stderr.write(`ker: ${event.message}\n`);
+	const remediation = identityChangeRemediation(event);
+	if (remediation) process.stderr.write(`ker: ${remediation}\n`);
 }
 
 async function subscribe(

@@ -11,6 +11,25 @@ test("an admitted prompt waits for its turn and prints only assistant text", asy
 	controlled.promptResponse.resolve(jsonResponse(admission("running"), 202));
 	controlled.complete([
 		{
+			actor: "human",
+			sessionId: "session-1",
+			turnId: "turn-1",
+			type: "message_submitted",
+			messageId: "message-1",
+			queueItemId: "queue-1",
+			text: "hello",
+			admission: "running",
+		},
+		{
+			actor: "human",
+			modelRole: "user",
+			sessionId: "session-1",
+			turnId: "turn-1",
+			type: "message_delivered",
+			messageId: "message-1",
+			text: "hello",
+		},
+		{
 			actor: "agent",
 			modelRole: "assistant",
 			sessionId: "session-1",
