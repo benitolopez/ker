@@ -3,10 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { applyEdit, tools } from "../src/index.ts";
+import { applyEdit, createDefinition } from "../src/index.ts";
 
 function editTool() {
-	const found = tools.find((t) => t.name === "edit");
+	const found = createDefinition(process.cwd()).tools.find((t) => t.name === "edit");
 	if (!found) throw new Error("edit tool not registered");
 	return found;
 }

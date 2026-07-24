@@ -176,10 +176,6 @@ export function createDefinition(cwd: string): { systemPrompt: string; tools: To
 	};
 }
 
-const definition = createDefinition(process.cwd());
-export const systemPrompt = definition.systemPrompt;
-export const tools = definition.tools;
-
 // Number every line while keeping the complete result within both output caps. An oversized first line
 // is cut at a UTF-8 boundary and carries a byte-exact bash command for reading the remainder.
 export function formatRead(raw: string, offset: number | undefined, limit: number | undefined, path: string): string {
