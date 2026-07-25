@@ -21,16 +21,20 @@ Thank you for your interest and understanding.
 - A streaming tool-call loop using the OpenAI Responses API, with its own retry/backoff on
   transient failures before provider output starts.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
-- Conversation memory that lives in the daemon: start a turn in one terminal, continue from
-  another — it remembers, because the client is disposable and the daemon isn't.
-- Prompts sent while a turn is active join that turn in FIFO order. They enter model history
-  after the current response and its requested tools finish.
-- OpenAI API-key authentication and an optional ChatGPT OAuth login. A conversation stays bound
+- Durable sessions stored outside the repository. Restarting the daemon restores completed history,
+  interrupted turns, and waiting work.
+- Multiple sessions per project, each with its own FIFO queue. One turn runs at a time in a session,
+  while different sessions can run concurrently.
+- Session-owned cancellation that every monitoring client can observe. Waiting turns cancel
+  immediately; running turns stay visibly `cancelling` until abort cleanup finishes.
+- Session snapshots and cursor-based event catch-up for monitoring during a response or reconnecting
+  after a client disconnects.
+- OpenAI API-key authentication and an optional ChatGPT OAuth login. A session stays bound
   to the credential identity that started it.
 - Bounded tool output: `read` pages large files, and `bash` keeps a bounded tail while spilling
   the full stream to a private temporary file.
 
-Not there yet: saved sessions, a TUI, or any provider other than OpenAI.
+Not there yet: a TUI, queue editing, or any provider other than OpenAI.
 
 ## Requirements
 
@@ -80,9 +84,9 @@ npx ker logout
 
 When both are configured the subscription wins; `ker logout` reverts to the key. The daemon reads
 the stored login before every provider request, so login, refresh, and logout do not require a daemon
-restart. An existing conversation refuses a different OAuth account or a switch between OAuth and an
-API key; use `ker new` to clear its history and credential binding. Use `--json` when sending a prompt
-to inspect the authentication event and the rest of the raw event stream.
+restart. An existing session refuses a different OAuth account or a switch between OAuth and an API
+key; use `ker new` to create an empty session with a new credential binding. Use `--json` when sending
+a prompt to inspect the session snapshot and raw event envelopes.
 
 ## Usage
 
@@ -92,30 +96,69 @@ Run these from the repo root. Start the daemon in one terminal (it listens on `1
 npx ker daemon
 ```
 
-Send it a prompt from another terminal:
+Create a session and save its printed ID in a shell variable:
 
 ```sh
-npx ker "my name is Beni"
-npx ker "what's my name?"
+SESSION_ID="$(npx ker new)"
+echo "$SESSION_ID"
 ```
 
-Start a fresh in-memory conversation with:
+To find an existing session ID later, run `npx ker sessions`; the ID is the first column. Send
+prompts to the selected session with:
 
 ```sh
-npx ker new
+npx ker --session "$SESSION_ID" "my name is Beni"
+npx ker --session "$SESSION_ID" "what's my name?"
 ```
 
-Assistant text goes to stdout and errors go to stderr. Pass `--json` before the prompt to print
-every raw event, including tool calls, tool results, reasoning summaries, authentication, and
-token usage:
+List this project's sessions or monitor one. Monitor renders the current conversation state in turn
+order, then follows new turns. Assistant text is the only monitor output written to stdout. Delivered,
+running, and waiting prompts are prefixed with `> ` on stderr; developer notices, lifecycle status,
+and errors are prefixed with `ker: ` there. Tool calls, tool results, reasoning, usage, retries, and
+authentication events stay omitted from human output. Historical status banners are suppressed, but
+current and future cancellation or failure transitions remain visible. Ctrl-C only stops the monitor
+and never cancels work. An idle monitor prints `ker: waiting for turns` to stderr and continues
+following:
 
 ```sh
-npx ker --json "my name is Beni"
+npx ker sessions
+npx ker monitor "$SESSION_ID"
 ```
 
-If another terminal submits a prompt while a turn is running, that terminal prints a queue
-acknowledgement and exits. The terminal that started the turn keeps rendering the shared response.
-Ctrl-C aborts a turn only from the terminal that started it.
+`npx ker --json monitor "$SESSION_ID"` keeps the diagnostic wire view unchanged: it prints the initial
+`SessionSnapshot`, raw event envelopes, and another snapshot line whenever the event cursor requires a
+resync. The event tail is bounded, so this feed does not promise a complete historical replay.
 
-Stop the daemon with Ctrl-C; restarting it clears the conversation (nothing is saved yet). `ker new`
-also clears the current conversation without stopping the daemon, but only while no turn is running.
+Cancel the exact running or cancelling turn captured from one session:
+
+```sh
+npx ker cancel "$SESSION_ID"
+npx ker --json cancel "$SESSION_ID"
+```
+
+The command captures the running turn ID from that session's snapshot before sending the request, so
+a race never retargets its successor. A missing or unreadable session, an idle session, or a target
+that finished during that race exits 1 without taking action.
+
+Prompts submitted while that session is active wait as separate turns in FIFO order. There is no
+steering or turn placement; every prompt creates one turn.
+
+A prompt client waits until its turn finishes. Disconnecting it leaves the turn intact; Ctrl-C
+cancels its exact waiting or running turn and exits 130. Cancellation from another local client also
+makes the owning prompt command exit 130. Successful turns exit 0, while other failures exit 1.
+Assistant text goes to stdout; queue and lifecycle status and errors go to stderr. Prompt commands do
+not echo prompt attribution. `--json` prints the full snapshot followed by raw event envelopes:
+
+```sh
+npx ker --json --session "$SESSION_ID" "inspect the raw stream"
+```
+
+Sessions are stored under `KER_SESSION_DIR` when set. Otherwise ker uses the platform user-data
+directory, grouped by canonical Git root and session ID. Protocol v7 uses session-local queue
+snapshots, and session logs use record format v2. Older v1 logs are reported as unreadable and left
+byte-for-byte unchanged until manually removed.
+
+Concurrent sessions intentionally use their recorded working directories without worktree isolation.
+Running two sessions against the same files can therefore conflict. Cooperative cancellation cannot
+force-stop code that ignores its abort signal; safe force stopping remains deferred until turns run in
+isolated processes.

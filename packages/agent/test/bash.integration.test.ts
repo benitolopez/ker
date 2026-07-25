@@ -4,10 +4,10 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { test } from "node:test";
-import { tools } from "../src/index.ts";
+import { createDefinition } from "../src/index.ts";
 
 function bashTool() {
-	const found = tools.find((t) => t.name === "bash");
+	const found = createDefinition(process.cwd()).tools.find((t) => t.name === "bash");
 	if (!found) throw new Error("bash tool not registered");
 	return found;
 }
@@ -64,8 +64,8 @@ test("large output is tail-truncated with the full log spilled to a temp file", 
 test("normal process exit removes its private spill directory", () => {
 	const agentUrl = JSON.stringify(new URL("../src/index.ts", import.meta.url).href);
 	const source = [
-		`import { tools } from ${agentUrl}`,
-		'const bash = tools.find((tool) => tool.name === "bash")',
+		`import { createDefinition } from ${agentUrl}`,
+		'const bash = createDefinition(process.cwd()).tools.find((tool) => tool.name === "bash")',
 		'if (!bash) throw new Error("bash tool not registered")',
 		'const result = await bash.execute({ command: "seq 1 100000" })',
 		'const marker = "full output: "',

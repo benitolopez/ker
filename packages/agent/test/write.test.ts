@@ -4,10 +4,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { tools } from "../src/index.ts";
+import { createDefinition } from "../src/index.ts";
 
 function writeTool() {
-	const found = tools.find((t) => t.name === "write");
+	const found = createDefinition(process.cwd()).tools.find((t) => t.name === "write");
 	if (!found) throw new Error("write tool not registered");
 	return found;
 }

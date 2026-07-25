@@ -14,7 +14,7 @@ test("tells an oauth-bound conversation to log back in", () => {
 			actual: { kind: "oauth", accountId: "acc_new" },
 			message: "identity changed",
 		}),
-		"log back into that account with `ker login`, or start a new conversation with `ker new`",
+		"log back into that account with `ker login`, or create a session with `ker new`",
 	);
 });
 
@@ -30,7 +30,7 @@ test("tells an api-key-bound conversation to remove the oauth login", () => {
 			actual: { kind: "oauth", accountId: "acc_new" },
 			message: "identity changed",
 		}),
-		"run `ker logout` to use the API key again, or start a new conversation with `ker new`",
+		"run `ker logout` to use the API key again, or create a session with `ker new`",
 	);
 });
 
