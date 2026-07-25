@@ -310,6 +310,7 @@ function controlMonitor(
 	t: TestContext,
 	options: { json?: boolean; initial?: Protocol.SessionSnapshot; recovered?: Protocol.SessionSnapshot } = {},
 ): ControlledMonitor {
+	const writeStdout = process.stdout.write.bind(process.stdout);
 	const originalFetch = globalThis.fetch;
 	const originalArgv = process.argv;
 	const originalExitCode = process.exitCode;
@@ -339,9 +340,9 @@ function controlMonitor(
 		return true;
 	});
 	t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-		const text = String(chunk);
-		stdout.push(text);
-		writes.push({ stream: "stdout", text });
+		if (typeof chunk !== "string") return writeStdout(chunk);
+		stdout.push(chunk);
+		writes.push({ stream: "stdout", text: chunk });
 		return true;
 	});
 	globalThis.fetch = async (input, init): Promise<Response> => {
