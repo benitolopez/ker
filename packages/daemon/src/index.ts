@@ -980,17 +980,7 @@ interface PromptRequest {
 type ListSessionScope = { type: "all" } | { type: "cwd"; cwd: string; projectRoot: string };
 
 async function readCreateSessionCwd(req: IncomingMessage, res: ServerResponse): Promise<string | undefined> {
-	if (!req.headers["content-type"]?.startsWith("application/json")) {
-		writeJson(res, 400, { code: "invalid_cwd" });
-		return undefined;
-	}
-	let parsed: unknown;
-	try {
-		parsed = await readJsonBody(req, res);
-	} catch {
-		writeJson(res, 400, { code: "invalid_cwd" });
-		return undefined;
-	}
+	const parsed = await readJsonBody(req, res);
 	if (parsed === undefined) return undefined;
 	const request = parseCreateSessionRequest(parsed);
 	if (!request) {

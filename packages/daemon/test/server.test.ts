@@ -125,8 +125,7 @@ test("rejects invalid session cwd and listing scopes", async (t) => {
 		assert.deepEqual(await readJson(response.body), { code: "invalid_cwd" });
 	}
 	const missing = await localFetch(`${running.url}/sessions`, { method: "POST" });
-	assert.equal(missing.status, 400);
-	assert.deepEqual(await readJson(missing.body), { code: "invalid_cwd" });
+	assert.equal(missing.status, 415);
 
 	for (const query of ["", "?scope=project", `?scope=all&cwd=${encodeURIComponent(root)}`, "?extra=true"]) {
 		const response = await localFetch(`${running.url}/sessions${query}`);
