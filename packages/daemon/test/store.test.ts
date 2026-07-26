@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -54,7 +54,8 @@ test("serializes concurrent appends within one session", async (t) => {
 		session.log.append([{ type: "identity", identity: { kind: "oauth", accountId: "account-1" } }]),
 	]);
 
-	const [loaded] = await store.loadAll();
+	const [entry] = await store.scanCatalog();
+	const loaded = await store.loadSession(entry.path);
 	assert.equal(loaded.records.length, 3);
 });
 
@@ -65,9 +66,12 @@ test("truncates only a malformed final partial line", async (t) => {
 	const session = await store.create(baseDir);
 	const completeSize = (await stat(session.log.path)).size;
 	await appendFile(session.log.path, '{"version":2,"id":"torn"');
+	const tornSize = (await stat(session.log.path)).size;
 
-	const loaded = await store.loadAll();
-	assert.equal(loaded.length, 1);
+	const [entry] = await store.scanCatalog();
+	assert.equal(entry.idle, false);
+	assert.equal((await stat(session.log.path)).size, tornSize);
+	await store.loadSession(entry.path);
 	assert.equal((await stat(session.log.path)).size, completeSize);
 });
 
@@ -86,12 +90,12 @@ test("keeps v1 sessions unreadable without changing their bytes", async (t) => {
 	})}\n`;
 	await writeFile(session.log.path, v1);
 
-	assert.deepEqual(await store.loadAll(), []);
+	assert.deepEqual(await store.scanCatalog(), []);
 	assert.equal(store.listUnreadable()[0]?.id, session.session.id);
 	assert.equal(await readFile(session.log.path, "utf8"), v1);
 });
 
-test("keeps a malformed complete tail without repairing it", async (t) => {
+test("rejects a malformed complete tail at load without repairing it", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-complete-tail-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
@@ -99,7 +103,10 @@ test("keeps a malformed complete tail without repairing it", async (t) => {
 	await appendFile(session.log.path, '{"version":2,}');
 	const before = await readFile(session.log.path);
 
-	assert.deepEqual(await store.loadAll(), []);
+	const [entry] = await store.scanCatalog();
+	assert.equal(entry.session.id, session.session.id);
+	assert.equal(entry.idle, false);
+	await assert.rejects(store.loadSession(entry.path));
 	assert.deepEqual(await readFile(session.log.path), before);
 });
 
@@ -111,13 +118,15 @@ test("repairs a valid final record that is missing its newline", async (t) => {
 	const contents = await readFile(session.log.path, "utf8");
 	await writeFile(session.log.path, contents.trimEnd());
 
-	const [loaded] = await store.loadAll();
+	const [entry] = await store.scanCatalog();
+	assert.equal(entry.idle, false);
+	const loaded = await store.loadSession(entry.path);
 	await loaded.log.append([{ type: "identity", identity: { kind: "apikey" } }]);
 	const lines = (await readFile(session.log.path, "utf8")).trimEnd().split("\n");
 	assert.equal(lines.length, 2);
 });
 
-test("isolates a session with a malformed complete record before the final line", async (t) => {
+test("admits deep corruption at scan and rejects it at load", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-malformed-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
@@ -126,14 +135,17 @@ test("isolates a session with a malformed complete record before the final line"
 	const original = await readFile(malformed.log.path, "utf8");
 	await writeFile(malformed.log.path, `${original}not-json\n{"also":"bad"}`);
 
-	const loaded = await store.loadAll();
+	const catalog = await store.scanCatalog();
 	assert.deepEqual(
-		loaded.map((session) => session.session.id),
-		[healthy.session.id],
+		new Set(catalog.map((entry) => entry.session.id)),
+		new Set([malformed.session.id, healthy.session.id]),
 	);
-	assert.equal(store.listUnreadable().length, 1);
-	assert.equal(store.listUnreadable()[0]?.id, malformed.session.id);
-	assert.match(store.listUnreadable()[0]?.error ?? "", /Unexpected token|Malformed record/);
+	assert.deepEqual(store.listUnreadable(), []);
+	const malformedEntry = catalog.find((entry) => entry.session.id === malformed.session.id);
+	await assert.rejects(store.loadSession(malformedEntry?.path ?? ""), /Unexpected token|Malformed record/);
+	const healthyEntry = catalog.find((entry) => entry.session.id === healthy.session.id);
+	const loaded = await store.loadSession(healthyEntry?.path ?? "");
+	assert.equal(loaded.session.id, healthy.session.id);
 });
 
 test("persists provider identity without credentials", async (t) => {
@@ -177,8 +189,8 @@ test("creates and reloads sessions from every project bucket", async (t) => {
 		join(baseDir, createHash("sha256").update(canonicalProjectA).digest("hex"), first.session.id, "session.jsonl"),
 	);
 
-	const loaded = await new SessionStore({ baseDir }).loadAll();
-	const loadedById = new Map(loaded.map((session) => [session.session.id, session.session]));
+	const catalog = await new SessionStore({ baseDir }).scanCatalog();
+	const loadedById = new Map(catalog.map((entry) => [entry.session.id, entry.session]));
 	assert.deepEqual(
 		{ cwd: loadedById.get(first.session.id)?.cwd, projectRoot: loadedById.get(first.session.id)?.projectRoot },
 		{ cwd: canonicalCwdA, projectRoot: canonicalProjectA },
@@ -187,6 +199,90 @@ test("creates and reloads sessions from every project bucket", async (t) => {
 		{ cwd: loadedById.get(second.session.id)?.cwd, projectRoot: loadedById.get(second.session.id)?.projectRoot },
 		{ cwd: canonicalProjectB, projectRoot: canonicalProjectB },
 	);
+});
+
+test("catalog freshness comes from file mtime until a session is loaded", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-mtime-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const session = await store.create(baseDir);
+	const touched = new Date("2026-02-03T04:05:06Z");
+	await utimes(session.log.path, touched, touched);
+
+	const [entry] = await store.scanCatalog();
+	assert.equal(entry.session.id, session.session.id);
+	assert.equal(entry.session.updatedAt, touched.toISOString());
+	assert.equal(entry.path, session.log.path);
+	assert.equal(entry.idle, true);
+
+	const loaded = await store.loadSession(entry.path);
+	assert.equal(loaded.session.updatedAt, loaded.records.at(-1)?.at);
+});
+
+test("flags a session with an unreadable header line", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-header-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const session = await store.create(baseDir);
+	await writeFile(session.log.path, "not-json\n");
+
+	assert.deepEqual(await store.scanCatalog(), []);
+	assert.equal(store.listUnreadable()[0]?.id, session.session.id);
+	assert.equal(store.listUnreadable(session.session.projectRoot)[0]?.id, session.session.id);
+	assert.deepEqual(store.listUnreadable(join(session.session.projectRoot, "elsewhere")), []);
+});
+
+test("classifies idle sessions from the final complete record", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-idle-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const idle = await store.create(baseDir);
+	await idle.log.append([
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: idle.session.id,
+				type: "queue_changed",
+				queue: { revision: 2, waiting: [] },
+			},
+		},
+	]);
+	const busy = await store.create(baseDir);
+	await busy.log.append([
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: busy.session.id,
+				type: "queue_changed",
+				queue: {
+					revision: 1,
+					running: {
+						id: "queue-1",
+						turnId: "turn-1",
+						messageId: "message-1",
+						text: "hello",
+						state: "running",
+						submittedAt: "2026-01-01T00:00:00.000Z",
+					},
+					waiting: [],
+				},
+			},
+		},
+	]);
+	const midTurn = await store.create(baseDir);
+	await midTurn.log.append([{ type: "identity", identity: { kind: "apikey" } }]);
+	const torn = await store.create(baseDir);
+	await appendFile(torn.log.path, '{"version":2');
+	const bare = await store.create(baseDir);
+
+	const idleById = new Map((await store.scanCatalog()).map((entry) => [entry.session.id, entry.idle]));
+	assert.equal(idleById.get(idle.session.id), true);
+	assert.equal(idleById.get(bare.session.id), true);
+	assert.equal(idleById.get(busy.session.id), false);
+	assert.equal(idleById.get(midTurn.session.id), false);
+	assert.equal(idleById.get(torn.session.id), false);
 });
 
 test("uses KER_SESSION_DIR before the user-owned default", (t) => {

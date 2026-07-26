@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -88,6 +88,10 @@ test("creates, filters, and restores sessions from multiple projects", async (t)
 		new Set(restored.sessions.map((session) => session.id)),
 		new Set([sessionA.id, otherSessionA.id, sessionB.id]),
 	);
+	assert.deepEqual(restoredCwds, []);
+	await getSnapshot(second.url, sessionA.id);
+	await getSnapshot(second.url, otherSessionA.id);
+	await getSnapshot(second.url, sessionB.id);
 	assert.deepEqual(new Set(restoredCwds), new Set([canonicalCwdA, canonicalOtherCwdA, canonicalProjectB]));
 	const retargetedResponse = await localFetch(
 		`${second.url}/sessions/${sessionA.id}?cwd=${encodeURIComponent(projectB)}`,
@@ -874,6 +878,129 @@ test("restart drains stale waiting work before finalizing the interrupted turn",
 	assert.equal(snapshot.turns.find((turn) => turn.id === seeded.waiting.turnId)?.status, "expired");
 	assert.equal(snapshot.queue.running, undefined);
 	assert.deepEqual(snapshot.queue.waiting, []);
+});
+
+test("restart constructs harnesses only for sessions with pending work", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-lazy-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const first = await startServer(t, immediateFactory(), { sessionDir }, false);
+	const idleSession = await createSession(first.url);
+	const admitted = await prompt(first.url, idleSession.id, "done");
+	await waitForTerminal(first.url, idleSession.id, admitted.turnId);
+	await first.close();
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedWaiting(store, [{ text: "pending", submittedAt: "2026-01-01T00:00:00.000Z" }]);
+
+	let constructions = 0;
+	const factory = immediateFactory();
+	const second = await startServer(
+		t,
+		(state, cwd) => {
+			constructions++;
+			return factory(state, cwd);
+		},
+		{ sessionDir },
+		false,
+	);
+	await waitForTerminal(second.url, seeded.session.session.id, "turn-1");
+	assert.equal(constructions, 1);
+	const snapshot = await getSnapshot(second.url, idleSession.id);
+	assert.equal(constructions, 2);
+	assert.deepEqual(
+		snapshot.messages.map((message) => message.text),
+		["answer:done"],
+	);
+	assert(snapshot.entries.length >= 2);
+	await second.close();
+});
+
+test("listing after restart reads no session bodies", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-catalog-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const first = await startServer(t, immediateFactory(), { sessionDir }, false);
+	const completed = await createSession(first.url);
+	const admitted = await prompt(first.url, completed.id, "done");
+	await waitForTerminal(first.url, completed.id, admitted.turnId);
+	const bare = await createSession(first.url);
+	await first.close();
+
+	const second = await startServer(
+		t,
+		() => {
+			throw new Error("Idle sessions must not construct a harness");
+		},
+		{ sessionDir },
+		false,
+	);
+	const listed = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${second.url}/sessions?scope=all`)).body,
+	);
+	assert.deepEqual(new Set(listed.sessions.map((session) => session.id)), new Set([completed.id, bare.id]));
+	assert.deepEqual(listed.unreadable, []);
+	await second.close();
+});
+
+test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-hidden-corruption-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const session = await store.create(process.cwd());
+	const tail = JSON.stringify({
+		version: 2,
+		recordId: "tail",
+		previousRecordId: "missing",
+		at: "2026-01-01T00:00:00.000Z",
+		type: "event",
+		event: {
+			actor: "process",
+			sessionId: session.session.id,
+			type: "queue_changed",
+			queue: { revision: 9, waiting: [] },
+		},
+	});
+	await appendFile(session.log.path, `not-json\n${tail}\n`);
+	const running = await startServer(t, immediateFactory(), { sessionDir });
+
+	const before = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${running.url}/sessions?scope=all`)).body,
+	);
+	assert.deepEqual(
+		before.sessions.map((listed) => listed.id),
+		[session.session.id],
+	);
+	assert.deepEqual(before.unreadable, []);
+
+	const snapshot = await localFetch(`${running.url}/sessions/${session.session.id}`);
+	assert.equal(snapshot.status, 500);
+	assert.equal((await readJson<{ code: string }>(snapshot.body)).code, "session_unreadable");
+
+	const after = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${running.url}/sessions?scope=all`)).body,
+	);
+	assert.deepEqual(after.sessions, []);
+	assert.equal(after.unreadable[0]?.id, session.session.id);
+});
+
+test("a completed turn leaves an empty queue_changed as the final log record", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-final-record-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const running = await startServer(t, immediateFactory(), { sessionDir });
+	const session = await createSession(running.url);
+	const admitted = await prompt(running.url, session.id, "done");
+	await waitForTerminal(running.url, session.id, admitted.turnId);
+
+	const [entry] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+	assert.equal(entry.idle, true);
+	const lines = (await readFile(entry.path, "utf8")).trimEnd().split("\n");
+	const last = JSON.parse(lines.at(-1) ?? "") as StoredRecord;
+	assert.equal(last.type, "event");
+	if (last.type === "event") {
+		assert.equal(last.event.type, "queue_changed");
+		if (last.event.type === "queue_changed") {
+			assert.equal(last.event.queue.running, undefined);
+			assert.deepEqual(last.event.queue.waiting, []);
+		}
+	}
 });
 
 test("shutdown aborts and awaits active turns in every session", async (t) => {

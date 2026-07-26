@@ -9,12 +9,14 @@ import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
 import {
 	type AssistantRecord,
+	type CatalogedSession,
 	type ConversationRecord,
 	canonicalDirectory,
 	canonicalProjectRoot,
 	type EventRecord,
 	type IdentityRecord,
 	type Payload,
+	projectKey,
 	SessionStore,
 	type StoredSession,
 } from "./store.ts";
@@ -107,12 +109,16 @@ interface SessionState {
 	activeTurn?: ActiveTurn;
 }
 
+type CatalogEntry = CatalogedSession & { stored?: StoredSession };
+
+class SessionUnreadableError extends Error {}
+
 class Registry {
 	readonly #store: SessionStore;
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #eventTailSize: number;
 	readonly #recoveryWindowMinutes: number;
-	readonly #stored = new Map<Protocol.SessionId, StoredSession>();
+	readonly #catalog = new Map<Protocol.SessionId, CatalogEntry>();
 	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
 	#stopping = false;
 
@@ -124,21 +130,29 @@ class Registry {
 	}
 
 	async initialize(): Promise<void> {
-		const sessions = await this.#store.loadAll();
-		for (const stored of sessions) this.#stored.set(stored.session.id, stored);
-		const states = await Promise.all(sessions.map((stored) => this.#state(stored.session.id)));
-		await Promise.all(
-			states.map((state) =>
-				this.#withQueueLock(state, async () => {
-					await this.#drainExpiredWaiting(state);
-					if (state.queue.running) {
-						await this.#recoverRunning(state, state.queue.running);
-						return;
-					}
-					await this.#startNext(state);
-				}),
-			),
-		);
+		const entries = await this.#store.scanCatalog();
+		for (const entry of entries) this.#catalog.set(entry.session.id, { ...entry });
+		await Promise.all(entries.filter((entry) => !entry.idle).map((entry) => this.#recoverSession(entry.session.id)));
+	}
+
+	// One corrupt session must not fail startup: an unreadable load is already registered, so
+	// recovery skips it while the other sessions proceed.
+	async #recoverSession(sessionId: Protocol.SessionId): Promise<void> {
+		let state: SessionState;
+		try {
+			state = await this.#state(sessionId);
+		} catch (error) {
+			if (error instanceof SessionUnreadableError) return;
+			throw error;
+		}
+		await this.#withQueueLock(state, async () => {
+			await this.#drainExpiredWaiting(state);
+			if (state.queue.running) {
+				await this.#recoverRunning(state, state.queue.running);
+				return;
+			}
+			await this.#startNext(state);
+		});
 	}
 
 	listUnreadableSessions(projectRoot?: string): Protocol.UnreadableSession[] {
@@ -152,19 +166,25 @@ class Registry {
 
 	async createSession(cwd: string): Promise<Protocol.SessionDescriptor> {
 		const stored = await this.#store.create(cwd);
-		this.#stored.set(stored.session.id, stored);
+		this.#catalog.set(stored.session.id, {
+			session: stored.session,
+			path: stored.log.path,
+			projectKey: projectKey(stored.session.projectRoot),
+			idle: true,
+			stored,
+		});
 		return stored.session;
 	}
 
 	listSessions(cwd?: string): Protocol.SessionDescriptor[] {
-		return [...this.#stored.values()]
-			.filter((stored) => !cwd || stored.session.cwd === cwd)
-			.map((stored) => ({ ...stored.session }))
+		return [...this.#catalog.values()]
+			.filter((entry) => !cwd || entry.session.cwd === cwd)
+			.map((entry) => ({ ...entry.session }))
 			.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 	}
 
 	async snapshot(sessionId: Protocol.SessionId): Promise<Protocol.SessionSnapshot | undefined> {
-		if (!this.#stored.has(sessionId)) return undefined;
+		if (!this.#catalog.has(sessionId)) return undefined;
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			const turns = new Map<Protocol.TurnId, Protocol.TurnSnapshot>();
@@ -195,7 +215,7 @@ class Registry {
 		sessionId: Protocol.SessionId,
 		cursor: Protocol.Cursor,
 	): Promise<{ state: SessionState; replay: Protocol.EventEnvelope[] } | "missing" | "resync"> {
-		if (!this.#stored.has(sessionId)) return "missing";
+		if (!this.#catalog.has(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		const firstSequence = state.tail[0]?.sequence ?? state.sequence + 1;
 		if (cursor.epoch !== state.epoch || cursor.sequence > state.sequence || cursor.sequence < firstSequence - 1) {
@@ -205,7 +225,7 @@ class Registry {
 	}
 
 	async admit(sessionId: Protocol.SessionId, text: string): Promise<Protocol.PromptAdmission | "missing"> {
-		if (!this.#stored.has(sessionId)) return "missing";
+		if (!this.#catalog.has(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			const messageId = randomUUID();
@@ -256,7 +276,7 @@ class Registry {
 		sessionId: Protocol.SessionId,
 		turnId: Protocol.TurnId,
 	): Promise<Protocol.TurnCancellationResult | "missing" | "turn_unavailable"> {
-		if (!this.#stored.has(sessionId)) return "missing";
+		if (!this.#catalog.has(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			const terminal = state.turns.get(turnId);
@@ -322,17 +342,22 @@ class Registry {
 
 	heartbeat(): void {
 		for (const statePromise of this.#states.values()) {
-			void statePromise.then((state) => {
-				for (const res of state.subscribers) {
-					if (!res.destroyed) res.write(": hb\n\n");
-				}
-			});
+			void statePromise.then(
+				(state) => {
+					for (const res of state.subscribers) {
+						if (!res.destroyed) res.write(": hb\n\n");
+					}
+				},
+				() => undefined,
+			);
 		}
 	}
 
 	async shutdown(): Promise<void> {
 		this.#stopping = true;
-		const states = await Promise.all(this.#states.values());
+		const states = (
+			await Promise.all([...this.#states.values()].map((statePromise) => statePromise.catch(() => undefined)))
+		).filter((state): state is SessionState => state !== undefined);
 		await Promise.all(
 			states.map(async (state) => {
 				const active = await this.#withQueueLock(state, async () => {
@@ -346,14 +371,32 @@ class Registry {
 		);
 	}
 
-	async #state(sessionId: Protocol.SessionId): Promise<SessionState> {
+	#state(sessionId: Protocol.SessionId): Promise<SessionState> {
 		const existing = this.#states.get(sessionId);
 		if (existing) return existing;
-		const stored = this.#stored.get(sessionId);
-		if (!stored) throw new Error(`Unknown session ${sessionId}`);
-		const loading = Promise.resolve(this.#loadState(stored));
+		const entry = this.#catalog.get(sessionId);
+		if (!entry) throw new Error(`Unknown session ${sessionId}`);
+		const loading = this.#openState(entry);
 		this.#states.set(sessionId, loading);
 		return loading;
+	}
+
+	// Sessions created this process keep their in-memory records; anything else replays its log
+	// from disk on first attach. A failed load leaves the session listed only as unreadable.
+	async #openState(entry: CatalogEntry): Promise<SessionState> {
+		if (entry.stored) return this.#loadState(entry.stored);
+		try {
+			const stored = await this.#store.loadSession(entry.path);
+			entry.stored = stored;
+			entry.session = stored.session;
+			return this.#loadState(stored);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.#states.delete(entry.session.id);
+			this.#catalog.delete(entry.session.id);
+			this.#store.markUnreadable(entry.session.id, message, entry.projectKey);
+			throw new SessionUnreadableError(message);
+		}
 	}
 
 	#loadState(stored: StoredSession): SessionState {
@@ -938,6 +981,10 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 		res.writeHead(404).end();
 	} catch (error) {
 		if (!res.headersSent) {
+			if (error instanceof SessionUnreadableError) {
+				writeJson(res, 500, { code: "session_unreadable", error: error.message });
+				return;
+			}
 			writeJson(res, error instanceof SyntaxError ? 400 : 500, {
 				error: error instanceof Error ? error.message : String(error),
 			});

@@ -7,6 +7,8 @@ import type * as Protocol from "@ker-ai/protocol";
 
 const STORE_VERSION = 2 as const;
 const SESSION_FILE = "session.jsonl";
+const HEADER_SCAN_BYTES = 8_192;
+const TAIL_SCAN_BYTES = 8_192;
 
 interface RecordBase {
 	version: typeof STORE_VERSION;
@@ -65,6 +67,15 @@ export interface StoredSession {
 	log: SessionLog;
 	records: StoredRecord[];
 	session: Protocol.SessionDescriptor;
+}
+
+// A session discovered by the startup scan: the header descriptor (updatedAt taken from file
+// mtime), its log path and project bucket, and whether the log tail shows an empty queue.
+export interface CatalogedSession {
+	session: Protocol.SessionDescriptor;
+	path: string;
+	projectKey: string;
+	idle: boolean;
 }
 
 interface BucketedUnreadableSession extends Protocol.UnreadableSession {
@@ -144,14 +155,16 @@ export class SessionStore {
 		return { log, records, session };
 	}
 
-	async loadAll(): Promise<StoredSession[]> {
+	// Discovers sessions by reading only each log's header line and a bounded tail, so startup
+	// cost stays flat in history size. Full replay happens in loadSession.
+	async scanCatalog(): Promise<CatalogedSession[]> {
 		this.#unreadableSessions.length = 0;
 		await mkdir(this.baseDir, { recursive: true, mode: 0o700 });
 		const projects = [];
 		for await (const entry of await opendir(this.baseDir)) {
 			if (entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)) projects.push(entry);
 		}
-		const sessions: StoredSession[] = [];
+		const sessions: CatalogedSession[] = [];
 		for (const project of projects) {
 			const projectDir = join(this.baseDir, project.name);
 			const directories = [];
@@ -161,12 +174,8 @@ export class SessionStore {
 			for (const directory of directories) {
 				const path = join(projectDir, directory.name, SESSION_FILE);
 				try {
-					const records = await readRecords(path);
-					const first = records[0];
-					if (!first || first.type !== "session") throw new Error(`Session log ${path} has no session record`);
-					const updatedAt = records.at(-1)?.at ?? first.session.updatedAt;
-					const session = { ...first.session, updatedAt };
-					sessions.push({ log: new SessionLog(path, records.at(-1)?.recordId ?? null), records, session });
+					const scanned = await scanSession(path);
+					sessions.push({ ...scanned, path, projectKey: project.name });
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 					this.#unreadableSessions.push({
@@ -178,6 +187,19 @@ export class SessionStore {
 			}
 		}
 		return sessions.sort((left, right) => left.session.createdAt.localeCompare(right.session.createdAt));
+	}
+
+	async loadSession(path: string): Promise<StoredSession> {
+		const records = await readRecords(path);
+		const first = records[0];
+		if (!first || first.type !== "session") throw new Error(`Session log ${path} has no session record`);
+		const updatedAt = records.at(-1)?.at ?? first.session.updatedAt;
+		const session = { ...first.session, updatedAt };
+		return { log: new SessionLog(path, records.at(-1)?.recordId ?? null), records, session };
+	}
+
+	markUnreadable(id: Protocol.SessionId, error: string, projectKey: string): void {
+		this.#unreadableSessions.push({ id, error, projectKey });
 	}
 
 	listUnreadable(projectRoot?: string): Protocol.UnreadableSession[] {
@@ -216,8 +238,55 @@ export function defaultSessionDir(): string {
 	return join(homedir(), ".ker", "sessions");
 }
 
-function projectKey(projectRoot: string): string {
+export function projectKey(projectRoot: string): string {
 	return createHash("sha256").update(projectRoot).digest("hex");
+}
+
+// Reads the header line for the descriptor and a bounded tail for idle classification; the
+// header must be the session record. Throws on anything unreadable at this depth.
+async function scanSession(path: string): Promise<{ session: Protocol.SessionDescriptor; idle: boolean }> {
+	const handle = await open(path, "r");
+	try {
+		const stats = await handle.stat();
+		const head = Buffer.alloc(Math.min(stats.size, HEADER_SCAN_BYTES));
+		await handle.read(head, 0, head.length, 0);
+		const newline = head.indexOf(10);
+		if (newline === -1 && stats.size > head.length) throw new Error(`Session header too long in ${path}`);
+		const header = parseRecord(head.subarray(0, newline === -1 ? head.length : newline).toString("utf8"), path);
+		if (header.type !== "session" || header.previousRecordId !== null) {
+			throw new Error(`Session log ${path} has no session record`);
+		}
+		const session = { ...header.session, updatedAt: stats.mtime.toISOString() };
+		const tailOffset = Math.max(0, stats.size - TAIL_SCAN_BYTES);
+		const tail = stats.size <= head.length ? head : Buffer.alloc(Math.min(stats.size, TAIL_SCAN_BYTES));
+		if (tail !== head) await handle.read(tail, 0, tail.length, tailOffset);
+		return { session, idle: isIdleTail(tail, tailOffset, path) };
+	} finally {
+		await handle.close();
+	}
+}
+
+// A session is idle exactly when its final complete record is a queue_changed with an empty
+// queue, or the log holds only the session record. Every ambiguous tail (torn line, truncated
+// view, parse failure) reads as busy, so recovery loads the full log instead of skipping it.
+function isIdleTail(tail: Buffer, tailOffset: number, path: string): boolean {
+	if (tail.length === 0 || tail[tail.length - 1] !== 10) return false;
+	const body = tail.subarray(0, tail.length - 1);
+	const start = body.lastIndexOf(10);
+	if (start === -1 && tailOffset > 0) return false;
+	let record: StoredRecord;
+	try {
+		record = parseRecord(body.subarray(start + 1).toString("utf8"), path);
+	} catch {
+		return false;
+	}
+	if (record.type === "session") return start === -1 && tailOffset === 0;
+	return (
+		record.type === "event" &&
+		record.event.type === "queue_changed" &&
+		!record.event.queue.running &&
+		record.event.queue.waiting.length === 0
+	);
 }
 
 // A torn final JSON fragment in a v2 log is discarded. Every complete malformed line invalidates the session.
