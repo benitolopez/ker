@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -17,7 +17,7 @@ test("creates and lists explicit durable sessions", async (t) => {
 	const running = await startServer(t, immediateFactory());
 	const first = await createSession(running.url);
 	const second = await createSession(running.url);
-	const response = await localFetch(`${running.url}/sessions`);
+	const response = await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(process.cwd())}`);
 	const listed = await readJson<{ sessions: Protocol.SessionDescriptor[] }>(response.body);
 
 	assert.equal(response.status, 200);
@@ -25,23 +25,134 @@ test("creates and lists explicit durable sessions", async (t) => {
 		listed.sessions.map((session) => session.id),
 		[first.id, second.id],
 	);
-	assert(listed.sessions.every((session) => session.cwd === "/project"));
+	assert(listed.sessions.every((session) => session.cwd === process.cwd()));
 	assert.equal((await localFetch(`${running.url}/conversation/new`, { method: "POST" })).status, 404);
+});
+
+test("creates, filters, and restores sessions from multiple projects", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-projects-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sessionDir = join(root, "sessions");
+	const projectA = join(root, "project-a");
+	const cwdA = join(projectA, "nested");
+	const otherCwdA = join(projectA, "other");
+	const projectB = join(root, "project-b");
+	await Promise.all([
+		mkdir(join(projectA, ".git"), { recursive: true }),
+		mkdir(cwdA, { recursive: true }),
+		mkdir(otherCwdA, { recursive: true }),
+		mkdir(projectB, { recursive: true }),
+	]);
+	const first = await startServer(t, immediateFactory(), { sessionDir }, false);
+	const sessionA = await createSession(first.url, cwdA);
+	const otherSessionA = await createSession(first.url, otherCwdA);
+	const sessionB = await createSession(first.url, projectB);
+	const canonicalRoot = await realpath(root);
+	const canonicalProjectA = join(canonicalRoot, "project-a");
+	const canonicalCwdA = join(canonicalProjectA, "nested");
+	const canonicalOtherCwdA = join(canonicalProjectA, "other");
+	const canonicalProjectB = join(canonicalRoot, "project-b");
+
+	assert.equal(sessionA.cwd, canonicalCwdA);
+	assert.equal(sessionA.projectRoot, canonicalProjectA);
+	assert.equal(sessionB.cwd, canonicalProjectB);
+	assert.equal(sessionB.projectRoot, canonicalProjectB);
+	const scopedResponse = await localFetch(`${first.url}/sessions?cwd=${encodeURIComponent(cwdA)}`);
+	const scoped = await readJson<Protocol.ListSessionsResponse>(scopedResponse.body);
+	assert.deepEqual(
+		scoped.sessions.map((session) => session.id),
+		[sessionA.id],
+	);
+	const allResponse = await localFetch(`${first.url}/sessions?scope=all`);
+	const all = await readJson<Protocol.ListSessionsResponse>(allResponse.body);
+	assert.deepEqual(
+		all.sessions.map((session) => session.id),
+		[sessionA.id, otherSessionA.id, sessionB.id],
+	);
+	await first.close();
+
+	const restoredCwds: string[] = [];
+	const factory = immediateFactory();
+	const second = await startServer(
+		t,
+		(state, cwd) => {
+			restoredCwds.push(cwd);
+			return factory(state, cwd);
+		},
+		{ sessionDir },
+		false,
+	);
+	const restoredResponse = await localFetch(`${second.url}/sessions?scope=all`);
+	const restored = await readJson<Protocol.ListSessionsResponse>(restoredResponse.body);
+	assert.deepEqual(
+		new Set(restored.sessions.map((session) => session.id)),
+		new Set([sessionA.id, otherSessionA.id, sessionB.id]),
+	);
+	assert.deepEqual(new Set(restoredCwds), new Set([canonicalCwdA, canonicalOtherCwdA, canonicalProjectB]));
+	const retargetedResponse = await localFetch(
+		`${second.url}/sessions/${sessionA.id}?cwd=${encodeURIComponent(projectB)}`,
+	);
+	const retargeted = await readJson<Protocol.SessionSnapshot>(retargetedResponse.body);
+	assert.equal(retargeted.session.cwd, canonicalCwdA);
+	const rejectedPrompt = await rawPrompt(second.url, sessionA.id, { text: "hello", cwd: projectB });
+	assert.equal(rejectedPrompt.status, 400);
+	assert.deepEqual(await readJson(rejectedPrompt.body), { code: "invalid_prompt" });
+	const admitted = await prompt(second.url, sessionA.id, "hello");
+	await waitForTerminal(second.url, sessionA.id, admitted.turnId);
+	await second.close();
+});
+
+test("rejects invalid session cwd and listing scopes", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-invalid-cwd-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const file = join(root, "file");
+	await writeFile(file, "not a directory");
+	const running = await startServer(t, immediateFactory());
+	const invalidBodies: Array<Protocol.CreateSessionRequest | object> = [
+		{},
+		{ cwd: root, extra: true },
+		{ cwd: "relative" },
+		{ cwd: join(root, "missing") },
+		{ cwd: file },
+	];
+	for (const body of invalidBodies) {
+		const response = await localFetch(`${running.url}/sessions`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		assert.equal(response.status, 400);
+		assert.deepEqual(await readJson(response.body), { code: "invalid_cwd" });
+	}
+	const missing = await localFetch(`${running.url}/sessions`, { method: "POST" });
+	assert.equal(missing.status, 400);
+	assert.deepEqual(await readJson(missing.body), { code: "invalid_cwd" });
+
+	for (const query of ["", "?scope=project", `?scope=all&cwd=${encodeURIComponent(root)}`, "?extra=true"]) {
+		const response = await localFetch(`${running.url}/sessions${query}`);
+		assert.equal(response.status, 400);
+		assert.deepEqual(await readJson(response.body), { code: "invalid_scope" });
+	}
+	for (const cwd of ["relative", join(root, "missing"), file]) {
+		const response = await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(cwd)}`);
+		assert.equal(response.status, 400);
+		assert.deepEqual(await readJson(response.body), { code: "invalid_cwd" });
+	}
 });
 
 test("keeps healthy sessions available when another session log is unreadable", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-malformed-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
-	const malformed = await store.create("/project");
-	const healthy = await store.create("/project");
+	const store = new SessionStore({ baseDir: sessionDir });
+	const malformed = await store.create(process.cwd());
+	const healthy = await store.create(process.cwd());
 	const original = await readFile(malformed.log.path, "utf8");
 	await writeFile(malformed.log.path, `${original}not-json\n{"also":"bad"}`);
 	const running = await startServer(t, immediateFactory(), { sessionDir });
 
 	const health = await localFetch(`${running.url}/health`);
 	assert.equal(health.status, 200);
-	const listedResponse = await localFetch(`${running.url}/sessions`);
+	const listedResponse = await localFetch(`${running.url}/sessions?scope=all`);
 	const listed = await readJson<{
 		sessions: Protocol.SessionDescriptor[];
 		unreadable: Protocol.UnreadableSession[];
@@ -54,6 +165,37 @@ test("keeps healthy sessions available when another session log is unreadable", 
 	const corruptSnapshot = await localFetch(`${running.url}/sessions/${malformed.session.id}`);
 	assert.equal(corruptSnapshot.status, 500);
 	assert.equal((await readJson<{ code: string }>(corruptSnapshot.body)).code, "session_unreadable");
+});
+
+test("scoped listing hides unreadable sessions from other project buckets", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-unreadable-scope-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sessionDir = join(root, "sessions");
+	const projectA = join(root, "project-a");
+	const projectB = join(root, "project-b");
+	await Promise.all([
+		mkdir(join(projectA, ".git"), { recursive: true }),
+		mkdir(join(projectB, ".git"), { recursive: true }),
+	]);
+	const store = new SessionStore({ baseDir: sessionDir });
+	const malformed = await store.create(projectA);
+	const healthy = await store.create(projectB);
+	const original = await readFile(malformed.log.path, "utf8");
+	await writeFile(malformed.log.path, `${original}not-json\n`);
+	const running = await startServer(t, immediateFactory(), { sessionDir });
+
+	const projectBResponse = await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(projectB)}`);
+	const projectBListing = await readJson<Protocol.ListSessionsResponse>(projectBResponse.body);
+	assert.deepEqual(
+		projectBListing.sessions.map((session) => session.id),
+		[healthy.session.id],
+	);
+	assert.deepEqual(projectBListing.unreadable, []);
+
+	const projectAResponse = await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(projectA)}`);
+	const projectAListing = await readJson<Protocol.ListSessionsResponse>(projectAResponse.body);
+	assert.deepEqual(projectAListing.sessions, []);
+	assert.equal(projectAListing.unreadable[0]?.id, malformed.session.id);
 });
 
 test("different sessions run concurrently while each session keeps FIFO order", async (t) => {
@@ -467,8 +609,11 @@ test("completed history loads after a daemon restart", async (t) => {
 test("restored sessions configure their harness with the recorded cwd", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cwd-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
-	const session = await store.create("/project/nested");
+	const cwd = join(sessionDir, "project", "nested");
+	await mkdir(cwd, { recursive: true });
+	const canonicalCwd = await realpath(cwd);
+	const store = new SessionStore({ baseDir: sessionDir });
+	const session = await store.create(cwd);
 	const captured: string[] = [];
 	const factory = immediateFactory();
 	const running = await startServer(
@@ -481,13 +626,13 @@ test("restored sessions configure their harness with the recorded cwd", async (t
 	);
 
 	await getSnapshot(running.url, session.session.id);
-	assert.deepEqual(captured, ["/project/nested"]);
+	assert.deepEqual(captured, [canonicalCwd]);
 });
 
 test("restart marks an active turn interrupted without repeating its work", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-interrupted-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const store = new SessionStore({ baseDir: sessionDir });
 	const seeded = await seedRunning(store, []);
 	const captured: Engine.HarnessState[] = [];
 	const running = await startServer(t, passiveFactory(captured), { sessionDir });
@@ -502,7 +647,7 @@ test("restart marks an active turn interrupted without repeating its work", asyn
 test("restart repairs an advertised tool call without executing it again", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-tool-repair-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const store = new SessionStore({ baseDir: sessionDir });
 	const seeded = await seedRunning(store, [
 		{
 			type: "conversation",
@@ -533,7 +678,7 @@ test("restart repairs an advertised tool call without executing it again", async
 test("restart finalizes a durable cancellation as aborted without repeating tools", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cancelling-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const store = new SessionStore({ baseDir: sessionDir });
 	const seeded = await seedRunning(
 		store,
 		[
@@ -571,7 +716,7 @@ test("restart finalizes a durable cancellation as aborted without repeating tool
 test("restart finishes cancellation cleanup before starting its queued successor", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cancelling-queue-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const store = new SessionStore({ baseDir: sessionDir });
 	const seeded = await seedCancellingWithWaiting(store);
 	const controlled = controlledFactory();
 	const running = await startServer(t, controlled.factory, { sessionDir });
@@ -592,7 +737,7 @@ test("restart finishes cancellation cleanup before starting its queued successor
 test("restart recovers and promotes each session independently", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-multi-recovery-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const store = new SessionStore({ baseDir: sessionDir, projectRoot: "/project" });
+	const store = new SessionStore({ baseDir: sessionDir });
 	const first = await seedCancellingWithWaiting(store);
 	const second = await seedCancellingWithWaiting(store);
 	const controlled = controlledFactory();
@@ -664,7 +809,7 @@ function passiveFactory(captured: Engine.HarnessState[]): NonNullable<DaemonOpti
 }
 
 async function seedRunning(store: SessionStore, extra: Payload[], state: "running" | "cancelling" = "running") {
-	const session = await store.create("/project");
+	const session = await store.create(process.cwd());
 	const item: Protocol.QueueItem = {
 		id: "queue-1",
 		turnId: "turn-1",
@@ -923,8 +1068,6 @@ async function startServer(
 	const sessionDir = options.sessionDir ?? (await mkdtemp(join(tmpdir(), "ker-daemon-")));
 	if (!options.sessionDir) t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const server = createDaemon({
-		cwd: "/project",
-		projectRoot: "/project",
 		sessionDir,
 		harnessFactory,
 		eventTailSize: options.eventTailSize,
@@ -944,8 +1087,13 @@ async function startServer(
 	return { url: `http://127.0.0.1:${(address as AddressInfo).port}`, close };
 }
 
-async function createSession(url: string): Promise<Protocol.SessionDescriptor> {
-	const response = await localFetch(`${url}/sessions`, { method: "POST" });
+async function createSession(url: string, cwd = process.cwd()): Promise<Protocol.SessionDescriptor> {
+	const request: Protocol.CreateSessionRequest = { cwd };
+	const response = await localFetch(`${url}/sessions`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(request),
+	});
 	assert.equal(response.status, 201);
 	return readJson(response.body);
 }

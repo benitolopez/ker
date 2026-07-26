@@ -10,6 +10,7 @@ import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
 import {
 	type AssistantRecord,
 	type ConversationRecord,
+	canonicalDirectory,
 	canonicalProjectRoot,
 	type EventRecord,
 	type IdentityRecord,
@@ -35,8 +36,6 @@ export interface Harness {
 export interface DaemonOptions {
 	harnessFactory?: (state: Engine.HarnessState, cwd: string) => Harness;
 	sessionDir?: string;
-	cwd?: string;
-	projectRoot?: string;
 	eventTailSize?: number;
 }
 
@@ -44,12 +43,9 @@ export type Daemon = Server & { shutdown(): Promise<void> };
 
 // The HTTP server is synchronous to construct; session discovery and recovery finish before a route responds.
 export function createDaemon(options: DaemonOptions = {}): Daemon {
-	const cwd = options.cwd ?? process.cwd();
 	const manager = (async () => {
-		const projectRoot = options.projectRoot ?? (await canonicalProjectRoot(cwd));
 		const registry = new Registry({
-			cwd,
-			store: new SessionStore({ baseDir: options.sessionDir, projectRoot }),
+			store: new SessionStore({ baseDir: options.sessionDir }),
 			harnessFactory: options.harnessFactory ?? createConfiguredHarness,
 			eventTailSize: options.eventTailSize ?? DEFAULT_EVENT_TAIL_SIZE,
 		});
@@ -74,7 +70,6 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 }
 
 interface RegistryOptions {
-	cwd: string;
 	store: SessionStore;
 	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	eventTailSize: number;
@@ -110,7 +105,6 @@ interface SessionState {
 }
 
 class Registry {
-	readonly #cwd: string;
 	readonly #store: SessionStore;
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #eventTailSize: number;
@@ -119,7 +113,6 @@ class Registry {
 	#stopping = false;
 
 	constructor(options: RegistryOptions) {
-		this.#cwd = options.cwd;
 		this.#store = options.store;
 		this.#harnessFactory = options.harnessFactory;
 		this.#eventTailSize = options.eventTailSize;
@@ -142,23 +135,24 @@ class Registry {
 		);
 	}
 
-	listUnreadableSessions(): Protocol.UnreadableSession[] {
-		return this.#store.unreadableSessions.map((session) => ({ ...session }));
+	listUnreadableSessions(projectRoot?: string): Protocol.UnreadableSession[] {
+		return this.#store.listUnreadable(projectRoot);
 	}
 
 	unreadableSession(sessionId: Protocol.SessionId): Protocol.UnreadableSession | undefined {
-		const session = this.#store.unreadableSessions.find((candidate) => candidate.id === sessionId);
+		const session = this.#store.listUnreadable().find((candidate) => candidate.id === sessionId);
 		return session ? { ...session } : undefined;
 	}
 
-	async createSession(): Promise<Protocol.SessionDescriptor> {
-		const stored = await this.#store.create(this.#cwd);
+	async createSession(cwd: string): Promise<Protocol.SessionDescriptor> {
+		const stored = await this.#store.create(cwd);
 		this.#stored.set(stored.session.id, stored);
 		return stored.session;
 	}
 
-	listSessions(): Protocol.SessionDescriptor[] {
+	listSessions(cwd?: string): Protocol.SessionDescriptor[] {
 		return [...this.#stored.values()]
+			.filter((stored) => !cwd || stored.session.cwd === cwd)
 			.map((stored) => ({ ...stored.session }))
 			.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 	}
@@ -802,14 +796,25 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 			return;
 		}
 		if (req.method === "POST" && url.pathname === "/sessions") {
-			writeJson(res, 201, await manager.createSession());
+			const cwd = await readCreateSessionCwd(req, res);
+			if (!cwd) return;
+			writeJson(res, 201, await manager.createSession(cwd));
 			return;
 		}
 		if (req.method === "GET" && url.pathname === "/sessions") {
-			writeJson(res, 200, {
-				sessions: manager.listSessions(),
-				unreadable: manager.listUnreadableSessions(),
-			});
+			const scope = await readListSessionScope(url, res);
+			if (!scope) return;
+			const body: Protocol.ListSessionsResponse =
+				scope.type === "all"
+					? {
+							sessions: manager.listSessions(),
+							unreadable: manager.listUnreadableSessions(),
+						}
+					: {
+							sessions: manager.listSessions(scope.cwd),
+							unreadable: manager.listUnreadableSessions(scope.projectRoot),
+						};
+			writeJson(res, 200, body);
 			return;
 		}
 		const snapshotMatch = url.pathname.match(/^\/sessions\/([^/]+)$/);
@@ -970,6 +975,59 @@ function createConfiguredHarness(state: Engine.HarnessState, cwd: string): Harne
 
 interface PromptRequest {
 	text: string;
+}
+
+type ListSessionScope = { type: "all" } | { type: "cwd"; cwd: string; projectRoot: string };
+
+async function readCreateSessionCwd(req: IncomingMessage, res: ServerResponse): Promise<string | undefined> {
+	if (!req.headers["content-type"]?.startsWith("application/json")) {
+		writeJson(res, 400, { code: "invalid_cwd" });
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = await readJsonBody(req, res);
+	} catch {
+		writeJson(res, 400, { code: "invalid_cwd" });
+		return undefined;
+	}
+	if (parsed === undefined) return undefined;
+	const request = parseCreateSessionRequest(parsed);
+	if (!request) {
+		writeJson(res, 400, { code: "invalid_cwd" });
+		return undefined;
+	}
+	try {
+		return await canonicalDirectory(request.cwd);
+	} catch {
+		writeJson(res, 400, { code: "invalid_cwd" });
+		return undefined;
+	}
+}
+
+async function readListSessionScope(url: URL, res: ServerResponse): Promise<ListSessionScope | undefined> {
+	const parameters = [...url.searchParams.entries()];
+	if (parameters.length === 1 && parameters[0][0] === "scope" && parameters[0][1] === "all") {
+		return { type: "all" };
+	}
+	if (parameters.length !== 1 || parameters[0][0] !== "cwd") {
+		writeJson(res, 400, { code: "invalid_scope" });
+		return undefined;
+	}
+	try {
+		const cwd = await canonicalDirectory(parameters[0][1]);
+		return { type: "cwd", cwd, projectRoot: await canonicalProjectRoot(cwd) };
+	} catch {
+		writeJson(res, 400, { code: "invalid_cwd" });
+		return undefined;
+	}
+}
+
+function parseCreateSessionRequest(value: unknown): Protocol.CreateSessionRequest | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const request = value as Record<string, unknown>;
+	if (Object.keys(request).length !== 1 || typeof request.cwd !== "string") return undefined;
+	return { cwd: request.cwd };
 }
 
 function parsePromptRequest(value: unknown): PromptRequest | undefined {

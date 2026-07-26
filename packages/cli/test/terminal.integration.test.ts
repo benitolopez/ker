@@ -53,7 +53,7 @@ test("session FIFO runs beside another session and survives exact cancellation",
 			},
 			initial,
 		);
-	const server = createDaemon({ cwd: PROJECT_ROOT, projectRoot: PROJECT_ROOT, sessionDir, harnessFactory });
+	const server = createDaemon({ sessionDir, harnessFactory });
 	const children = new Set<ChildProcess>();
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
@@ -158,7 +158,12 @@ function startCli(args: string[], daemonUrl: string): RunningCli {
 }
 
 async function createSession(daemonUrl: string): Promise<Protocol.SessionDescriptor> {
-	const response = await localRequest(daemonUrl, "/sessions", { method: "POST" });
+	const request: Protocol.CreateSessionRequest = { cwd: PROJECT_ROOT };
+	const response = await localRequest(daemonUrl, "/sessions", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(request),
+	});
 	assert.equal(response.status, 201);
 	return JSON.parse(response.body) as Protocol.SessionDescriptor;
 }

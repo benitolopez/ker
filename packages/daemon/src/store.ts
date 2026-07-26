@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, opendir, readFile, realpath, stat } from "node:fs/promises";
-import { homedir, platform } from "node:os";
-import { dirname, join, parse } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, parse } from "node:path";
 import type * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
 
@@ -67,14 +67,12 @@ export interface StoredSession {
 	session: Protocol.SessionDescriptor;
 }
 
-export interface UnreadableSession {
-	id: Protocol.SessionId;
-	error: string;
+interface BucketedUnreadableSession extends Protocol.UnreadableSession {
+	projectKey: string;
 }
 
 export interface StoreOptions {
 	baseDir?: string;
-	projectRoot: string;
 }
 
 // Each append becomes one filesystem write, and the promise chain prevents records from interleaving.
@@ -121,27 +119,25 @@ export class SessionLog {
 }
 
 export class SessionStore {
-	readonly projectRoot: string;
-	readonly projectDir: string;
-	readonly unreadableSessions: UnreadableSession[] = [];
+	readonly baseDir: string;
+	readonly #unreadableSessions: BucketedUnreadableSession[] = [];
 
-	constructor(options: StoreOptions) {
-		this.projectRoot = options.projectRoot;
-		const baseDir = options.baseDir ?? defaultSessionDir();
-		const projectKey = createHash("sha256").update(options.projectRoot).digest("hex");
-		this.projectDir = join(baseDir, projectKey);
+	constructor(options: StoreOptions = {}) {
+		this.baseDir = options.baseDir ?? defaultSessionDir();
 	}
 
 	async create(cwd: string): Promise<StoredSession> {
+		const canonicalCwd = await canonicalDirectory(cwd);
+		const projectRoot = await canonicalProjectRoot(canonicalCwd);
 		const now = new Date().toISOString();
 		const session: Protocol.SessionDescriptor = {
 			id: randomUUID(),
-			cwd,
-			projectRoot: this.projectRoot,
+			cwd: canonicalCwd,
+			projectRoot,
 			createdAt: now,
 			updatedAt: now,
 		};
-		const directory = join(this.projectDir, session.id);
+		const directory = join(this.baseDir, projectKey(projectRoot), session.id);
 		await mkdir(directory, { recursive: true, mode: 0o700 });
 		const log = new SessionLog(join(directory, SESSION_FILE), null);
 		const records = await log.append([{ type: "session", session }]);
@@ -149,36 +145,58 @@ export class SessionStore {
 	}
 
 	async loadAll(): Promise<StoredSession[]> {
-		this.unreadableSessions.length = 0;
-		await mkdir(this.projectDir, { recursive: true, mode: 0o700 });
-		const directories = [];
-		for await (const entry of await opendir(this.projectDir)) {
-			if (entry.isDirectory()) directories.push(entry);
+		this.#unreadableSessions.length = 0;
+		await mkdir(this.baseDir, { recursive: true, mode: 0o700 });
+		const projects = [];
+		for await (const entry of await opendir(this.baseDir)) {
+			if (entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)) projects.push(entry);
 		}
 		const sessions: StoredSession[] = [];
-		for (const directory of directories) {
-			const path = join(this.projectDir, directory.name, SESSION_FILE);
-			try {
-				const records = await readRecords(path);
-				const first = records[0];
-				if (!first || first.type !== "session") throw new Error(`Session log ${path} has no session record`);
-				const updatedAt = records.at(-1)?.at ?? first.session.updatedAt;
-				const session = { ...first.session, updatedAt };
-				sessions.push({ log: new SessionLog(path, records.at(-1)?.recordId ?? null), records, session });
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-				this.unreadableSessions.push({
-					id: directory.name,
-					error: error instanceof Error ? error.message : String(error),
-				});
+		for (const project of projects) {
+			const projectDir = join(this.baseDir, project.name);
+			const directories = [];
+			for await (const entry of await opendir(projectDir)) {
+				if (entry.isDirectory()) directories.push(entry);
+			}
+			for (const directory of directories) {
+				const path = join(projectDir, directory.name, SESSION_FILE);
+				try {
+					const records = await readRecords(path);
+					const first = records[0];
+					if (!first || first.type !== "session") throw new Error(`Session log ${path} has no session record`);
+					const updatedAt = records.at(-1)?.at ?? first.session.updatedAt;
+					const session = { ...first.session, updatedAt };
+					sessions.push({ log: new SessionLog(path, records.at(-1)?.recordId ?? null), records, session });
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					this.#unreadableSessions.push({
+						id: directory.name,
+						error: error instanceof Error ? error.message : String(error),
+						projectKey: project.name,
+					});
+				}
 			}
 		}
 		return sessions.sort((left, right) => left.session.createdAt.localeCompare(right.session.createdAt));
 	}
+
+	listUnreadable(projectRoot?: string): Protocol.UnreadableSession[] {
+		const key = projectRoot ? projectKey(projectRoot) : undefined;
+		return this.#unreadableSessions
+			.filter((session) => !key || session.projectKey === key)
+			.map(({ id, error }) => ({ id, error }));
+	}
+}
+
+export async function canonicalDirectory(cwd: string): Promise<string> {
+	if (!isAbsolute(cwd)) throw new Error("Session cwd must be absolute");
+	const canonicalCwd = await realpath(cwd);
+	if (!(await stat(canonicalCwd)).isDirectory()) throw new Error("Session cwd must be a directory");
+	return canonicalCwd;
 }
 
 export async function canonicalProjectRoot(cwd: string): Promise<string> {
-	const canonicalCwd = await realpath(cwd);
+	const canonicalCwd = await canonicalDirectory(cwd);
 	const root = parse(canonicalCwd).root;
 	for (let candidate = canonicalCwd; ; candidate = dirname(candidate)) {
 		try {
@@ -194,10 +212,11 @@ export async function canonicalProjectRoot(cwd: string): Promise<string> {
 export function defaultSessionDir(): string {
 	const override = process.env.KER_SESSION_DIR;
 	if (override) return override;
-	if (platform() === "darwin") return join(homedir(), "Library", "Application Support", "ker", "sessions");
-	if (platform() === "win32")
-		return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "ker", "sessions");
-	return join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "ker", "sessions");
+	return join(homedir(), ".ker", "sessions");
+}
+
+function projectKey(projectRoot: string): string {
+	return createHash("sha256").update(projectRoot).digest("hex");
 }
 
 // A torn final JSON fragment in a v2 log is discarded. Every complete malformed line invalidates the session.

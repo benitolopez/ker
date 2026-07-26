@@ -20,9 +20,18 @@ export interface SessionDescriptor {
 	updatedAt: string;
 }
 
+export interface CreateSessionRequest {
+	cwd: string;
+}
+
 export interface UnreadableSession {
 	id: SessionId;
 	error: string;
+}
+
+export interface ListSessionsResponse {
+	sessions: SessionDescriptor[];
+	unreadable: UnreadableSession[];
 }
 
 export interface QueueItem {
@@ -291,7 +300,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "7" as const;
+export const PROTOCOL_VERSION = "8" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

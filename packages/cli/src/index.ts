@@ -17,7 +17,13 @@ interface ParsedPrompt {
 export async function run(): Promise<void> {
 	const args = process.argv.slice(2);
 	const json = args.includes("--json");
-	const positional = args.filter((arg) => arg !== "--json");
+	const all = args.includes("--all");
+	const positional = args.filter((arg) => arg !== "--json" && arg !== "--all");
+	if (all && !(positional.length === 1 && positional[0] === "sessions")) {
+		writeUsage();
+		process.exitCode = 1;
+		return;
+	}
 	if (positional.length === 1 && positional[0] === "daemon") {
 		runDaemon();
 		return;
@@ -35,7 +41,7 @@ export async function run(): Promise<void> {
 		return;
 	}
 	if (positional.length === 1 && positional[0] === "sessions") {
-		await runSessions(json);
+		await runSessions(json, all);
 		return;
 	}
 	if (positional[0] === "cancel" && positional.length === 2) {
@@ -57,7 +63,12 @@ export async function run(): Promise<void> {
 
 async function runNewSession(json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
-	const res = await fetch(`${BASE}/sessions`, { method: "POST" });
+	const request: Protocol.CreateSessionRequest = { cwd: process.cwd() };
+	const res = await fetch(`${BASE}/sessions`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(request),
+	});
 	if (!res.ok) {
 		process.stderr.write(`ker: daemon could not create a session (HTTP ${res.status})\n`);
 		process.exitCode = 1;
@@ -67,18 +78,16 @@ async function runNewSession(json: boolean): Promise<void> {
 	process.stdout.write(json ? `${JSON.stringify(session)}\n` : `${session.id}\n`);
 }
 
-async function runSessions(json: boolean): Promise<void> {
+async function runSessions(json: boolean, all: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
-	const res = await fetch(`${BASE}/sessions`);
+	const query = all ? new URLSearchParams({ scope: "all" }) : new URLSearchParams({ cwd: process.cwd() });
+	const res = await fetch(`${BASE}/sessions?${query}`);
 	if (!res.ok) {
 		process.stderr.write(`ker: daemon could not list sessions (HTTP ${res.status})\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const body = (await res.json()) as {
-		sessions: Protocol.SessionDescriptor[];
-		unreadable: Protocol.UnreadableSession[];
-	};
+	const body = (await res.json()) as Protocol.ListSessionsResponse;
 	if (json) {
 		process.stdout.write(`${JSON.stringify(body)}\n`);
 		return;
@@ -620,6 +629,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions | cancel <id> | monitor <id>\n       ker [--json] --session <id> <prompt>\n       ker daemon | login | logout\n",
+		"usage: ker [--json] new | sessions [--all] | cancel <id> | monitor <id>\n       ker [--json] --session <id> <prompt>\n       ker daemon | login | logout\n",
 	);
 }
