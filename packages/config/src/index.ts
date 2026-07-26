@@ -12,6 +12,9 @@ export interface Config {
 	apiKey?: string;
 	model: string;
 	reasoningEffort?: ReasoningEffort;
+	// After a daemon restart, queued prompts older than this many minutes are dropped as
+	// expired instead of auto-running. 0 drops all queued prompts on restart.
+	recoveryWindowMinutes: number;
 }
 
 // Load the user-owned config: the model, an optional API key (file value, then OPENAI_API_KEY), and an
@@ -24,6 +27,7 @@ export function loadConfig(): Config {
 		apiKey: file.apiKey ?? process.env.OPENAI_API_KEY,
 		model: file.model ?? DEFAULT_MODEL,
 		reasoningEffort: file.reasoningEffort,
+		recoveryWindowMinutes: file.recoveryWindowMinutes ?? 0,
 	};
 }
 
@@ -31,6 +35,7 @@ interface ConfigFile {
 	apiKey?: string;
 	model?: string;
 	reasoningEffort?: ReasoningEffort;
+	recoveryWindowMinutes?: number;
 }
 
 // A missing file returns an empty object, so env and defaults apply. Malformed JSON throws.

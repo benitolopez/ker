@@ -53,7 +53,7 @@ test("session FIFO runs beside another session and survives exact cancellation",
 			},
 			initial,
 		);
-	const server = createDaemon({ sessionDir, harnessFactory });
+	const server = createDaemon({ sessionDir, harnessFactory, recoveryWindowMinutes: 0 });
 	const children = new Set<ChildProcess>();
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);

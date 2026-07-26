@@ -21,8 +21,9 @@ Thank you for your interest and understanding.
 - A streaming tool-call loop using the OpenAI Responses API, with its own retry/backoff on
   transient failures before provider output starts.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
-- Durable sessions stored outside the repository. Restarting the daemon restores completed history,
-  interrupted turns, and waiting work.
+- Durable sessions stored outside the repository. Restarting the daemon restores completed history
+  and interrupted turns; queued prompts expire by default, or resume when `recoveryWindowMinutes`
+  says they are recent enough.
 - Multiple sessions per project, each with its own FIFO queue. One turn runs at a time in a session,
   while different sessions can run concurrently.
 - Session-owned cancellation that every monitoring client can observe. Waiting turns cancel
@@ -63,6 +64,8 @@ ker needs either an OpenAI API key or a ChatGPT Plus/Pro subscription.
 
 Or set `OPENAI_API_KEY` in the environment. `model` is optional and defaults to `gpt-5.4-mini`;
 `reasoningEffort` is optional and accepts `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
+`recoveryWindowMinutes` is optional and defaults to `0`: after a daemon restart, queued prompts older
+than that many minutes are dropped as `expired` instead of auto-running, and `0` drops all of them.
 
 **ChatGPT subscription.** Sign in with your OpenAI account instead of a key:
 
@@ -153,8 +156,8 @@ not echo prompt attribution. `--json` prints the full snapshot followed by raw e
 npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
-Sessions are stored under `KER_SESSION_DIR` when set. Otherwise ker uses the platform user-data
-directory, grouped by canonical Git root and session ID. Protocol v7 uses session-local queue
+Sessions are stored under `KER_SESSION_DIR` when set, otherwise at `~/.ker/sessions`, grouped by
+canonical Git root and session ID. Protocol v9 uses session-local queue
 snapshots, and session logs use record format v2. Older v1 logs are reported as unreadable and left
 byte-for-byte unchanged until manually removed.
 

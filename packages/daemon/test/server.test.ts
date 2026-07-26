@@ -9,7 +9,7 @@ import { type TestContext, test } from "node:test";
 import type * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
 import { createDaemon, type DaemonOptions, type Harness } from "../src/index.ts";
-import { type Payload, SessionStore } from "../src/store.ts";
+import { type Payload, SessionStore, type StoredRecord } from "../src/store.ts";
 
 const LOCAL_HOST = "127.0.0.1:5537";
 
@@ -753,6 +753,129 @@ test("restart recovers and promotes each session independently", async (t) => {
 	await Promise.all([controlled.finished(0), controlled.finished(1)]);
 });
 
+test("restart drains stale waiting prompts instead of running them", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-expired-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedWaiting(store, [{ text: "stale", submittedAt: "2026-01-01T00:00:00.000Z" }]);
+	const seededLines = (await readFile(seeded.session.log.path, "utf8")).trimEnd().split("\n").length;
+	const running = await startServer(t, passiveFactory([]), { sessionDir, recoveryWindowMinutes: 0 });
+
+	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
+	assert.equal(snapshot.queue.running, undefined);
+	assert.deepEqual(snapshot.queue.waiting, []);
+	assert.equal(snapshot.turns.find((turn) => turn.id === "turn-1")?.status, "expired");
+	const lines = (await readFile(seeded.session.log.path, "utf8")).trimEnd().split("\n");
+	const events = lines
+		.slice(seededLines)
+		.map((line) => JSON.parse(line) as StoredRecord)
+		.flatMap((record) => (record.type === "event" ? [record.event] : []));
+	assert.deepEqual(
+		events.map((event) => event.type),
+		["message_undelivered", "turn_terminal", "end", "queue_changed"],
+	);
+	assert.deepEqual(events[0], {
+		actor: "process",
+		sessionId: seeded.session.session.id,
+		turnId: "turn-1",
+		type: "message_undelivered",
+		messageId: "message-1",
+		text: "stale",
+		reason: "expired",
+	});
+	const terminal = events[1];
+	assert.equal(terminal.type, "turn_terminal");
+	if (terminal.type === "turn_terminal") assert.equal(terminal.reason, "expired");
+	const queue = events.at(-1);
+	assert.equal(queue?.type, "queue_changed");
+	if (queue?.type === "queue_changed") {
+		assert.equal(queue.queue.running, undefined);
+		assert.deepEqual(queue.queue.waiting, []);
+	}
+});
+
+test("a recovery window long enough resumes stale waiting prompts", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-resume-window-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedWaiting(store, [{ text: "stale", submittedAt: "2026-01-01T00:00:00.000Z" }]);
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory, {
+		sessionDir,
+		recoveryWindowMinutes: Number.MAX_SAFE_INTEGER,
+	});
+
+	await controlled.started(0);
+	controlled.release(0);
+	await controlled.finished(0);
+	await waitForTerminal(running.url, seeded.session.session.id, "turn-1");
+	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
+	assert.equal(snapshot.turns.find((turn) => turn.id === "turn-1")?.status, "completed");
+	assert.deepEqual(controlled.initials, ["stale"]);
+});
+
+test("restart drains only expired prompts and keeps survivor order", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-mixed-expiry-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const seeded = await seedWaiting(store, [
+		{ text: "stale", submittedAt: "2026-01-01T00:00:00.000Z" },
+		{ text: "fresh-1", submittedAt: recent },
+		{ text: "fresh-2", submittedAt: recent },
+	]);
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory, { sessionDir, recoveryWindowMinutes: 60 });
+
+	await controlled.started(0);
+	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
+	assert.equal(snapshot.turns.find((turn) => turn.id === "turn-1")?.status, "expired");
+	assert.equal(snapshot.queue.running?.text, "fresh-1");
+	assert.deepEqual(
+		snapshot.queue.waiting.map((item) => item.text),
+		["fresh-2"],
+	);
+	controlled.release(0);
+	await controlled.started(1);
+	controlled.release(1);
+	await controlled.finished(1);
+	assert.deepEqual(controlled.initials, ["fresh-1", "fresh-2"]);
+});
+
+test("a drained turn stays expired across another restart", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-expired-replay-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedWaiting(store, [{ text: "stale", submittedAt: "2026-01-01T00:00:00.000Z" }]);
+	const first = await startServer(t, passiveFactory([]), { sessionDir, recoveryWindowMinutes: 0 }, false);
+	assert.equal(
+		(await getSnapshot(first.url, seeded.session.session.id)).turns.find((turn) => turn.id === "turn-1")?.status,
+		"expired",
+	);
+	await first.close();
+
+	const second = await startServer(t, passiveFactory([]), { sessionDir, recoveryWindowMinutes: 0 }, false);
+	const snapshot = await getSnapshot(second.url, seeded.session.session.id);
+	assert.equal(snapshot.turns.find((turn) => turn.id === "turn-1")?.status, "expired");
+	assert.equal(snapshot.queue.running, undefined);
+	assert.deepEqual(snapshot.queue.waiting, []);
+	await second.close();
+});
+
+test("restart drains stale waiting work before finalizing the interrupted turn", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cancelling-expiry-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedCancellingWithWaiting(store);
+	const running = await startServer(t, passiveFactory([]), { sessionDir, recoveryWindowMinutes: 0 });
+
+	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
+	assert.equal(snapshot.turns.find((turn) => turn.id === "turn-1")?.status, "aborted");
+	assert.equal(snapshot.turns.find((turn) => turn.id === seeded.waiting.turnId)?.status, "expired");
+	assert.equal(snapshot.queue.running, undefined);
+	assert.deepEqual(snapshot.queue.waiting, []);
+});
+
 test("shutdown aborts and awaits active turns in every session", async (t) => {
 	const controlled = controlledFactory({ pauseAfterAbort: true });
 	const running = await startServer(t, controlled.factory, {}, false);
@@ -936,6 +1059,37 @@ async function seedCancellingWithWaiting(store: SessionStore) {
 	return { session, waiting };
 }
 
+async function seedWaiting(store: SessionStore, items: Array<{ text: string; submittedAt: string }>) {
+	const session = await store.create(process.cwd());
+	const waiting: Protocol.QueueItem[] = items.map((item, index) => ({
+		id: `queue-${index + 1}`,
+		turnId: `turn-${index + 1}`,
+		messageId: `message-${index + 1}`,
+		text: item.text,
+		state: "waiting",
+		submittedAt: item.submittedAt,
+	}));
+	const payloads: Payload[] = waiting.map((item) => ({
+		type: "event",
+		event: {
+			actor: "human",
+			sessionId: session.session.id,
+			turnId: item.turnId,
+			type: "message_submitted",
+			messageId: item.messageId,
+			queueItemId: item.id,
+			text: item.text,
+			admission: "waiting",
+		},
+	}));
+	payloads.push({
+		type: "event",
+		event: { actor: "process", sessionId: session.session.id, type: "queue_changed", queue: { revision: 1, waiting } },
+	});
+	await session.log.append(payloads);
+	return { session, waiting };
+}
+
 function controlledFactory(options: { pauseAfterDelta?: boolean; pauseAfterAbort?: boolean } = {}): {
 	factory: NonNullable<DaemonOptions["harnessFactory"]>;
 	initials: string[];
@@ -1070,6 +1224,7 @@ async function startServer(
 		sessionDir,
 		harnessFactory,
 		eventTailSize: options.eventTailSize,
+		recoveryWindowMinutes: options.recoveryWindowMinutes ?? Number.MAX_SAFE_INTEGER,
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);

@@ -37,6 +37,7 @@ export interface DaemonOptions {
 	harnessFactory?: (state: Engine.HarnessState, cwd: string) => Harness;
 	sessionDir?: string;
 	eventTailSize?: number;
+	recoveryWindowMinutes?: number;
 }
 
 export type Daemon = Server & { shutdown(): Promise<void> };
@@ -48,6 +49,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 			store: new SessionStore({ baseDir: options.sessionDir }),
 			harnessFactory: options.harnessFactory ?? createConfiguredHarness,
 			eventTailSize: options.eventTailSize ?? DEFAULT_EVENT_TAIL_SIZE,
+			recoveryWindowMinutes: options.recoveryWindowMinutes ?? Config.loadConfig().recoveryWindowMinutes,
 		});
 		await registry.initialize();
 		return registry;
@@ -73,6 +75,7 @@ interface RegistryOptions {
 	store: SessionStore;
 	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	eventTailSize: number;
+	recoveryWindowMinutes: number;
 }
 
 interface ActiveTurn {
@@ -108,6 +111,7 @@ class Registry {
 	readonly #store: SessionStore;
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #eventTailSize: number;
+	readonly #recoveryWindowMinutes: number;
 	readonly #stored = new Map<Protocol.SessionId, StoredSession>();
 	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
 	#stopping = false;
@@ -116,6 +120,7 @@ class Registry {
 		this.#store = options.store;
 		this.#harnessFactory = options.harnessFactory;
 		this.#eventTailSize = options.eventTailSize;
+		this.#recoveryWindowMinutes = options.recoveryWindowMinutes;
 	}
 
 	async initialize(): Promise<void> {
@@ -125,6 +130,7 @@ class Registry {
 		await Promise.all(
 			states.map((state) =>
 				this.#withQueueLock(state, async () => {
+					await this.#drainExpiredWaiting(state);
 					if (state.queue.running) {
 						await this.#recoverRunning(state, state.queue.running);
 						return;
@@ -379,16 +385,16 @@ class Registry {
 			}
 			if (event.type === "queue_changed" && event.queue.revision > queue.revision) queue = cloneQueue(event.queue);
 		}
-		const running = queue.running ? items.get(queue.running.id) : undefined;
+		// Queue items restore from the queue snapshot, not the submission records: the snapshot
+		// carries each item's original submittedAt, which recovery expiry depends on.
 		const restoredRunning: Protocol.QueueItem | undefined =
-			running && queue.running
-				? { ...running, state: queue.running.state === "cancelling" ? "cancelling" : "running" }
+			queue.running && items.has(queue.running.id)
+				? { ...queue.running, state: queue.running.state === "cancelling" ? "cancelling" : "running" }
 				: undefined;
 		if (restoredRunning) items.set(restoredRunning.id, restoredRunning);
 		const waiting = queue.waiting.flatMap((queued) => {
-			const item = items.get(queued.id);
-			if (!item) return [];
-			const restored = { ...item, state: "waiting" as const };
+			if (!items.has(queued.id)) return [];
+			const restored = { ...queued, state: "waiting" as const };
 			items.set(restored.id, restored);
 			return [restored];
 		});
@@ -620,6 +626,40 @@ class Registry {
 				queue: cloneQueue(state.queue),
 			},
 		};
+	}
+
+	// Runs only during restart recovery, never while the daemon is live: waiting prompts older
+	// than the recovery window are dropped as expired instead of auto-running unattended.
+	async #drainExpiredWaiting(state: SessionState): Promise<void> {
+		if (state.queue.waiting.length === 0) return;
+		const now = Date.now();
+		const windowMs = this.#recoveryWindowMinutes * 60_000;
+		const isFresh = (item: Protocol.QueueItem) =>
+			this.#recoveryWindowMinutes > 0 && now - Date.parse(item.submittedAt) <= windowMs;
+		const expired = state.queue.waiting.filter((item) => !isFresh(item));
+		if (expired.length === 0) return;
+		state.queue.waiting = state.queue.waiting.filter(isFresh);
+		state.queue.revision++;
+		const payloads: Payload[] = expired.flatMap((item): Payload[] => {
+			const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
+			return [
+				{
+					type: "event",
+					event: {
+						actor: "process",
+						...scope,
+						type: "message_undelivered",
+						messageId: item.messageId,
+						text: item.text,
+						reason: "expired",
+					},
+				},
+				{ type: "event", event: { actor: "process", ...scope, type: "turn_terminal", reason: "expired" } },
+				{ type: "event", event: { actor: "process", ...scope, type: "end" } },
+			];
+		});
+		payloads.push(this.#queueChangedPayload(state));
+		await this.#appendAndPublish(state, payloads);
 	}
 
 	async #recoverRunning(state: SessionState, item: Protocol.QueueItem): Promise<void> {

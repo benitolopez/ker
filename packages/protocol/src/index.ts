@@ -9,7 +9,7 @@ export type QueueItemId = string;
 
 export type AdmissionStatus = "running" | "waiting";
 export type CancellationStatus = "cancelling" | "cancelled" | "aborted";
-export type TurnTerminalReason = "completed" | "aborted" | "error" | "interrupted" | "cancelled";
+export type TurnTerminalReason = "completed" | "aborted" | "error" | "interrupted" | "cancelled" | "expired";
 export type AssistantTerminalReason = "completed" | "length" | "aborted" | "error";
 
 export interface SessionDescriptor {
@@ -131,7 +131,7 @@ export interface MessageUndeliveredEvent extends TurnEventBase {
 	type: "message_undelivered";
 	messageId: MessageId;
 	text: string;
-	reason: "aborted" | "error" | "interrupted" | "cancelled";
+	reason: "aborted" | "error" | "interrupted" | "cancelled" | "expired";
 }
 
 export interface TurnCancelRequestedEvent extends TurnEventBase {
@@ -300,7 +300,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "8" as const;
+export const PROTOCOL_VERSION = "9" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;
