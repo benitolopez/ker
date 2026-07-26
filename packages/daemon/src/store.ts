@@ -195,8 +195,9 @@ export async function canonicalDirectory(cwd: string): Promise<string> {
 	return canonicalCwd;
 }
 
-export async function canonicalProjectRoot(cwd: string): Promise<string> {
-	const canonicalCwd = await canonicalDirectory(cwd);
+// Walks up from an already-canonical directory to the nearest ancestor containing
+// .git; returns the directory itself when no repository is found.
+export async function canonicalProjectRoot(canonicalCwd: string): Promise<string> {
 	const root = parse(canonicalCwd).root;
 	for (let candidate = canonicalCwd; ; candidate = dirname(candidate)) {
 		try {
