@@ -1,4 +1,8 @@
+import type { Model, Provider, Usage } from "@ker-ai/protocol";
 import OpenAI, { APIConnectionError, APIConnectionTimeoutError, APIError, APIUserAbortError } from "openai";
+import { models } from "./models.generated.ts";
+
+export type { Model, Provider, Usage } from "@ker-ai/protocol";
 
 export interface ToolCall {
 	callId: string;
@@ -10,7 +14,15 @@ export interface ToolCall {
 export type Message =
 	| { role: "user"; content: string }
 	| { role: "developer"; content: string }
-	| { role: "assistant"; content: string; toolCalls?: ToolCall[]; reasoning?: unknown[] }
+	| {
+			role: "assistant";
+			content: string;
+			toolCalls?: ToolCall[];
+			reasoning?: unknown[];
+			provider?: Provider;
+			model?: string;
+			usage?: Usage;
+	  }
 	| { role: "tool"; toolCallId: string; content: string };
 
 // The wire-level view of a tool: the name, prose, and argument schema the model is shown. The engine's
@@ -32,12 +44,6 @@ export interface StreamOptions {
 	signal?: AbortSignal;
 }
 
-export interface Usage {
-	input: number;
-	output: number;
-	total: number;
-}
-
 export type FinishReason = "stop" | "length" | "content_filter";
 
 export type Event =
@@ -54,6 +60,16 @@ export type Event =
 export type Auth = { kind: "apikey"; key: string } | { kind: "oauth"; accessToken: string; accountId: string };
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+
+export function getModel(provider: Provider, id: string): Model {
+	const model = models.find((candidate) => candidate.provider === provider && candidate.id === id);
+	return model ? { ...model } : { provider, id };
+}
+
+export function providerOf(auth: Auth): Provider {
+	if (auth.kind === "oauth") return "openai-codex";
+	return "openai";
+}
 
 // Stream one OpenAI Responses call as normalized events. It never throws: cancellation returns
 // `aborted`, while every failure returns one `error` that says whether a retry is worth it and carries
@@ -134,15 +150,10 @@ export async function* stream(
 				}
 			}
 			if (event.type === "response.completed") {
-				const usage = event.response.usage;
 				yield {
 					type: "done",
 					reason: "stop",
-					usage: {
-						input: usage?.input_tokens ?? 0,
-						output: usage?.output_tokens ?? 0,
-						total: usage?.total_tokens ?? 0,
-					},
+					usage: normalizeUsage(event.response.usage),
 				};
 				return;
 			}
@@ -151,15 +162,10 @@ export async function* stream(
 				if (reason !== "max_output_tokens" && reason !== "content_filter") {
 					throw new Error("OpenAI response was incomplete without a recognized reason");
 				}
-				const usage = event.response.usage;
 				yield {
 					type: "done",
 					reason: reason === "max_output_tokens" ? "length" : "content_filter",
-					usage: {
-						input: usage?.input_tokens ?? 0,
-						output: usage?.output_tokens ?? 0,
-						total: usage?.total_tokens ?? 0,
-					},
+					usage: normalizeUsage(event.response.usage),
 				};
 				return;
 			}
@@ -179,6 +185,25 @@ export async function* stream(
 		}
 		yield { type: "error", ...classifyError(err) };
 	}
+}
+
+export function normalizeUsage(usage: OpenAI.Responses.ResponseUsage | undefined): Usage {
+	const inputDetails = usage?.input_tokens_details as
+		| (OpenAI.Responses.ResponseUsage.InputTokensDetails & { cache_write_tokens?: number })
+		| undefined;
+	const cacheRead = inputDetails?.cached_tokens ?? 0;
+	const cacheWrite = inputDetails?.cache_write_tokens ?? 0;
+	const input = Math.max(0, (usage?.input_tokens ?? 0) - cacheRead - cacheWrite);
+	const output = usage?.output_tokens ?? 0;
+	const reasoning = usage?.output_tokens_details?.reasoning_tokens;
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		...(reasoning === undefined ? {} : { reasoning }),
+		total: usage?.total_tokens ?? input + output + cacheRead + cacheWrite,
+	};
 }
 
 // Rebuild the Responses `input` from the conversation. A reasoning model's assistant turn is replayed in

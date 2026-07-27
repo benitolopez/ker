@@ -105,9 +105,9 @@ test("monitor", async (t) => {
 				sessionId: "session-1",
 				turnId: "live",
 				type: "usage",
-				input: 1,
-				output: 2,
-				total: 3,
+				provider: "openai",
+				model: "gpt-5.4-mini",
+				usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 },
 			},
 			{
 				actor: "process",
@@ -408,6 +408,7 @@ function controlMonitor(
 function conversationSnapshot(): Protocol.SessionSnapshot {
 	return {
 		session: session(),
+		usage: emptyUsage(),
 		entries: [
 			entry("entry-user-1", "turn-1", "user", "first\nquestion", "prompt-1"),
 			entry("entry-assistant-1", "turn-1", "assistant", "saved", "assistant-1"),
@@ -445,6 +446,7 @@ function conversationSnapshot(): Protocol.SessionSnapshot {
 function emptySnapshot(): Protocol.SessionSnapshot {
 	return {
 		session: session(),
+		usage: emptyUsage(),
 		entries: [],
 		messages: [],
 		turns: [],
@@ -456,6 +458,7 @@ function emptySnapshot(): Protocol.SessionSnapshot {
 function resyncInitialSnapshot(): Protocol.SessionSnapshot {
 	return {
 		session: session(),
+		usage: emptyUsage(),
 		entries: [
 			entry("entry-assistant-old", "old", "assistant", "old", "assistant-old"),
 			entry("entry-user-current", "current", "user", "ask", "prompt-current"),
@@ -482,6 +485,7 @@ function resyncInitialSnapshot(): Protocol.SessionSnapshot {
 function resyncRecoveredSnapshot(): Protocol.SessionSnapshot {
 	return {
 		session: session(),
+		usage: emptyUsage(),
 		entries: [
 			entry("entry-assistant-old", "old", "assistant", "old", "assistant-old"),
 			entry("entry-user-current", "current", "user", "ask", "prompt-current"),
@@ -519,6 +523,7 @@ function resyncRecoveredSnapshot(): Protocol.SessionSnapshot {
 function initialSnapshot(): Protocol.SessionSnapshot {
 	return {
 		session: session(),
+		usage: emptyUsage(),
 		entries: [],
 		messages: [{ id: "assistant-1", turnId: "historical", text: "saved", reason: "completed" }],
 		turns: [
@@ -533,6 +538,7 @@ function initialSnapshot(): Protocol.SessionSnapshot {
 function recoveredSnapshot(): Protocol.SessionSnapshot {
 	return {
 		session: session(),
+		usage: emptyUsage(),
 		entries: [],
 		messages: [{ id: "assistant-1", turnId: "historical", text: "saved", reason: "completed" }],
 		turns: [
@@ -543,6 +549,13 @@ function recoveredSnapshot(): Protocol.SessionSnapshot {
 		],
 		queue: { revision: 3, waiting: [] },
 		cursor: { epoch: "epoch-2", sequence: 0 },
+	};
+}
+
+function emptyUsage(): Protocol.SessionUsage {
+	return {
+		contextTokens: 0,
+		cumulative: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
 

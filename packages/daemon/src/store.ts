@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, parse } from "node:path";
 import type * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
 
-const STORE_VERSION = 2 as const;
+const STORE_VERSION = 3 as const;
 const SESSION_FILE = "session.jsonl";
 const HEADER_SCAN_BYTES = 8_192;
 const TAIL_SCAN_BYTES = 8_192;
@@ -289,7 +289,7 @@ function isIdleTail(tail: Buffer, tailOffset: number, path: string): boolean {
 	);
 }
 
-// A torn final JSON fragment in a v2 log is discarded. Every complete malformed line invalidates the session.
+// A torn final JSON fragment in a v3 log is discarded. Every complete malformed line invalidates the session.
 async function readRecords(path: string): Promise<StoredRecord[]> {
 	const contents = await readFile(path);
 	const records: StoredRecord[] = [];

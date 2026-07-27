@@ -41,7 +41,7 @@ test("writes chained versioned records and keeps conversation ancestry explicit"
 	assert.equal(delivered.previousRecordId, submitted.recordId);
 	assert.equal(delivered.type, "conversation");
 	if (delivered.type === "conversation") assert.equal(delivered.parentId, null);
-	assert.equal(session.records[0].version, 2);
+	assert.equal(session.records[0].version, 3);
 });
 
 test("serializes concurrent appends within one session", async (t) => {
@@ -65,7 +65,7 @@ test("truncates only a malformed final partial line", async (t) => {
 	const store = new SessionStore({ baseDir });
 	const session = await store.create(baseDir);
 	const completeSize = (await stat(session.log.path)).size;
-	await appendFile(session.log.path, '{"version":2,"id":"torn"');
+	await appendFile(session.log.path, '{"version":3,"id":"torn"');
 	const tornSize = (await stat(session.log.path)).size;
 
 	const [entry] = await store.scanCatalog();
@@ -75,24 +75,24 @@ test("truncates only a malformed final partial line", async (t) => {
 	assert.equal((await stat(session.log.path)).size, completeSize);
 });
 
-test("keeps v1 sessions unreadable without changing their bytes", async (t) => {
-	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-v1-"));
+test("keeps v2 sessions unreadable without changing their bytes", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-v2-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
 	const session = await store.create(baseDir);
-	const v1 = `${JSON.stringify({
-		version: 1,
+	const v2 = `${JSON.stringify({
+		version: 2,
 		recordId: "record-1",
 		previousRecordId: null,
 		at: "2026-01-01T00:00:00.000Z",
 		type: "session",
 		session: session.session,
 	})}\n`;
-	await writeFile(session.log.path, v1);
+	await writeFile(session.log.path, v2);
 
 	assert.deepEqual(await store.scanCatalog(), []);
 	assert.equal(store.listUnreadable()[0]?.id, session.session.id);
-	assert.equal(await readFile(session.log.path, "utf8"), v1);
+	assert.equal(await readFile(session.log.path, "utf8"), v2);
 });
 
 test("rejects a malformed complete tail at load without repairing it", async (t) => {
@@ -100,7 +100,7 @@ test("rejects a malformed complete tail at load without repairing it", async (t)
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
 	const session = await store.create(baseDir);
-	await appendFile(session.log.path, '{"version":2,}');
+	await appendFile(session.log.path, '{"version":3,}');
 	const before = await readFile(session.log.path);
 
 	const [entry] = await store.scanCatalog();
@@ -274,7 +274,7 @@ test("classifies idle sessions from the final complete record", async (t) => {
 	const midTurn = await store.create(baseDir);
 	await midTurn.log.append([{ type: "identity", identity: { kind: "apikey" } }]);
 	const torn = await store.create(baseDir);
-	await appendFile(torn.log.path, '{"version":2');
+	await appendFile(torn.log.path, '{"version":3');
 	const bare = await store.create(baseDir);
 
 	const idleById = new Map((await store.scanCatalog()).map((entry) => [entry.session.id, entry.idle]));

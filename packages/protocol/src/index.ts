@@ -11,6 +11,28 @@ export type AdmissionStatus = "running" | "waiting";
 export type CancellationStatus = "cancelling" | "cancelled" | "aborted";
 export type TurnTerminalReason = "completed" | "aborted" | "error" | "interrupted" | "cancelled" | "expired";
 export type AssistantTerminalReason = "completed" | "length" | "aborted" | "error";
+export type Provider = "openai" | "openai-codex";
+
+export interface Model {
+	provider: Provider;
+	id: string;
+	contextWindow?: number;
+	maxOutputTokens?: number;
+}
+
+export interface Usage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	reasoning?: number;
+	total: number;
+}
+
+export interface SessionUsage {
+	contextTokens: number;
+	cumulative: Usage;
+}
 
 export interface SessionDescriptor {
 	id: SessionId;
@@ -91,6 +113,8 @@ export type ConversationEntry =
 export interface SessionSnapshot {
 	session: SessionDescriptor;
 	identity?: Identity;
+	model?: Model;
+	usage: SessionUsage;
 	entries: ConversationEntry[];
 	messages: AssistantMessage[];
 	active?: ActiveAssistantMessage;
@@ -169,9 +193,9 @@ export interface AssistantMessageCompletedEvent extends TurnEventBase {
 export interface UsageEvent extends TurnEventBase {
 	actor: "process";
 	type: "usage";
-	input: number;
-	output: number;
-	total: number;
+	provider: Provider;
+	model: string;
+	usage: Usage;
 }
 
 // The credential a session is bound to. OAuth logins are told apart by account; API keys all
@@ -300,7 +324,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "9" as const;
+export const PROTOCOL_VERSION = "10" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

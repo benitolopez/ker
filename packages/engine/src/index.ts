@@ -242,8 +242,16 @@ async function* streamStep(
 			}
 			if (event.type === "reasoning") reasoning.push(event.item);
 			if (event.type === "done") {
+				const provider = Llm.providerOf(auth);
 				if (event.reason === "content_filter") {
-					yield { actor: "process", ...scope, type: "usage", ...event.usage };
+					yield {
+						actor: "process",
+						...scope,
+						type: "usage",
+						provider,
+						model: config.model,
+						usage: event.usage,
+					};
 					yield {
 						actor: "process",
 						...scope,
@@ -252,7 +260,15 @@ async function* streamStep(
 					};
 					return { kind: "stopped" };
 				}
-				messages.push({ role: "assistant", content: reply, toolCalls, reasoning });
+				messages.push({
+					role: "assistant",
+					content: reply,
+					toolCalls,
+					reasoning,
+					provider,
+					model: config.model,
+					usage: event.usage,
+				});
 				yield {
 					actor: "agent",
 					modelRole: "assistant",
@@ -261,7 +277,14 @@ async function* streamStep(
 					messageId,
 					reason: event.reason === "length" ? "length" : "completed",
 				};
-				yield { actor: "process", ...scope, type: "usage", ...event.usage };
+				yield {
+					actor: "process",
+					...scope,
+					type: "usage",
+					provider,
+					model: config.model,
+					usage: event.usage,
+				};
 				return { kind: "done", toolCalls };
 			}
 			if (event.type === "error") {
@@ -292,6 +315,44 @@ async function* streamStep(
 			throw error;
 		}
 	}
+}
+
+export function estimateContextTokens(messages: readonly Llm.Message[]): number {
+	const lastUsageIndex = messages.findLastIndex(
+		(message) =>
+			message.role === "assistant" &&
+			message.provider !== undefined &&
+			message.model !== undefined &&
+			message.usage !== undefined &&
+			usageTokens(message.usage) > 0,
+	);
+	const lastUsage = lastUsageIndex === -1 ? undefined : messages[lastUsageIndex];
+	const reported = lastUsage?.role === "assistant" && lastUsage.usage ? usageTokens(lastUsage.usage) : 0;
+	const trailingCharacters = messages
+		.slice(lastUsageIndex + 1)
+		.reduce((total, message) => total + messageCharacters(message), 0);
+	return reported + Math.ceil(trailingCharacters / 4);
+}
+
+function usageTokens(usage: Llm.Usage): number {
+	return usage.total || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function messageCharacters(message: Llm.Message): number {
+	if (message.role === "user" || message.role === "developer") return message.content.length;
+	if (message.role === "tool") return message.toolCallId.length + message.content.length;
+	const calls = (message.toolCalls ?? []).reduce(
+		(total, call) => total + call.callId.length + (call.itemId?.length ?? 0) + call.name.length + call.arguments.length,
+		0,
+	);
+	const reasoning = (message.reasoning ?? []).reduce<number>((total, item) => {
+		try {
+			return total + (JSON.stringify(item)?.length ?? 0);
+		} catch {
+			return total;
+		}
+	}, 0);
+	return message.content.length + calls + reasoning;
 }
 
 type AuthResult =

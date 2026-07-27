@@ -21,6 +21,6 @@
       "@ker-ai/cli/*": ["./packages/cli/src/*"]
     }
   },
-  "include": ["packages/*/src/**/*", "packages/*/test/**/*"],
+  "include": ["packages/*/src/**/*", "packages/*/test/**/*", "packages/*/scripts/**/*"],
   "exclude": ["reference", "node_modules", "dist"]
 }

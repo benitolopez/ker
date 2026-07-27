@@ -5,6 +5,7 @@ import * as Agent from "@ker-ai/agent";
 import * as Auth from "@ker-ai/auth";
 import * as Config from "@ker-ai/config";
 import * as Engine from "@ker-ai/engine";
+import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
 import {
@@ -96,6 +97,8 @@ interface SessionState {
 	persistedMessageCount: number;
 	lastConversationEntryId: string | null;
 	identity?: Protocol.Identity;
+	model?: Protocol.Model;
+	cumulativeUsage: Protocol.Usage;
 	messages: Protocol.AssistantMessage[];
 	active?: Protocol.ActiveAssistantMessage;
 	turns: Map<Protocol.TurnId, Protocol.TurnTerminalReason>;
@@ -199,6 +202,11 @@ class Registry {
 			return {
 				session: { ...state.stored.session },
 				identity: state.identity,
+				model: state.model ? { ...state.model } : undefined,
+				usage: {
+					contextTokens: Engine.estimateContextTokens(state.harness.snapshot().messages),
+					cumulative: { ...state.cumulativeUsage },
+				},
 				entries: state.stored.records
 					.filter((record): record is ConversationRecord => record.type === "conversation")
 					.map(toConversationEntry),
@@ -409,6 +417,17 @@ class Registry {
 		const messages = stored.records
 			.filter((record): record is AssistantRecord => record.type === "assistant")
 			.map((record) => ({ ...record.message }));
+		const usageEvents = stored.records.flatMap((record) =>
+			record.type === "event" && record.event.type === "usage" ? [record.event] : [],
+		);
+		const latestUsage = usageEvents.at(-1);
+		const cumulativeUsage = usageEvents.reduce((total, event) => addUsage(total, event.usage), {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0,
+		} satisfies Protocol.Usage);
 		const turns = new Map<Protocol.TurnId, Protocol.TurnTerminalReason>();
 		const items = new Map<Protocol.QueueItemId, Protocol.QueueItem>();
 		let queue: Protocol.QueueSnapshot = { revision: 0, waiting: [] };
@@ -451,6 +470,8 @@ class Registry {
 			persistedMessageCount: state.messages.length,
 			lastConversationEntryId: conversation.at(-1)?.id ?? null,
 			identity,
+			model: latestUsage ? Llm.getModel(latestUsage.provider, latestUsage.model) : undefined,
+			cumulativeUsage,
 			messages,
 			turns,
 			epoch: randomUUID(),
@@ -655,6 +676,10 @@ class Registry {
 			}
 			if (event.offset !== active.text.length) throw new Error(`Non-contiguous assistant message ${event.messageId}`);
 			active.text += event.text;
+		}
+		if (event.type === "usage") {
+			state.model = Llm.getModel(event.provider, event.model);
+			state.cumulativeUsage = addUsage(state.cumulativeUsage, event.usage);
 		}
 		if (event.type === "turn_terminal") state.turns.set(event.turnId, event.reason);
 	}
@@ -1121,6 +1146,21 @@ function cloneQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {
 		revision: queue.revision,
 		running: queue.running ? { ...queue.running } : undefined,
 		waiting: queue.waiting.map((item) => ({ ...item })),
+	};
+}
+
+function addUsage(left: Protocol.Usage, right: Protocol.Usage): Protocol.Usage {
+	const reasoning =
+		left.reasoning === undefined && right.reasoning === undefined
+			? undefined
+			: (left.reasoning ?? 0) + (right.reasoning ?? 0);
+	return {
+		input: left.input + right.input,
+		output: left.output + right.output,
+		cacheRead: left.cacheRead + right.cacheRead,
+		cacheWrite: left.cacheWrite + right.cacheWrite,
+		...(reasoning === undefined ? {} : { reasoning }),
+		total: left.total + right.total,
 	};
 }
 

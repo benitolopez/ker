@@ -17,9 +17,11 @@
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
     "clean": "shx rm -rf dist",
+    "generate:models": "node scripts/generate-models.ts",
     "test": "node --test test/*.test.ts"
   },
   "dependencies": {
+    "@ker-ai/protocol": "^0.0.0",
     "openai": "6.45.0"
   }
 }

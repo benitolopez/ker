@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
-import { createHarness, type EngineConfig, type Tool } from "../src/index.ts";
+import { createHarness, type EngineConfig, estimateContextTokens, type Tool } from "../src/index.ts";
 
 test("does not admit a prompt when initial auth resolution fails", async () => {
 	const observed = { loggedIn: true, streamCalls: 0 };
@@ -18,7 +18,7 @@ test("does not admit a prompt when initial auth resolution fails", async () => {
 			stream: async function* () {
 				observed.streamCalls++;
 				yield { type: "delta", text: "first response" };
-				yield { type: "done", reason: "stop", usage: { input: 2, output: 2, total: 4 } };
+				yield { type: "done", reason: "stop", usage: { input: 2, output: 2, cacheRead: 0, cacheWrite: 0, total: 4 } };
 			},
 		},
 	);
@@ -32,7 +32,15 @@ test("does not admit a prompt when initial auth resolution fails", async () => {
 	]);
 	assert.deepEqual(harness.messages, [
 		{ role: "user", content: "first" },
-		{ role: "assistant", content: "first response", toolCalls: [], reasoning: [] },
+		{
+			role: "assistant",
+			content: "first response",
+			toolCalls: [],
+			reasoning: [],
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 2, output: 2, cacheRead: 0, cacheWrite: 0, total: 4 },
+		},
 	]);
 	assert.deepEqual(observed, { loggedIn: false, streamCalls: 1 });
 });
@@ -54,7 +62,7 @@ test("does not restore an auth-rejected prompt after login and resubmission", as
 					if (message.role === "user") users.push(message.content);
 				}
 				observed.providerUsers.push(users);
-				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
 			},
 		},
 	);
@@ -69,7 +77,15 @@ test("does not restore an auth-rejected prompt after login and resubmission", as
 	assert.deepEqual(observed.providerUsers, [["resubmitted"]]);
 	assert.deepEqual(harness.messages, [
 		{ role: "user", content: "resubmitted" },
-		{ role: "assistant", content: "", toolCalls: [], reasoning: [] },
+		{
+			role: "assistant",
+			content: "",
+			toolCalls: [],
+			reasoning: [],
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+		},
 	]);
 });
 
@@ -83,7 +99,7 @@ test("reuses preflight auth for the initial provider attempt", async () => {
 		{
 			stream: async function* (_model, _messages, auth) {
 				if (auth.kind === "apikey") observed.providerKeys.push(auth.key);
-				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
 			},
 		},
 	);
@@ -103,7 +119,7 @@ test("rejects a changed oauth account before admitting the prompt", async () => 
 		{
 			stream: async function* () {
 				observed.streamCalls++;
-				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
 			},
 		},
 	);
@@ -124,7 +140,15 @@ test("rejects a changed oauth account before admitting the prompt", async () => 
 	]);
 	assert.deepEqual(harness.messages, [
 		{ role: "user", content: "first" },
-		{ role: "assistant", content: "", toolCalls: [], reasoning: [] },
+		{
+			role: "assistant",
+			content: "",
+			toolCalls: [],
+			reasoning: [],
+			provider: "openai-codex",
+			model: "test-model",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+		},
 	]);
 	assert.equal(observed.streamCalls, 1);
 });
@@ -142,7 +166,7 @@ test("rejects a change between oauth and api-key auth", async () => {
 		{
 			stream: async function* () {
 				observed.streamCalls++;
-				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
 			},
 		},
 	);
@@ -176,7 +200,7 @@ test("allows the original oauth account after rejecting another account", async 
 				observed.providerUsers.push(
 					messages.filter((message) => message.role === "user").map((message) => message.content),
 				);
-				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
 			},
 		},
 	);
@@ -210,7 +234,7 @@ test("stops before a tool follow-up when the oauth account changes mid-turn", as
 			stream: async function* () {
 				observed.streamCalls++;
 				yield { type: "tool_call", callId: "call_1", name: "switch_account", arguments: "{}" };
-				yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+				yield { type: "done", reason: "stop", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 } };
 			},
 		},
 	);
@@ -234,6 +258,9 @@ test("stops before a tool follow-up when the oauth account changes mid-turn", as
 			content: "",
 			toolCalls: [{ callId: "call_1", itemId: undefined, name: "switch_account", arguments: "{}" }],
 			reasoning: [],
+			provider: "openai-codex",
+			model: "test-model",
+			usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 },
 		},
 		{ role: "tool", toolCallId: "call_1", content: "switched" },
 	]);
@@ -262,7 +289,7 @@ test("stops before a tool follow-up when auth changes from oauth to an api key",
 			stream: async function* () {
 				observed.streamCalls++;
 				yield { type: "tool_call", callId: "call_1", name: "switch_auth", arguments: "{}" };
-				yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+				yield { type: "done", reason: "stop", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 } };
 			},
 		},
 	);
@@ -300,7 +327,7 @@ test("resolves fresh auth before retrying the provider", async () => {
 					yield { type: "error", message: "retry me", retryable: true, retryAfterMs: 0 };
 					return;
 				}
-				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+				yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
 			},
 		},
 	);
@@ -308,7 +335,13 @@ test("resolves fresh auth before retrying the provider", async () => {
 	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "assistant", type: "retry", attempt: 1, maxAttempts: 3, delayMs: 0, message: "retry me" },
-		{ role: "assistant", type: "usage", input: 1, output: 1, total: 2 },
+		{
+			role: "assistant",
+			type: "usage",
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+		},
 		{ role: "assistant", type: "end" },
 	]);
 	assert.deepEqual(observed, { authCalls: 2, streamCalls: 2, providerKeys: ["key-1", "key-2"] });
@@ -431,7 +464,7 @@ test("keeps completed tool history when auth disappears before the next model st
 		{
 			stream: async function* () {
 				yield { type: "tool_call", callId: "call_1", name: "lookup", arguments: "{}" };
-				yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+				yield { type: "done", reason: "stop", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 } };
 			},
 		},
 	);
@@ -439,7 +472,13 @@ test("keeps completed tool history when auth disappears before the next model st
 	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "tool", type: "tool_call", id: "call_1", name: "lookup", arguments: "{}" },
-		{ role: "assistant", type: "usage", input: 2, output: 1, total: 3 },
+		{
+			role: "assistant",
+			type: "usage",
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 },
+		},
 		{ role: "tool", type: "tool_result", id: "call_1", name: "lookup", status: "ok", output: "result" },
 		{ role: "assistant", type: "error", message: "logged out" },
 		{ role: "assistant", type: "end" },
@@ -451,6 +490,9 @@ test("keeps completed tool history when auth disappears before the next model st
 			content: "",
 			toolCalls: [{ callId: "call_1", itemId: undefined, name: "lookup", arguments: "{}" }],
 			reasoning: [],
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 },
 		},
 		{ role: "tool", toolCallId: "call_1", content: "result" },
 	]);
@@ -476,7 +518,7 @@ test("stops a content-filtered turn without saving its response or executing its
 			yield {
 				type: "done",
 				reason: "content_filter",
-				usage: { input: 10, output: 3, total: 13 },
+				usage: { input: 10, output: 3, cacheRead: 0, cacheWrite: 0, total: 13 },
 			};
 		},
 	});
@@ -485,7 +527,13 @@ test("stops a content-filtered turn without saving its response or executing its
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "assistant", type: "message_delta", text: "partial response" },
 		{ role: "tool", type: "tool_call", id: "call_1", name: "lookup", arguments: "{}" },
-		{ role: "assistant", type: "usage", input: 10, output: 3, total: 13 },
+		{
+			role: "assistant",
+			type: "usage",
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 10, output: 3, cacheRead: 0, cacheWrite: 0, total: 13 },
+		},
 		{ role: "assistant", type: "error", message: "The model response was stopped by a content filter" },
 		{ role: "assistant", type: "end" },
 	]);
@@ -502,7 +550,7 @@ test("saves a length-limited response without reporting an error", async () => {
 			yield {
 				type: "done",
 				reason: "length",
-				usage: { input: 8, output: 4, total: 12 },
+				usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, total: 12 },
 			};
 		},
 	});
@@ -510,12 +558,26 @@ test("saves a length-limited response without reporting an error", async () => {
 	assert.deepEqual(await collectEvents(send(harness, "hello")), [
 		{ role: "assistant", type: "auth", mode: "apikey" },
 		{ role: "assistant", type: "message_delta", text: "truncated response" },
-		{ role: "assistant", type: "usage", input: 8, output: 4, total: 12 },
+		{
+			role: "assistant",
+			type: "usage",
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, total: 12 },
+		},
 		{ role: "assistant", type: "end" },
 	]);
 	assert.deepEqual(harness.messages, [
 		{ role: "user", content: "hello" },
-		{ role: "assistant", content: "truncated response", toolCalls: [], reasoning: [] },
+		{
+			role: "assistant",
+			content: "truncated response",
+			toolCalls: [],
+			reasoning: [],
+			provider: "openai",
+			model: "test-model",
+			usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, total: 12 },
+		},
 	]);
 	assert.deepEqual(observed, { streamCalls: 1 });
 });
@@ -525,7 +587,7 @@ test("assigns one stable assistant message id and contiguous offsets to a provid
 		stream: async function* () {
 			yield { type: "delta", text: "hel" };
 			yield { type: "delta", text: "lo" };
-			yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+			yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
 		},
 	});
 	const events = await collectProtocolEvents(send(harness, "hello"), true);
@@ -696,7 +758,7 @@ test("repairs active and queued tool results before reporting the abort", async 
 		stream: async function* () {
 			yield { type: "tool_call", callId: "call_1", name: "first", arguments: "{}" };
 			yield { type: "tool_call", callId: "call_2", name: "second", arguments: "{}" };
-			yield { type: "done", reason: "stop", usage: { input: 3, output: 2, total: 5 } };
+			yield { type: "done", reason: "stop", usage: { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, total: 5 } };
 		},
 	});
 
@@ -754,7 +816,7 @@ test("repairs every advertised tool when cancellation follows provider completio
 	const harness = createHarness(createConfig([lookup]), {
 		stream: async function* () {
 			yield { type: "tool_call", callId: "call_1", name: "lookup", arguments: "{}" };
-			yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+			yield { type: "done", reason: "stop", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 } };
 		},
 	});
 	const events: Array<Record<string, unknown>> = [];
@@ -807,7 +869,7 @@ test("requests another model response after completing the full tool batch", asy
 				yield { type: "tool_call", callId: "call-2", name: "second", arguments: "{}" };
 			}
 			if (observed.providerCalls === 2) assert.equal(observed.toolsFinished, 2);
-			yield { type: "done", reason: "stop", usage: { input: 2, output: 1, total: 3 } };
+			yield { type: "done", reason: "stop", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 } };
 		},
 	});
 	const events = await collectProtocolEvents(send(harness, "initial"));
@@ -837,6 +899,29 @@ test("requests another model response after completing the full tool batch", asy
 	);
 	assert(events.every((event) => event.sessionId === "session-1" && event.turnId === "turn-1"));
 	assert.deepEqual(observed, { providerCalls: 2, toolsFinished: 2 });
+});
+
+test("estimates context from the latest valid assistant usage plus trailing text", () => {
+	const messages: Llm.Message[] = [
+		{ role: "user", content: "old prompt" },
+		{
+			role: "assistant",
+			content: "old answer",
+			provider: "openai",
+			model: "gpt-5.4-mini",
+			usage: { input: 60, output: 40, cacheRead: 0, cacheWrite: 0, reasoning: 20, total: 100 },
+		},
+		{ role: "user", content: "12345678" },
+	];
+
+	assert.equal(estimateContextTokens(messages), 102);
+	assert.equal(
+		estimateContextTokens([
+			{ role: "user", content: "12345678" },
+			{ role: "assistant", content: "1234", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		]),
+		3,
+	);
 });
 
 function createConfig(tools: Tool[] = []): EngineConfig {

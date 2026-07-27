@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
 import OpenAI, { APIUserAbortError } from "openai";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
-import { type Event, stream } from "../src/index.ts";
+import { type Event, normalizeUsage, stream } from "../src/index.ts";
 
 const responsesPrototype = Object.getPrototypeOf(new OpenAI({ apiKey: "test" }).responses) as Pick<
 	OpenAI["responses"],
@@ -20,7 +20,7 @@ test("streams refusal text before completing normally", async (t) => {
 
 	assert.deepEqual(await collectStream(), [
 		{ type: "delta", text: "I can't help with that." },
-		{ type: "done", reason: "stop", usage: { input: 2, output: 3, total: 5 } },
+		{ type: "done", reason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, total: 5 } },
 	]);
 });
 
@@ -42,7 +42,7 @@ test("maps a max-output incomplete response to a length finish", async (t) => {
 	mockStream(t, [incompleteEvent("max_output_tokens")]);
 
 	assert.deepEqual(await collectStream(), [
-		{ type: "done", reason: "length", usage: { input: 2, output: 3, total: 5 } },
+		{ type: "done", reason: "length", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, total: 5 } },
 	]);
 });
 
@@ -50,8 +50,29 @@ test("maps a filtered incomplete response to a content-filter finish", async (t)
 	mockStream(t, [incompleteEvent("content_filter")]);
 
 	assert.deepEqual(await collectStream(), [
-		{ type: "done", reason: "content_filter", usage: { input: 2, output: 3, total: 5 } },
+		{ type: "done", reason: "content_filter", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, total: 5 } },
 	]);
+});
+
+test("separates cached input, cache writes, and reasoning without double counting", () => {
+	const usage = {
+		input_tokens: 13,
+		input_tokens_details: { cached_tokens: 4, cache_write_tokens: 2 },
+		output_tokens: 5,
+		output_tokens_details: { reasoning_tokens: 3 },
+		total_tokens: 18,
+	} as OpenAI.Responses.ResponseUsage & {
+		input_tokens_details: { cached_tokens: number; cache_write_tokens: number };
+	};
+
+	assert.deepEqual(normalizeUsage(usage), {
+		input: 7,
+		output: 5,
+		cacheRead: 4,
+		cacheWrite: 2,
+		reasoning: 3,
+		total: 18,
+	});
 });
 
 test("rejects an incomplete response without a recognized reason", async (t) => {

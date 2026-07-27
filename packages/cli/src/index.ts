@@ -52,6 +52,10 @@ export async function run(): Promise<void> {
 		await runMonitor(positional[1], json);
 		return;
 	}
+	if (positional[0] === "stats" && positional.length === 2) {
+		await runStats(positional[1], json);
+		return;
+	}
 	const prompt = parsePrompt(args);
 	if (!prompt) {
 		writeUsage();
@@ -98,6 +102,52 @@ async function runSessions(json: boolean, all: boolean): Promise<void> {
 	for (const session of body.unreadable) {
 		process.stderr.write(`ker: session ${session.id} is unreadable — ${session.error}\n`);
 	}
+}
+
+async function runStats(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
+	if (!(await checkHealth())) return;
+	const response = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`);
+	if (response.status === 404) {
+		process.stderr.write(`ker: session ${sessionId} was not found\n`);
+		process.exitCode = 1;
+		return;
+	}
+	if (!response.ok) {
+		process.stderr.write(`ker: session ${sessionId} is unreadable (HTTP ${response.status})\n`);
+		process.exitCode = 1;
+		return;
+	}
+	const snapshot = (await response.json()) as Protocol.SessionSnapshot;
+	if (json) {
+		process.stdout.write(
+			`${JSON.stringify({
+				session: snapshot.session,
+				model: snapshot.model ?? null,
+				usage: snapshot.usage,
+			})}\n`,
+		);
+		return;
+	}
+
+	const context = formatTokens(snapshot.usage.contextTokens);
+	const window = snapshot.model?.contextWindow;
+	const percentage = window ? ` (${((snapshot.usage.contextTokens / window) * 100).toFixed(1)}%)` : "";
+	process.stdout.write(`Session: ${snapshot.session.id}\n`);
+	process.stdout.write(
+		snapshot.model ? `Model: ${snapshot.model.provider}/${snapshot.model.id}\n` : "Model: unknown\n",
+	);
+	process.stdout.write(
+		window ? `Context: ${context} / ${formatTokens(window)} tokens${percentage}\n` : `Context: ${context} tokens\n`,
+	);
+	process.stdout.write("Cumulative:\n");
+	process.stdout.write(`  Input: ${formatTokens(snapshot.usage.cumulative.input)}\n`);
+	process.stdout.write(`  Output: ${formatTokens(snapshot.usage.cumulative.output)}\n`);
+	process.stdout.write(`  Cache read: ${formatTokens(snapshot.usage.cumulative.cacheRead)}\n`);
+	process.stdout.write(`  Cache write: ${formatTokens(snapshot.usage.cumulative.cacheWrite)}\n`);
+	if (snapshot.usage.cumulative.reasoning !== undefined) {
+		process.stdout.write(`  Reasoning: ${formatTokens(snapshot.usage.cumulative.reasoning)}\n`);
+	}
+	process.stdout.write(`  Total: ${formatTokens(snapshot.usage.cumulative.total)}\n`);
 }
 
 async function runCancel(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
@@ -551,6 +601,10 @@ function queueIsIdle(queue: Protocol.QueueSnapshot): boolean {
 	return !queue.running && queue.waiting.length === 0;
 }
 
+function formatTokens(tokens: number): string {
+	return tokens.toLocaleString("en-US");
+}
+
 function writeIdle(): void {
 	process.stderr.write("ker: waiting for turns\n");
 }
@@ -629,6 +683,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions [--all] | cancel <id> | monitor <id>\n       ker [--json] --session <id> <prompt>\n       ker daemon | login | logout\n",
+		"usage: ker [--json] new | sessions [--all] | stats <id> | cancel <id> | monitor <id>\n       ker [--json] --session <id> <prompt>\n       ker daemon | login | logout\n",
 	);
 }

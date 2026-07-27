@@ -609,6 +609,80 @@ test("completed history loads after a daemon restart", async (t) => {
 	await second.close();
 });
 
+test("snapshots preserve cumulative usage and current context across restart", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-usage-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const first = await startServer(t, accountingFactory(), { sessionDir }, false);
+	const session = await createSession(first.url);
+	const completed = await prompt(first.url, session.id, "hello");
+	await waitForTerminal(first.url, session.id, completed.turnId);
+	const filtered = await prompt(first.url, session.id, "filtered");
+	await waitForTerminal(first.url, session.id, filtered.turnId);
+	const live = await getSnapshot(first.url, session.id);
+
+	assert.deepEqual(live.model, {
+		provider: "openai",
+		id: "gpt-5.4-mini",
+		contextWindow: 272_000,
+		maxOutputTokens: 128_000,
+	});
+	assert.deepEqual(live.usage, {
+		contextTokens: 19,
+		cumulative: {
+			input: 18,
+			output: 7,
+			cacheRead: 3,
+			cacheWrite: 2,
+			reasoning: 3,
+			total: 30,
+		},
+	});
+	await first.close();
+
+	const second = await startServer(t, accountingFactory(), { sessionDir }, false);
+	assert.deepEqual((await getSnapshot(second.url, session.id)).usage, live.usage);
+	await second.close();
+});
+
+test("multi-step usage is counted once per provider call and restores across restart", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-multi-step-usage-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const first = await startServer(t, multiStepAccountingFactory(), { sessionDir }, false);
+	const session = await createSession(first.url);
+	const admitted = await prompt(first.url, session.id, "calculate");
+	await waitForTerminal(first.url, session.id, admitted.turnId);
+	const live = await getSnapshot(first.url, session.id);
+
+	assert.deepEqual(live.usage, {
+		contextTokens: 50,
+		cumulative: {
+			input: 12,
+			output: 14,
+			cacheRead: 16,
+			cacheWrite: 18,
+			reasoning: 6,
+			total: 60,
+		},
+	});
+	await first.close();
+
+	const second = await startServer(t, multiStepAccountingFactory(), { sessionDir }, false);
+	assert.deepEqual((await getSnapshot(second.url, session.id)).usage, live.usage);
+	await second.close();
+});
+
+test("snapshots keep unknown models without guessed capacity metadata", async (t) => {
+	const running = await startServer(t, accountingFactory("custom-model"));
+	const session = await createSession(running.url);
+	const admitted = await prompt(running.url, session.id, "hello");
+	await waitForTerminal(running.url, session.id, admitted.turnId);
+
+	assert.deepEqual((await getSnapshot(running.url, session.id)).model, {
+		provider: "openai",
+		id: "custom-model",
+	});
+});
+
 test("restored sessions configure their harness with the recorded cwd", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-cwd-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
@@ -946,7 +1020,7 @@ test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
 	const store = new SessionStore({ baseDir: sessionDir });
 	const session = await store.create(process.cwd());
 	const tail = JSON.stringify({
-		version: 2,
+		version: 3,
 		recordId: "tail",
 		previousRecordId: "missing",
 		at: "2026-01-01T00:00:00.000Z",
@@ -1032,6 +1106,158 @@ function immediateFactory(): NonNullable<DaemonOptions["harnessFactory"]> {
 				yield delta(input, messageId, text);
 				state.messages.push({ role: "assistant", content: text, toolCalls: [], reasoning: [] });
 				yield completed(input, messageId);
+				yield end(input);
+			},
+		};
+	};
+}
+
+function accountingFactory(model = "gpt-5.4-mini"): NonNullable<DaemonOptions["harnessFactory"]> {
+	return (initial) => {
+		const state = structuredClone(initial);
+		return {
+			snapshot: () => structuredClone(state),
+			async *send(input) {
+				state.messages.push({ role: "user", content: input.text });
+				yield delivered(input);
+				if (input.text === "filtered") {
+					const usage: Protocol.Usage = {
+						input: 8,
+						output: 3,
+						cacheRead: 1,
+						cacheWrite: 1,
+						reasoning: 1,
+						total: 13,
+					};
+					yield {
+						actor: "process",
+						sessionId: input.sessionId,
+						turnId: input.turnId,
+						type: "usage",
+						provider: "openai",
+						model,
+						usage,
+					};
+					yield {
+						actor: "process",
+						sessionId: input.sessionId,
+						turnId: input.turnId,
+						type: "error",
+						message: "The model response was stopped by a content filter",
+					};
+					yield end(input);
+					return;
+				}
+				const messageId = randomUUID();
+				const text = `answer:${input.text}`;
+				const usage: Protocol.Usage = {
+					input: 10,
+					output: 4,
+					cacheRead: 2,
+					cacheWrite: 1,
+					reasoning: 2,
+					total: 17,
+				};
+				yield delta(input, messageId, text);
+				state.messages.push({
+					role: "assistant",
+					content: text,
+					toolCalls: [],
+					reasoning: [],
+					provider: "openai",
+					model,
+					usage,
+				});
+				yield completed(input, messageId);
+				yield {
+					actor: "process",
+					sessionId: input.sessionId,
+					turnId: input.turnId,
+					type: "usage",
+					provider: "openai",
+					model,
+					usage,
+				};
+				yield end(input);
+			},
+		};
+	};
+}
+
+function multiStepAccountingFactory(): NonNullable<DaemonOptions["harnessFactory"]> {
+	return (initial) => {
+		const state = structuredClone(initial);
+		return {
+			snapshot: () => structuredClone(state),
+			async *send(input) {
+				const model = "gpt-5.4-mini";
+				const firstMessageId = randomUUID();
+				const firstUsage: Protocol.Usage = {
+					input: 1,
+					output: 2,
+					cacheRead: 3,
+					cacheWrite: 4,
+					reasoning: 1,
+					total: 10,
+				};
+				const secondMessageId = randomUUID();
+				const secondUsage: Protocol.Usage = {
+					input: 11,
+					output: 12,
+					cacheRead: 13,
+					cacheWrite: 14,
+					reasoning: 5,
+					total: 50,
+				};
+
+				state.messages.push({ role: "user", content: input.text });
+				yield delivered(input);
+				yield {
+					actor: "agent",
+					modelRole: "assistant",
+					sessionId: input.sessionId,
+					turnId: input.turnId,
+					type: "tool_call",
+					messageId: firstMessageId,
+					id: "call-1",
+					name: "calculate",
+					arguments: "{}",
+				};
+				state.messages.push({
+					role: "assistant",
+					content: "",
+					toolCalls: [{ callId: "call-1", name: "calculate", arguments: "{}" }],
+					reasoning: [],
+					provider: "openai",
+					model,
+					usage: firstUsage,
+				});
+				yield completed(input, firstMessageId);
+				yield usageEvent(input, model, firstUsage);
+				state.messages.push({ role: "tool", toolCallId: "call-1", content: "42" });
+				yield {
+					actor: "process",
+					modelRole: "tool",
+					sessionId: input.sessionId,
+					turnId: input.turnId,
+					type: "tool_result",
+					id: "call-1",
+					name: "calculate",
+					status: "ok",
+					output: "42",
+				};
+				yield delta(input, secondMessageId, "42");
+				state.messages.push({
+					role: "assistant",
+					content: "42",
+					toolCalls: [],
+					reasoning: [],
+					provider: "openai",
+					model,
+					usage: secondUsage,
+				});
+				yield completed(input, secondMessageId);
+				yield usageEvent(input, model, secondUsage);
 				yield end(input);
 			},
 		};
@@ -1327,6 +1553,18 @@ function completed(message: Engine.UserMessage, messageId: string): Protocol.Ass
 		type: "assistant_message_completed",
 		messageId,
 		reason: "completed",
+	};
+}
+
+function usageEvent(message: Engine.UserMessage, model: string, usage: Protocol.Usage): Protocol.UsageEvent {
+	return {
+		actor: "process",
+		sessionId: message.sessionId,
+		turnId: message.turnId,
+		type: "usage",
+		provider: "openai",
+		model,
+		usage,
 	};
 }
 

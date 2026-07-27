@@ -40,12 +40,20 @@ test("session FIFO runs beside another session and survives exact cancellation",
 					}
 					if (text === "reply with second") {
 						yield { type: "delta", text: "reply with second" };
-						yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+						yield {
+							type: "done",
+							reason: "stop",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+						};
 						return;
 					}
 					if (text === "reply with session B") {
 						yield { type: "delta", text: "reply with session B" };
-						yield { type: "done", reason: "stop", usage: { input: 1, output: 1, total: 2 } };
+						yield {
+							type: "done",
+							reason: "stop",
+							usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+						};
 						return;
 					}
 					yield { type: "error", message: `Unexpected test prompt: ${text}`, retryable: false };

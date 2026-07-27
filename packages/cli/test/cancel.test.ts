@@ -137,11 +137,19 @@ function snapshot(queueSnapshot: Protocol.QueueSnapshot): Protocol.SessionSnapsh
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 		},
+		usage: emptyUsage(),
 		entries: [],
 		messages: [],
 		turns: [],
 		queue: queueSnapshot,
 		cursor: { epoch: "epoch-1", sequence: 0 },
+	};
+}
+
+function emptyUsage(): Protocol.SessionUsage {
+	return {
+		contextTokens: 0,
+		cumulative: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
 
