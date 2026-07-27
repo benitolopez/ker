@@ -134,6 +134,16 @@ test("session FIFO runs beside another session and survives exact cancellation",
 	assert.equal(monitor.child.exitCode, null);
 	assert.equal(monitor.child.signalCode, null);
 
+	const continuedA = startCli(["-c", "reply with second"], daemonUrl);
+	children.add(continuedA.child);
+	assert.deepEqual(await waitForClose(continuedA), { code: 0, signal: null });
+	assert.equal(continuedA.stdout.join(""), "reply with second\n");
+
+	const latestStats = startCli(["stats"], daemonUrl);
+	children.add(latestStats.child);
+	assert.deepEqual(await waitForClose(latestStats), { code: 0, signal: null });
+	assert.equal(latestStats.stdout.join("").startsWith(`Session: ${sessionA.id}\n`), true);
+
 	assert.equal(monitor.child.kill("SIGINT"), true);
 	const monitorExit = await waitForClose(monitor);
 	assert.deepEqual(monitorExit, { code: 0, signal: null });

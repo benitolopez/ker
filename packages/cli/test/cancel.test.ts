@@ -23,6 +23,26 @@ test("cancel targets the captured running turn and supports JSON output", async 
 	assert.equal(controlled.stderr.join(""), "");
 });
 
+test("cancel defaults to the latest session for the current directory", async (t) => {
+	const controlled = controlCancel(
+		t,
+		["cancel"],
+		snapshot(queue()),
+		jsonResponse({ status: "cancelling", sessionId: "session-1", turnId: "turn-1" }, 202),
+	);
+
+	await run();
+
+	assert.deepEqual(controlled.paths, [
+		"/health",
+		"/sessions",
+		"/health",
+		"/sessions/session-1",
+		"/sessions/session-1/turns/turn-1/cancel",
+	]);
+	assert.equal(controlled.stderr.join(""), "ker: cancelling (turn turn-1)\n");
+});
+
 test("cancel reports an idle queue without sending a request", async (t) => {
 	const controlled = controlCancel(t, ["cancel", "session-1"], snapshot({ revision: 4, waiting: [] }));
 
@@ -96,6 +116,9 @@ function controlCancel(
 		const path = new URL(String(input)).pathname;
 		paths.push(path);
 		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION }, 200);
+		if (path === "/sessions") {
+			return jsonResponse({ sessions: [snapshot(queue()).session], unreadable: [] }, 200);
+		}
 		if (path === "/sessions/session-1") {
 			return sessionSnapshot instanceof Response ? sessionSnapshot : jsonResponse(sessionSnapshot, 200);
 		}

@@ -8,9 +8,20 @@ import { sseData } from "./sse.ts";
 
 const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
 
-interface ParsedPrompt {
+interface ResolvedPrompt {
 	json: boolean;
 	sessionId: Protocol.SessionId;
+	text: string;
+}
+
+type PromptTarget =
+	| { kind: "new" }
+	| { kind: "latest" }
+	| { kind: "session"; id: Protocol.SessionId };
+
+interface PromptArgs {
+	json: boolean;
+	target: PromptTarget;
 	text: string;
 }
 
@@ -44,16 +55,28 @@ export async function run(): Promise<void> {
 		await runSessions(json, all);
 		return;
 	}
-	if (positional[0] === "cancel" && positional.length === 2) {
-		await runCancel(positional[1], json);
+	if (positional[0] === "cancel" && positional.length <= 2) {
+		const sessionId = positional[1] ?? (await resolveLatestSession());
+		if (!sessionId) return;
+		await runCancel(sessionId, json);
 		return;
 	}
-	if (positional[0] === "monitor" && positional.length === 2) {
-		await runMonitor(positional[1], json);
+	if (positional[0] === "monitor" && positional.length <= 2) {
+		const sessionId = positional[1] ?? (await resolveLatestSession());
+		if (!sessionId) return;
+		await runMonitor(sessionId, json);
 		return;
 	}
-	if (positional[0] === "stats" && positional.length === 2) {
-		await runStats(positional[1], json);
+	if (positional[0] === "stats" && positional.length <= 2) {
+		const sessionId = positional[1] ?? (await resolveLatestSession());
+		if (!sessionId) return;
+		await runStats(sessionId, json);
+		return;
+	}
+	const commands = ["daemon", "login", "logout", "new", "sessions", "stats", "cancel", "monitor"];
+	if (positional[0] !== undefined && commands.includes(positional[0])) {
+		writeUsage();
+		process.exitCode = 1;
 		return;
 	}
 	const prompt = parsePrompt(args);
@@ -62,10 +85,23 @@ export async function run(): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	await runPrompt(prompt);
+	if (prompt.target.kind === "session") {
+		await runPrompt({ json: prompt.json, sessionId: prompt.target.id, text: prompt.text });
+		return;
+	}
+	const sessionId =
+		prompt.target.kind === "latest" ? await resolveLatestSession() : (await createSession())?.id;
+	if (!sessionId) return;
+	await runPrompt({ json: prompt.json, sessionId, text: prompt.text });
 }
 
 async function runNewSession(json: boolean): Promise<void> {
+	const session = await createSession();
+	if (!session) return;
+	process.stdout.write(json ? `${JSON.stringify(session)}\n` : `${session.id}\n`);
+}
+
+async function createSession(): Promise<Protocol.SessionDescriptor | undefined> {
 	if (!(await checkHealth())) return;
 	const request: Protocol.CreateSessionRequest = { cwd: process.cwd() };
 	const res = await fetch(`${BASE}/sessions`, {
@@ -78,8 +114,7 @@ async function runNewSession(json: boolean): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const session = (await res.json()) as Protocol.SessionDescriptor;
-	process.stdout.write(json ? `${JSON.stringify(session)}\n` : `${session.id}\n`);
+	return (await res.json()) as Protocol.SessionDescriptor;
 }
 
 async function runSessions(json: boolean, all: boolean): Promise<void> {
@@ -102,6 +137,29 @@ async function runSessions(json: boolean, all: boolean): Promise<void> {
 	for (const session of body.unreadable) {
 		process.stderr.write(`ker: session ${session.id} is unreadable — ${session.error}\n`);
 	}
+}
+
+async function resolveLatestSession(): Promise<Protocol.SessionId | undefined> {
+	if (!(await checkHealth())) return undefined;
+	const query = new URLSearchParams({ cwd: process.cwd() });
+	const res = await fetch(`${BASE}/sessions?${query}`);
+	if (!res.ok) {
+		process.stderr.write(`ker: daemon could not list sessions (HTTP ${res.status})\n`);
+		process.exitCode = 1;
+		return undefined;
+	}
+	const body = (await res.json()) as Protocol.ListSessionsResponse;
+	// The daemon lists sessions createdAt-ascending, so >= resolves an updatedAt tie to the later-created one.
+	const latest = body.sessions.reduce<Protocol.SessionDescriptor | undefined>(
+		(current, session) => (!current || session.updatedAt >= current.updatedAt ? session : current),
+		undefined,
+	);
+	if (latest) return latest.id;
+	process.stderr.write(
+		`ker: no session for ${process.cwd()} — start one with \`ker <prompt>\` or \`ker new\`\n`,
+	);
+	process.exitCode = 1;
+	return undefined;
 }
 
 async function runStats(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
@@ -273,7 +331,7 @@ async function runMonitor(sessionId: Protocol.SessionId, json: boolean): Promise
 }
 
 // A prompt subscribes before admission, waits through its session queue, and cancels only its exact turn.
-async function runPrompt(prompt: ParsedPrompt): Promise<void> {
+async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 	const controller = new AbortController();
 	const renderer = new Renderer();
 	let accepted: Protocol.PromptAdmission | undefined;
@@ -585,16 +643,26 @@ class Renderer {
 	}
 }
 
-function parsePrompt(args: string[]): ParsedPrompt | undefined {
-	const values = args.filter((arg) => arg !== "--json");
-	const json = values.length !== args.length;
+function parsePrompt(args: string[]): PromptArgs | undefined {
+	const withoutJson = args.filter((arg) => arg !== "--json");
+	const json = withoutJson.length !== args.length;
+	const values = withoutJson.filter((arg) => arg !== "-c" && arg !== "--continue");
+	const continueFlag = values.length !== withoutJson.length;
 	const sessionIndex = values.indexOf("--session");
-	if (sessionIndex === -1 || !values[sessionIndex + 1]) return undefined;
-	const sessionId = values[sessionIndex + 1];
-	values.splice(sessionIndex, 2);
+	const sessionId = sessionIndex === -1 ? undefined : values[sessionIndex + 1];
+	if (sessionIndex !== -1) {
+		if (!sessionId) return undefined;
+		values.splice(sessionIndex, 2);
+	}
+	if (continueFlag && sessionId) return undefined;
 	const text = values.join(" ").trim();
-	if (!text || values.some((value) => value.startsWith("--"))) return undefined;
-	return { json, sessionId, text };
+	if (!text || values.some((value) => value.startsWith("-"))) return undefined;
+	const target: PromptTarget = sessionId
+		? { kind: "session", id: sessionId }
+		: continueFlag
+			? { kind: "latest" }
+			: { kind: "new" };
+	return { json, target, text };
 }
 
 function queueIsIdle(queue: Protocol.QueueSnapshot): boolean {
@@ -683,6 +751,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions [--all] | stats <id> | cancel <id> | monitor <id>\n       ker [--json] --session <id> <prompt>\n       ker daemon | login | logout\n",
+		"usage: ker [--json] new | sessions [--all] | stats [id] | cancel [id] | monitor [id]\n       ker [--json] [--session <id> | -c|--continue] <prompt>\n       ker daemon | login | logout\n",
 	);
 }

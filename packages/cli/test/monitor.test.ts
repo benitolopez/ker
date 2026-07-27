@@ -228,6 +228,24 @@ test("monitor", async (t) => {
 		await running;
 	});
 
+	await t.test("defaults to the latest session for the current directory", async (t) => {
+		const controlled = controlMonitor(t, { args: ["monitor"] });
+		const running = run();
+		await controlled.firstSubscribed.promise;
+
+		assert.deepEqual(controlled.paths.slice(0, 5), [
+			"/health",
+			"/sessions",
+			"/health",
+			"/sessions/session-1",
+			"/sessions/session-1/events",
+		]);
+		controlled.closeFirst();
+		await controlled.followingSubscribed.promise;
+		findNewSignalListener(controlled.signalListeners)("SIGINT");
+		await running;
+	});
+
 	await t.test("resnapshots append only newly discovered conversation output and status", async (t) => {
 		const controlled = controlMonitor(t, {
 			initial: resyncInitialSnapshot(),
@@ -308,7 +326,12 @@ interface ControlledMonitor {
 
 function controlMonitor(
 	t: TestContext,
-	options: { json?: boolean; initial?: Protocol.SessionSnapshot; recovered?: Protocol.SessionSnapshot } = {},
+	options: {
+		args?: string[];
+		json?: boolean;
+		initial?: Protocol.SessionSnapshot;
+		recovered?: Protocol.SessionSnapshot;
+	} = {},
 ): ControlledMonitor {
 	const writeStdout = process.stdout.write.bind(process.stdout);
 	const originalFetch = globalThis.fetch;
@@ -331,7 +354,12 @@ function controlMonitor(
 	let snapshotCalls = 0;
 	let eventCalls = 0;
 
-	process.argv = [process.execPath, "ker", ...(options.json ? ["--json"] : []), "monitor", "session-1"];
+	process.argv = [
+		process.execPath,
+		"ker",
+		...(options.json ? ["--json"] : []),
+		...(options.args ?? ["monitor", "session-1"]),
+	];
 	process.exitCode = undefined;
 	t.mock.method(process.stderr, "write", (chunk: string | Uint8Array) => {
 		const text = String(chunk);
@@ -349,6 +377,9 @@ function controlMonitor(
 		const path = new URL(String(input)).pathname;
 		paths.push(path);
 		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION }, 200);
+		if (path === "/sessions") {
+			return jsonResponse({ sessions: [session()], unreadable: [] }, 200);
+		}
 		if (path === "/sessions/session-1") {
 			snapshotCalls++;
 			return jsonResponse(

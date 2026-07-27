@@ -102,7 +102,7 @@ test("external cancellation reports both transitions and exits 130", async (t) =
 	assert.equal(process.exitCode, 130);
 });
 
-test("rejects attach and obsolete placement flags through usage handling", async (t) => {
+test("rejects malformed prompts and commands through usage handling", async (t) => {
 	const originalArgv = process.argv;
 	const originalExitCode = process.exitCode;
 	const stderr: string[] = [];
@@ -115,16 +115,19 @@ test("rejects attach and obsolete placement flags through usage handling", async
 		process.exitCode = originalExitCode;
 	});
 	for (const args of [
-		["attach", "session-1"],
 		["--session", "session-1", "--to-turn", "turn-1", "steer"],
 		["--session", "session-1", "--after-turn", "turn-1", "next"],
+		["--session", "session-1", "-c", "hello"],
+		["-c"],
+		["-j", "hello"],
+		["stats", "a", "b"],
 	]) {
 		process.argv = [process.execPath, "ker", ...args];
 		process.exitCode = undefined;
 		await run();
 		assert.equal(process.exitCode, 1);
 	}
-	assert.equal(stderr.filter((line) => line.startsWith("usage: ker")).length, 3);
+	assert.equal(stderr.filter((line) => line.startsWith("usage: ker")).length, 6);
 });
 
 test("--json prints the snapshot and raw event envelopes", async (t) => {

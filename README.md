@@ -99,33 +99,37 @@ Run these from the repo root. Start the daemon in one terminal (it listens on `1
 npx ker daemon
 ```
 
-Create a session and save its printed ID in a shell variable:
+Start a new session with a prompt, then continue the latest session for the exact current directory:
+
+```sh
+npx ker "my name is Beni"
+npx ker -c "what's my name?"
+```
+
+The first command creates the session without printing its ID. To select a session explicitly, create
+one separately and pass its printed ID with `--session`:
 
 ```sh
 SESSION_ID="$(npx ker new)"
-echo "$SESSION_ID"
-```
-
-To find an existing session ID later, run `npx ker sessions`; the ID is the first column. Send
-prompts to the selected session with:
-
-```sh
 npx ker --session "$SESSION_ID" "my name is Beni"
 npx ker --session "$SESSION_ID" "what's my name?"
 ```
 
-List this project's sessions or monitor one. Monitor renders the current conversation state in turn
-order, then follows new turns. Assistant text is the only monitor output written to stdout. Delivered,
-running, and waiting prompts are prefixed with `> ` on stderr; developer notices, lifecycle status,
-and errors are prefixed with `ker: ` there. Tool calls, tool results, reasoning, usage, retries, and
-authentication events stay omitted from human output. Historical status banners are suppressed, but
-current and future cancellation or failure transitions remain visible. Ctrl-C only stops the monitor
-and never cancels work. An idle monitor prints `ker: waiting for turns` to stderr and continues
-following:
+To find a session ID later, run `npx ker sessions`; the ID is the first column. `stats`, `cancel`, and
+`monitor` accept an optional ID and default to the latest session for the exact current directory.
+
+Monitor renders the current conversation state in turn order, then follows new turns. Assistant text
+is the only monitor output written to stdout. Delivered, running, and waiting prompts are prefixed
+with `> ` on stderr; developer notices, lifecycle status, and errors are prefixed with `ker: ` there.
+Tool calls, tool results, reasoning, usage, retries, and authentication events stay omitted from
+human output. Historical status banners are suppressed, but current and future cancellation or
+failure transitions remain visible. Ctrl-C only stops the monitor and never cancels work. An idle
+monitor prints `ker: waiting for turns` to stderr and continues following:
 
 ```sh
 npx ker sessions
-npx ker monitor "$SESSION_ID"
+npx ker stats
+npx ker monitor
 ```
 
 `npx ker --json monitor "$SESSION_ID"` keeps the diagnostic wire view unchanged: it prints the initial
@@ -135,7 +139,7 @@ resync. The event tail is bounded, so this feed does not promise a complete hist
 Cancel the exact running or cancelling turn captured from one session:
 
 ```sh
-npx ker cancel "$SESSION_ID"
+npx ker cancel
 npx ker --json cancel "$SESSION_ID"
 ```
 

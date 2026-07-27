@@ -28,6 +28,16 @@ test("stats prints the model, context capacity, and cumulative token breakdown",
 	assert.equal(controlled.stderr.join(""), "");
 });
 
+test("stats defaults to the latest session for the current directory", async (t) => {
+	const controlled = controlStats(t, ["stats"], jsonResponse(snapshot()));
+
+	await run();
+
+	assert.deepEqual(controlled.paths, ["/health", "/sessions", "/health", "/sessions/session-1"]);
+	assert.match(controlled.stdout.join(""), /^Session: session-1\n/);
+	assert.equal(controlled.stderr.join(""), "");
+});
+
 test("stats JSON emits only the session, model, and usage snapshot", async (t) => {
 	const current = snapshot();
 	const controlled = controlStats(t, ["--json", "stats", "session-1"], jsonResponse(current));
@@ -57,6 +67,7 @@ test("stats reports missing and unreadable sessions", async (t) => {
 });
 
 interface ControlledStats {
+	paths: string[];
 	stderr: string[];
 	stdout: string[];
 }
@@ -65,6 +76,7 @@ function controlStats(t: TestContext, args: string[], response: Response): Contr
 	const originalFetch = globalThis.fetch;
 	const originalArgv = process.argv;
 	const originalExitCode = process.exitCode;
+	const paths: string[] = [];
 	const stderr: string[] = [];
 	const stdout: string[] = [];
 
@@ -80,7 +92,11 @@ function controlStats(t: TestContext, args: string[], response: Response): Contr
 	});
 	globalThis.fetch = async (input): Promise<Response> => {
 		const path = new URL(String(input)).pathname;
+		paths.push(path);
 		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION });
+		if (path === "/sessions") {
+			return jsonResponse({ sessions: [snapshot().session], unreadable: [] });
+		}
 		if (path.startsWith("/sessions/")) return response;
 		throw new Error(`Unexpected request to ${path}`);
 	};
@@ -89,7 +105,7 @@ function controlStats(t: TestContext, args: string[], response: Response): Contr
 		process.argv = originalArgv;
 		process.exitCode = originalExitCode;
 	});
-	return { stderr, stdout };
+	return { paths, stderr, stdout };
 }
 
 function snapshot(): Protocol.SessionSnapshot {
