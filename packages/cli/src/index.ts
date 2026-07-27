@@ -14,10 +14,7 @@ interface ResolvedPrompt {
 	text: string;
 }
 
-type PromptTarget =
-	| { kind: "new" }
-	| { kind: "latest" }
-	| { kind: "session"; id: Protocol.SessionId };
+type PromptTarget = { kind: "new" } | { kind: "latest" } | { kind: "session"; id: Protocol.SessionId };
 
 interface PromptArgs {
 	json: boolean;
@@ -89,8 +86,7 @@ export async function run(): Promise<void> {
 		await runPrompt({ json: prompt.json, sessionId: prompt.target.id, text: prompt.text });
 		return;
 	}
-	const sessionId =
-		prompt.target.kind === "latest" ? await resolveLatestSession() : (await createSession())?.id;
+	const sessionId = prompt.target.kind === "latest" ? await resolveLatestSession() : (await createSession())?.id;
 	if (!sessionId) return;
 	await runPrompt({ json: prompt.json, sessionId, text: prompt.text });
 }
@@ -155,9 +151,7 @@ async function resolveLatestSession(): Promise<Protocol.SessionId | undefined> {
 		undefined,
 	);
 	if (latest) return latest.id;
-	process.stderr.write(
-		`ker: no session for ${process.cwd()} — start one with \`ker <prompt>\` or \`ker new\`\n`,
-	);
+	process.stderr.write(`ker: no session for ${process.cwd()} — start one with \`ker <prompt>\` or \`ker new\`\n`);
 	process.exitCode = 1;
 	return undefined;
 }

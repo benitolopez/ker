@@ -45,7 +45,10 @@ test("a bare prompt stops when session creation fails", async (t) => {
 
 	assert.equal(controlled.stderr.join(""), "ker: daemon could not create a session (HTTP 500)\n");
 	assert.equal(process.exitCode, 1);
-	assert.equal(controlled.paths.some((path) => path.endsWith("/prompts")), false);
+	assert.equal(
+		controlled.paths.some((path) => path.endsWith("/prompts")),
+		false,
+	);
 });
 
 test("-c and --continue select the greatest updatedAt rather than list order", async (t) => {
@@ -89,7 +92,10 @@ test("-c reports when the current directory has no sessions", async (t) => {
 
 	assert.match(controlled.stderr.join(""), /ker: no session for .* — start one with `ker <prompt>` or `ker new`/);
 	assert.equal(process.exitCode, 1);
-	assert.equal(controlled.paths.some((path) => path.endsWith("/prompts")), false);
+	assert.equal(
+		controlled.paths.some((path) => path.endsWith("/prompts")),
+		false,
+	);
 });
 
 interface ControlledPrompt {
@@ -238,10 +244,7 @@ function controlPrompt(
 	};
 }
 
-function descriptor(
-	id: Protocol.SessionId,
-	updatedAt = "2026-01-01T00:00:00.000Z",
-): Protocol.SessionDescriptor {
+function descriptor(id: Protocol.SessionId, updatedAt = "2026-01-01T00:00:00.000Z"): Protocol.SessionDescriptor {
 	return {
 		id,
 		cwd: process.cwd(),
