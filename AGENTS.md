@@ -162,7 +162,7 @@ const table = sqliteTable("session", {
 
 ## Commands
 
-- Never run `npm run build` or `npm test` unless requested by the user.
+- Never run `npm run build` unless requested by the user.
 - Never commit unless the user asks.
 
 ## Git
