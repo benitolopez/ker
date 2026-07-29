@@ -1567,27 +1567,94 @@ test("repeat compaction uses the latest summary and the next prompt persists no 
 	);
 });
 
-test("automatic compaction stays latched until a prompt usage event rearms it", { timeout: 10_000 }, async (t) => {
-	const requests: Engine.CompactionRequest[] = [];
-	const running = await startServer(t, compactionFactory(requests, "skipped"), {
-		compaction: { enabled: true, reserveTokens: 271_999, keepRecentTokens: 1, prune: false },
-	});
+// The backoff tests drive the context estimate directly: each prompt's text is the token total the
+// fake assistant reports, and it becomes the whole estimate because it anchors the last message.
+// With reserveTokens 200_000 the trigger is 72_000, and a failure at 80_000 re-arms at
+// 80_000 + (272_000 − 80_000) / 2 = 176_000.
+test("a failed automatic compaction waits for the context to grow before retrying", async (t) => {
+	const controlled = backoffFactory();
+	const running = await startServer(t, controlled.factory, { compaction: BACKOFF_COMPACTION });
 	const session = await createSession(running.url);
-	const first = await prompt(running.url, session.id, "first");
-	await waitForCompactionAttempts(running.url, session.id, requests, 1);
-	assert.equal(requests.length, 1);
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(requests.length, 1);
 
-	const second = await prompt(running.url, session.id, "second");
-	assert.equal(second.status, "running");
-	assert.equal(second.queue.running?.kind, "prompt");
-	await waitForCompactionAttempts(running.url, session.id, requests, 2);
+	await prompt(running.url, session.id, "80000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
 
-	const snapshot = await getSnapshot(running.url, session.id);
-	assert.equal(snapshot.turns.find((turn) => turn.id === first.turnId)?.status, "completed");
-	assert.equal(snapshot.turns.find((turn) => turn.id === second.turnId)?.status, "completed");
-	assert.equal(requests.length, 2);
+	await prompt(running.url, session.id, "100000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
+
+	await prompt(running.url, session.id, "180000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 2);
+});
+
+test("a transient compaction failure retries on the next prompt turn without looping", async (t) => {
+	const controlled = backoffFactory("retryable");
+	const running = await startServer(t, controlled.factory, { compaction: BACKOFF_COMPACTION });
+	const session = await createSession(running.url);
+
+	await prompt(running.url, session.id, "80000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
+
+	await prompt(running.url, session.id, "90000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 2);
+});
+
+test("a skipped automatic compaction backs off like a failure", async (t) => {
+	const controlled = backoffFactory("skipped");
+	const running = await startServer(t, controlled.factory, { compaction: BACKOFF_COMPACTION });
+	const session = await createSession(running.url);
+
+	await prompt(running.url, session.id, "80000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
+
+	await prompt(running.url, session.id, "100000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
+});
+
+test("a successful compaction clears the backoff and reports no failure", async (t) => {
+	const controlled = backoffFactory();
+	const running = await startServer(t, controlled.factory, { compaction: BACKOFF_COMPACTION });
+	const session = await createSession(running.url);
+
+	await prompt(running.url, session.id, "80000");
+	const failed = await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
+	assert.match(failed.compactionFailure?.message ?? "", /^Compaction did not reduce the context \(\d+ → \d+ tokens\)$/);
+
+	controlled.mode.outcome = "compacted";
+	const manual = await readJson<Protocol.CompactionAdmission>((await rawCompact(running.url, session.id, {})).body);
+	await waitForTerminal(running.url, session.id, manual.turnId);
+	assert.equal(controlled.requests.length, 2);
+	assert.equal((await getSnapshot(running.url, session.id)).compactionFailure, undefined);
+
+	await prompt(running.url, session.id, "100000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 3);
+});
+
+test("a cancelled automatic compaction does not back off", async (t) => {
+	const controlled = backoffFactory("hang");
+	const running = await startServer(t, controlled.factory, { compaction: BACKOFF_COMPACTION });
+	const session = await createSession(running.url);
+
+	await prompt(running.url, session.id, "80000");
+	await controlled.started.promise;
+	const running_ = (await getSnapshot(running.url, session.id)).queue.running;
+	assert.equal(running_?.kind, "compaction");
+	await localFetch(`${running.url}/sessions/${session.id}/turns/${running_?.turnId}/cancel`, { method: "POST" });
+	controlled.mode.outcome = "gate-fail";
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
+
+	await prompt(running.url, session.id, "90000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 2);
 });
 
 test("an over-ceiling idle session compacts before admitting its next prompt", async (t) => {
@@ -2060,6 +2127,76 @@ test("shutdown aborts and awaits active turns in every session", async (t) => {
 	await closing;
 	await Promise.all([controlled.finished(0), controlled.finished(1)]);
 });
+
+const BACKOFF_COMPACTION: NonNullable<DaemonOptions["compaction"]> = {
+	enabled: true,
+	prune: true,
+	reserveTokens: 200_000,
+	keepRecentTokens: 1,
+};
+
+type BackoffOutcome = "gate-fail" | "retryable" | "skipped" | "compacted" | "hang";
+
+// Reports the prompt text as the turn's token total, so a test sets the context estimate by naming it.
+function backoffFactory(outcome: BackoffOutcome = "gate-fail") {
+	const requests: Engine.CompactionRequest[] = [];
+	const mode = { outcome };
+	const started = Promise.withResolvers<void>();
+	const factory: NonNullable<DaemonOptions["harnessFactory"]> = (initial) => {
+		const state = structuredClone(initial);
+		return {
+			snapshot: () => structuredClone(state),
+			async *compact(input, signal) {
+				requests.push(structuredClone(input));
+				if (mode.outcome === "hang") {
+					started.resolve();
+					await waitForAbort(signal);
+					return { kind: "aborted" };
+				}
+				if (mode.outcome === "skipped") return { kind: "skipped", reason: "nothing_to_compact" };
+				if (mode.outcome === "retryable") return { kind: "stopped", retryable: true };
+				yield {
+					actor: "process",
+					sessionId: input.sessionId,
+					turnId: input.turnId,
+					type: "usage",
+					provider: "openai",
+					model: "gpt-5.4-mini",
+					usage: { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, total: 5 },
+				};
+				const kept = state.messages.slice(-1).map(Engine.stripAssistantUsage);
+				const before = Engine.estimateContextTokens(state.messages.map(Engine.stripAssistantUsage));
+				return {
+					kind: "compacted",
+					summary: "summary",
+					keptCount: kept.length,
+					tokensBefore: before,
+					tokensAfter: mode.outcome === "gate-fail" ? before + 1 : 1,
+					messages: [Engine.compactionSummaryMessage("summary"), ...kept],
+				};
+			},
+			async *send(input) {
+				const total = Number(input.text);
+				const usage: Protocol.Usage = { input: total, output: 0, cacheRead: 0, cacheWrite: 0, total };
+				state.messages.push({ role: "user", content: input.text });
+				yield delivered(input);
+				const messageId = randomUUID();
+				yield delta(input, messageId, "ok");
+				state.messages.push({
+					role: "assistant",
+					content: "ok",
+					provider: "openai",
+					model: "gpt-5.4-mini",
+					usage,
+				});
+				yield completed(input, messageId);
+				yield usageEvent(input, "gpt-5.4-mini", usage);
+				yield end(input);
+			},
+		};
+	};
+	return { requests, mode, started, factory };
+}
 
 function compactionFactory(
 	requests: Engine.CompactionRequest[],
@@ -2922,6 +3059,14 @@ async function waitForCompaction(url: string, sessionId: string, promptTurnId: s
 		) {
 			throw new Error(`Automatic compaction ended with status ${compactionTurn.status}`);
 		}
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+}
+
+async function waitForIdle(url: string, sessionId: string): Promise<Protocol.SessionSnapshot> {
+	while (true) {
+		const snapshot = await getSnapshot(url, sessionId);
+		if (!snapshot.queue.running && snapshot.queue.waiting.length === 0) return snapshot;
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 }

@@ -120,6 +120,8 @@ interface SessionState {
 	queueLock: Promise<void>;
 	activeTurn?: ActiveTurn;
 	compactionAttempted: boolean;
+	compactionBackoffTokens?: number;
+	compactionFailure?: { turnId: Protocol.TurnId; message: string };
 }
 
 type CatalogEntry = CatalogedSession & { stored?: StoredSession };
@@ -219,6 +221,7 @@ class Registry {
 					contextTokens: Engine.estimateContextTokens(state.harness.snapshot().messages),
 					cumulative: { ...state.cumulativeUsage },
 				},
+				compactionFailure: state.compactionFailure ? { ...state.compactionFailure } : undefined,
 				entries: state.stored.records.flatMap((record) => {
 					if (record.type === "conversation") return [toConversationEntry(record)];
 					if (record.type === "compaction") return [toCompactionEntry(record)];
@@ -672,18 +675,16 @@ class Registry {
 					return;
 				}
 				if (failure !== undefined) {
-					await this.#recordHarnessEvent(state, {
-						actor: "process",
-						...scope,
-						type: "error",
-						message: failure.error instanceof Error ? failure.error.message : String(failure.error),
-					});
+					const message = failure.error instanceof Error ? failure.error.message : String(failure.error);
+					await this.#recordHarnessEvent(state, { actor: "process", ...scope, type: "error", message });
+					this.#backOffCompaction(state, item, message);
 					await this.#finishTurn(state, turn, "error");
 					state.activeTurn = undefined;
 					await this.#advanceQueue(state, item.id);
 					return;
 				}
 				if (!outcome || outcome.kind === "stopped" || outcome.kind === "aborted") {
+					if (!(outcome?.kind === "stopped" && outcome.retryable)) this.#backOffCompaction(state, item);
 					await this.#finishTurn(state, turn, "error");
 					state.activeTurn = undefined;
 					await this.#advanceQueue(state, item.id);
@@ -696,6 +697,7 @@ class Registry {
 						type: "compaction_skipped",
 						reason: outcome.reason,
 					});
+					this.#backOffCompaction(state, item);
 					await this.#finishTurn(state, turn);
 					state.activeTurn = undefined;
 					await this.#advanceQueue(state, item.id);
@@ -723,6 +725,7 @@ class Registry {
 						type: "error",
 						message: gateError,
 					});
+					this.#backOffCompaction(state, item, gateError);
 					await this.#finishTurn(state, turn, "error");
 					state.activeTurn = undefined;
 					await this.#advanceQueue(state, item.id);
@@ -772,6 +775,8 @@ class Registry {
 					state.stored.session.cwd,
 				);
 				state.persistedMessageCount = outcome.messages.length;
+				state.compactionBackoffTokens = undefined;
+				state.compactionFailure = undefined;
 				await this.#finishTurn(state, turn);
 				state.activeTurn = undefined;
 				await this.#advanceQueue(state, item.id);
@@ -1212,8 +1217,22 @@ class Registry {
 		if (contextWindow === undefined) return undefined;
 		const trigger = contextWindow - this.#compaction.reserveTokens;
 		if (trigger <= 0) return undefined;
-		if (Engine.estimateContextTokens(state.harness.snapshot().messages) <= trigger) return undefined;
+		const estimate = Engine.estimateContextTokens(state.harness.snapshot().messages);
+		if (estimate <= trigger) return undefined;
+		const mark = state.compactionBackoffTokens;
+		if (mark !== undefined && estimate <= mark + Math.max(1, Math.floor((contextWindow - mark) / 2))) {
+			return undefined;
+		}
 		return this.#createCompactionItem(state, "auto");
+	}
+
+	// A compaction that failed for a reason the conversation controls repeats identically, so the next
+	// automatic attempt waits until the context has grown halfway to the window. Transient provider
+	// failures skip this and retry on the next turn, paced by compactionAttempted alone.
+	#backOffCompaction(state: SessionState, item: Protocol.CompactionQueueItem, message?: string): void {
+		if (item.source !== "auto") return;
+		state.compactionBackoffTokens = Engine.estimateContextTokens(state.harness.snapshot().messages);
+		if (message !== undefined) state.compactionFailure = { turnId: item.turnId, message };
 	}
 
 	#createCompactionItem(
