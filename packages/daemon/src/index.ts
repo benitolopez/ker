@@ -1163,6 +1163,7 @@ class Registry {
 		const snapshot = state.harness.snapshot();
 		if (snapshot.messages.length !== state.persistedMessageCount) return;
 		const trigger = contextWindow - this.#compaction.reserveTokens;
+		if (trigger <= 0) return;
 		if (Engine.estimateContextTokens(snapshot.messages) <= trigger) return;
 		const outcome = Engine.pruneToolOutputs(snapshot.messages);
 		if (!outcome) return;

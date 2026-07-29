@@ -1226,24 +1226,103 @@ test("applies the bounded watermark only to automatic compaction", async (t) => 
 	assert.equal(afterManualStored.records.filter((record) => record.type === "compaction").length, 1);
 });
 
-test("a non-positive automatic trigger skips compaction while manual compaction still runs", async (t) => {
+test("a non-positive automatic trigger skips compaction and pruning while manual compaction still runs", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-nonpositive-trigger-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await store.create(process.cwd());
+	const usage: Protocol.Usage = { input: 10, output: 7, cacheRead: 0, cacheWrite: 0, total: 17 };
+	await seeded.log.append([
+		{
+			type: "conversation",
+			id: "entry-owner",
+			parentId: null,
+			turnId: "turn-old",
+			message: {
+				role: "assistant",
+				content: "",
+				toolCalls: [
+					{ callId: "call-1", name: "read", arguments: "{}" },
+					{ callId: "call-2", name: "read", arguments: "{}" },
+				],
+			},
+		},
+		{
+			type: "conversation",
+			id: "entry-tool-1",
+			parentId: "entry-owner",
+			turnId: "turn-old",
+			message: { role: "tool", toolCallId: "call-1", content: "x".repeat(200_000) },
+		},
+		{
+			type: "conversation",
+			id: "entry-tool-2",
+			parentId: "entry-tool-1",
+			turnId: "turn-old",
+			message: { role: "tool", toolCallId: "call-2", content: "x".repeat(200_000) },
+		},
+		{
+			type: "conversation",
+			id: "entry-user-1",
+			parentId: "entry-tool-2",
+			turnId: "turn-aged-1",
+			message: { role: "user", content: "first follow-up" },
+		},
+		{
+			type: "conversation",
+			id: "entry-user-2",
+			parentId: "entry-user-1",
+			turnId: "turn-aged-2",
+			message: { role: "user", content: "second follow-up" },
+		},
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: seeded.session.id,
+				turnId: "turn-old",
+				type: "usage",
+				provider: "openai",
+				model: "gpt-5.4-mini",
+				usage,
+			},
+		},
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: seeded.session.id,
+				type: "queue_changed",
+				queue: { revision: 1, waiting: [] },
+			},
+		},
+	]);
 	const requests: Engine.CompactionRequest[] = [];
 	const running = await startServer(t, compactionFactory(requests, "compacted"), {
-		compaction: { enabled: true, reserveTokens: 272_000, keepRecentTokens: 1, prune: false },
+		sessionDir,
+		compaction: { enabled: true, reserveTokens: 272_000, keepRecentTokens: 1, prune: true },
 	});
-	const session = await createSession(running.url);
-	const admittedPrompt = await prompt(running.url, session.id, "do not compact automatically");
-	await waitForTerminal(running.url, session.id, admittedPrompt.turnId);
+	const admittedPrompt = await prompt(running.url, seeded.session.id, "do not compact automatically");
+	await waitForTerminal(running.url, seeded.session.id, admittedPrompt.turnId);
 	await new Promise<void>((resolve) => setImmediate(resolve));
 
 	assert.equal(requests.length, 0);
-	const response = await rawCompact(running.url, session.id, {});
+	const stored = await store.loadSession(seeded.log.path);
+	assert.equal(
+		stored.records.some((record) => record.type === "prune"),
+		false,
+	);
+	assert.equal(
+		stored.records.some((record) => record.type === "event" && record.event.type === "pruned"),
+		false,
+	);
+	const response = await rawCompact(running.url, seeded.session.id, {});
 	const manual = await readJson<Protocol.CompactionAdmission>(response.body);
-	await waitForTerminal(running.url, session.id, manual.turnId);
+	await waitForTerminal(running.url, seeded.session.id, manual.turnId);
 
 	assert.equal(requests.length, 1);
 	assert.equal(
-		(await getSnapshot(running.url, session.id)).turns.find((turn) => turn.id === manual.turnId)?.status,
+		(await getSnapshot(running.url, seeded.session.id)).turns.find((turn) => turn.id === manual.turnId)?.status,
 		"completed",
 	);
 });
