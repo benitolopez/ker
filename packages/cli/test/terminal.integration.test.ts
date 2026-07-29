@@ -27,6 +27,11 @@ test("session FIFO runs beside another session and survives exact cancellation",
 				getAuth: async () => ({ kind: "apikey", key: "test" }),
 				tools: [],
 				systemPrompt: "Test system prompt",
+				compaction: {
+					systemPrompt: "Summary system prompt",
+					initialInstructions: "Initial summary instructions",
+					updateInstructions: "Update summary instructions",
+				},
 			},
 			{
 				stream: async function* (_model, messages, _auth, options) {
@@ -61,7 +66,12 @@ test("session FIFO runs beside another session and survives exact cancellation",
 			},
 			initial,
 		);
-	const server = createDaemon({ sessionDir, harnessFactory, recoveryWindowMinutes: 0 });
+	const server = createDaemon({
+		sessionDir,
+		harnessFactory,
+		recoveryWindowMinutes: 0,
+		compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000, prune: true },
+	});
 	const children = new Set<ChildProcess>();
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);

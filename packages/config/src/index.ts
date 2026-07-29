@@ -8,10 +8,19 @@ export const DEFAULT_MODEL = "gpt-5.4-mini";
 // returns no summary; set a level to turn thinking on.
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+export interface CompactionSettings {
+	enabled: boolean;
+	reserveTokens: number;
+	keepRecentTokens: number;
+	reasoningEffort?: ReasoningEffort;
+	prune: boolean;
+}
+
 export interface Config {
 	apiKey?: string;
 	model: string;
 	reasoningEffort?: ReasoningEffort;
+	compaction: CompactionSettings;
 	// After a daemon restart, queued prompts older than this many minutes are dropped as
 	// expired instead of auto-running. 0 drops all queued prompts on restart.
 	recoveryWindowMinutes: number;
@@ -27,6 +36,13 @@ export function loadConfig(): Config {
 		apiKey: file.apiKey ?? process.env.OPENAI_API_KEY,
 		model: file.model ?? DEFAULT_MODEL,
 		reasoningEffort: file.reasoningEffort,
+		compaction: {
+			enabled: file.compaction?.enabled ?? true,
+			reserveTokens: file.compaction?.reserveTokens ?? 16_384,
+			keepRecentTokens: file.compaction?.keepRecentTokens ?? 20_000,
+			reasoningEffort: file.compaction?.reasoningEffort,
+			prune: file.compaction?.prune ?? true,
+		},
 		recoveryWindowMinutes: file.recoveryWindowMinutes ?? 0,
 	};
 }
@@ -35,6 +51,7 @@ interface ConfigFile {
 	apiKey?: string;
 	model?: string;
 	reasoningEffort?: ReasoningEffort;
+	compaction?: Partial<CompactionSettings>;
 	recoveryWindowMinutes?: number;
 }
 

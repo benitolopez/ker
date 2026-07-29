@@ -59,6 +59,28 @@ test("serializes concurrent appends within one session", async (t) => {
 	assert.equal(loaded.records.length, 3);
 });
 
+test("round-trips prune records", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-prune-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const session = await store.create(baseDir);
+	await session.log.append([
+		{
+			type: "prune",
+			toolCallIds: ["call-1", "call-2"],
+			tokensBefore: 120_000,
+			tokensAfter: 60_000,
+		},
+	]);
+
+	const loaded = await store.loadSession(session.log.path);
+	const prune = loaded.records.find((record) => record.type === "prune");
+	assert(prune);
+	assert.deepEqual(prune.toolCallIds, ["call-1", "call-2"]);
+	assert.equal(prune.tokensBefore, 120_000);
+	assert.equal(prune.tokensAfter, 60_000);
+});
+
 test("truncates only a malformed final partial line", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-torn-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
@@ -261,6 +283,7 @@ test("classifies idle sessions from the final complete record", async (t) => {
 					running: {
 						id: "queue-1",
 						turnId: "turn-1",
+						kind: "prompt",
 						messageId: "message-1",
 						text: "hello",
 						state: "running",
@@ -283,6 +306,49 @@ test("classifies idle sessions from the final complete record", async (t) => {
 	assert.equal(idleById.get(busy.session.id), false);
 	assert.equal(idleById.get(midTurn.session.id), false);
 	assert.equal(idleById.get(torn.session.id), false);
+});
+
+test("round-trips compaction records and classifies their completed queue as idle", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-compaction-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const session = await store.create(baseDir);
+	await session.log.append([
+		{
+			type: "conversation",
+			id: "entry-1",
+			parentId: null,
+			turnId: "turn-1",
+			message: { role: "user", content: "hello" },
+		},
+		{
+			type: "compaction",
+			turnId: "turn-compact",
+			summary: "summary",
+			firstKeptEntryId: "entry-1",
+			tokensBefore: 100,
+			tokensAfter: 20,
+		},
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				type: "queue_changed",
+				queue: { revision: 2, waiting: [] },
+			},
+		},
+	]);
+
+	const [catalog] = await store.scanCatalog();
+	assert.equal(catalog.idle, true);
+	const loaded = await store.loadSession(catalog.path);
+	const compacted = loaded.records.find((record) => record.type === "compaction");
+	assert.equal(compacted?.type, "compaction");
+	if (compacted?.type === "compaction") {
+		assert.equal(compacted.firstKeptEntryId, "entry-1");
+		assert.equal(compacted.summary, "summary");
+	}
 });
 
 test("uses KER_SESSION_DIR before the user-owned default", (t) => {

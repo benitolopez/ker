@@ -2,7 +2,7 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { Tool } from "@ker-ai/engine";
+import type * as Engine from "@ker-ai/engine";
 import * as Bash from "./bash-output.ts";
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES } from "./output-limits.ts";
 
@@ -11,8 +11,77 @@ export { truncateTail } from "./bash-output.ts";
 const DEFAULT_TIMEOUT_SECS = 120;
 const KILL_GRACE_MS = 2000;
 const IDLE_GRACE_MS = 100;
+const COMPACTION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
-function createRead(cwd: string): Tool {
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+const COMPACTION_INITIAL_INSTRUCTIONS = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep the entire summary under roughly 2,000 tokens. Prefer dropping resolved or stale detail over exceeding the budget. Preserve exact file paths, function names, and error messages.`;
+const COMPACTION_UPDATE_INSTRUCTIONS = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+Produce a replacement summary, not an append-only update. Preserve unresolved requirements, active decisions, current state, exact identifiers, still-relevant failures, and next steps. Remove superseded plans, completed procedural detail, duplicated facts, and stale observations.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any unresolved constraints, preferences, or requirements]
+- [Or "(none)" if none remain]
+
+## Progress
+### Done
+- [x] [Completed tasks or changes that remain relevant]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Current blockers, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep the entire summary under roughly 2,000 tokens. Prefer dropping resolved or stale detail over exceeding the budget. Preserve exact file paths, function names, and error messages.`;
+
+function createRead(cwd: string): Engine.Tool {
 	return {
 		name: "read",
 		description:
@@ -45,7 +114,7 @@ function createRead(cwd: string): Tool {
 	};
 }
 
-function createWrite(cwd: string): Tool {
+function createWrite(cwd: string): Engine.Tool {
 	return {
 		name: "write",
 		description:
@@ -77,7 +146,7 @@ function createWrite(cwd: string): Tool {
 	};
 }
 
-function createEdit(cwd: string): Tool {
+function createEdit(cwd: string): Engine.Tool {
 	return {
 		name: "edit",
 		description:
@@ -130,7 +199,7 @@ function createEdit(cwd: string): Tool {
 	};
 }
 
-function createBash(cwd: string): Tool {
+function createBash(cwd: string): Engine.Tool {
 	return {
 		name: "bash",
 		description:
@@ -163,7 +232,11 @@ function createBash(cwd: string): Tool {
 	};
 }
 
-export function createDefinition(cwd: string): { systemPrompt: string; tools: Tool[] } {
+export function createDefinition(cwd: string): {
+	systemPrompt: string;
+	tools: Engine.Tool[];
+	compaction: Engine.CompactionTemplate;
+} {
 	return {
 		systemPrompt: [
 			"You are ker, a terminal coding agent working in the user's project.",
@@ -173,6 +246,11 @@ export function createDefinition(cwd: string): { systemPrompt: string; tools: To
 			"Be concise and direct.",
 		].join("\n"),
 		tools: [createRead(cwd), createWrite(cwd), createEdit(cwd), createBash(cwd)],
+		compaction: {
+			systemPrompt: COMPACTION_SYSTEM_PROMPT,
+			initialInstructions: COMPACTION_INITIAL_INSTRUCTIONS,
+			updateInstructions: COMPACTION_UPDATE_INSTRUCTIONS,
+		},
 	};
 }
 

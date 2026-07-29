@@ -70,7 +70,13 @@ export async function run(): Promise<void> {
 		await runStats(sessionId, json);
 		return;
 	}
-	const commands = ["daemon", "login", "logout", "new", "sessions", "stats", "cancel", "monitor"];
+	if (positional[0] === "compact" && positional.length <= 2) {
+		const sessionId = positional[1] ?? (await resolveLatestSession());
+		if (!sessionId) return;
+		await runCompact(sessionId, json);
+		return;
+	}
+	const commands = ["daemon", "login", "logout", "new", "sessions", "stats", "cancel", "compact", "monitor"];
 	if (positional[0] !== undefined && commands.includes(positional[0])) {
 		writeUsage();
 		process.exitCode = 1;
@@ -191,6 +197,9 @@ async function runStats(sessionId: Protocol.SessionId, json: boolean): Promise<v
 	process.stdout.write(
 		window ? `Context: ${context} / ${formatTokens(window)} tokens${percentage}\n` : `Context: ${context} tokens\n`,
 	);
+	if (snapshot.compactionFailure) {
+		process.stdout.write(`Compaction: last attempt failed — ${snapshot.compactionFailure.message}\n`);
+	}
 	process.stdout.write("Cumulative:\n");
 	process.stdout.write(`  Input: ${formatTokens(snapshot.usage.cumulative.input)}\n`);
 	process.stdout.write(`  Output: ${formatTokens(snapshot.usage.cumulative.output)}\n`);
@@ -239,6 +248,164 @@ async function runCancel(sessionId: Protocol.SessionId, json: boolean): Promise<
 		return;
 	}
 	writeTurnStatus(result.status, result.turnId);
+}
+
+async function runCompact(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
+	const controller = new AbortController();
+	let accepted: Protocol.CompactionAdmission | undefined;
+	let cancelRequest: Promise<Response> | undefined;
+	let interrupted = false;
+	const onSigint = () => {
+		if (interrupted) {
+			process.exit(130);
+			return;
+		}
+		interrupted = true;
+		controller.abort();
+		if (accepted) cancelRequest = cancelTurn(accepted.sessionId, accepted.turnId);
+	};
+	process.on("SIGINT", onSigint);
+	try {
+		if (!(await checkHealth(controller.signal))) return;
+		const initial = await fetchSnapshot(sessionId, controller.signal);
+		if (!initial) return;
+		let cursor = initial.cursor;
+		let events = await subscribe(sessionId, cursor, controller.signal);
+		if (events.status === 410) {
+			const replacement = await fetchSnapshot(sessionId, controller.signal);
+			if (!replacement) return;
+			cursor = replacement.cursor;
+			events = await subscribe(sessionId, cursor, controller.signal);
+		}
+		if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
+		const response = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/compact`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({} satisfies Protocol.CompactRequest),
+		});
+		if (response.status !== 202) {
+			process.stderr.write(
+				response.status === 404
+					? `ker: session ${sessionId} was not found\n`
+					: response.status === 500
+						? `ker: session ${sessionId} is unreadable (HTTP ${response.status})\n`
+						: `ker: daemon rejected compaction (HTTP ${response.status})\n`,
+			);
+			process.exitCode = 1;
+			return;
+		}
+		accepted = (await response.json()) as Protocol.CompactionAdmission;
+		if (json) process.stdout.write(`${JSON.stringify(accepted)}\n`);
+		if (accepted.status !== "running") {
+			process.stderr.write(`ker: ${accepted.status} (turn ${accepted.turnId})\n`);
+		}
+		if (interrupted && !cancelRequest) cancelRequest = cancelTurn(accepted.sessionId, accepted.turnId);
+
+		let terminal = false;
+		let failed = false;
+		let cancelled = false;
+		let outcomeShown = false;
+		const applySnapshot = (snapshot: Protocol.SessionSnapshot) => {
+			const turn = snapshot.turns.find((candidate) => candidate.id === accepted?.turnId);
+			if (!turn || turn.status === "running" || turn.status === "cancelling" || turn.status === "waiting") {
+				if (turn?.status === "cancelling") cancelled = true;
+				return;
+			}
+			terminal = true;
+			failed = turn.status !== "completed";
+			cancelled = turn.status === "aborted" || turn.status === "cancelled";
+			const entry = snapshot.entries.find(
+				(candidate) => candidate.role === "compaction" && candidate.turnId === accepted?.turnId,
+			);
+			if (entry?.role === "compaction" && !outcomeShown && !json) {
+				writeCompacted(entry.tokensBefore, entry.tokensAfter);
+				outcomeShown = true;
+			}
+			if (turn.status === "completed" && !entry && !outcomeShown && !json) {
+				process.stderr.write("ker: nothing to compact\n");
+				outcomeShown = true;
+			}
+		};
+
+		while (!terminal && !controller.signal.aborted) {
+			try {
+				if (!events.body) throw new Error("event stream has no body");
+				for await (const data of sseData(events.body)) {
+					const envelope = JSON.parse(data) as Protocol.EventEnvelope;
+					cursor = { epoch: envelope.epoch, sequence: envelope.sequence };
+					if (json) process.stdout.write(`${data}\n`);
+					if (!("turnId" in envelope.event) || envelope.event.turnId !== accepted.turnId) continue;
+					if (envelope.event.type === "compacted" && !outcomeShown && !json) {
+						writeCompacted(envelope.event.tokensBefore, envelope.event.tokensAfter);
+						outcomeShown = true;
+					}
+					if (envelope.event.type === "compaction_skipped" && !outcomeShown && !json) {
+						process.stderr.write("ker: nothing to compact\n");
+						outcomeShown = true;
+					}
+					if (envelope.event.type === "error") {
+						failed = true;
+						if (!json) writeError(envelope.event);
+					}
+					if (envelope.event.type === "turn_cancel_requested") cancelled = true;
+					if (envelope.event.type === "turn_terminal") {
+						failed = envelope.event.reason !== "completed";
+						cancelled = envelope.event.reason === "aborted" || envelope.event.reason === "cancelled";
+					}
+					if (envelope.event.type === "end") terminal = true;
+					if (terminal) break;
+				}
+				if (terminal) break;
+				const snapshot = await fetchSnapshot(sessionId, controller.signal);
+				if (!snapshot) return;
+				cursor = snapshot.cursor;
+				applySnapshot(snapshot);
+				if (terminal) break;
+				events = await subscribe(sessionId, cursor, controller.signal);
+				if (events.status === 410) continue;
+				if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
+			} catch (error) {
+				if (controller.signal.aborted) break;
+				process.stderr.write(
+					`ker: event stream disconnected — ${error instanceof Error ? error.message : String(error)}; reconnecting\n`,
+				);
+				await sleep(1_000, undefined, { signal: controller.signal });
+				const snapshot = await fetchSnapshot(sessionId, controller.signal);
+				if (!snapshot) return;
+				cursor = snapshot.cursor;
+				applySnapshot(snapshot);
+				if (terminal) break;
+				events = await subscribe(sessionId, cursor, controller.signal);
+			}
+		}
+		if (terminal && !outcomeShown && !failed && !cancelled && !json && !controller.signal.aborted) {
+			const snapshot = await fetchSnapshot(sessionId, controller.signal);
+			if (!snapshot) return;
+			applySnapshot(snapshot);
+		}
+		if (cancelled) process.exitCode = 130;
+		if (!cancelled && failed) process.exitCode = 1;
+	} catch (error) {
+		if (!interrupted) {
+			process.stderr.write(`ker: compaction failed — ${error instanceof Error ? error.message : String(error)}\n`);
+			process.exitCode = 1;
+		}
+	} finally {
+		if (cancelRequest) {
+			try {
+				const response = await cancelRequest;
+				if (!response.ok && response.status !== 409) {
+					process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${response.status})\n`);
+				}
+			} catch (error) {
+				process.stderr.write(
+					`ker: could not reach the daemon to cancel the turn — ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		}
+		if (interrupted) process.exitCode = 130;
+		process.off("SIGINT", onSigint);
+	}
 }
 
 // Signals stop new connections, abort the active turn cleanly, and leave waiting work persisted.
@@ -348,6 +515,7 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 		const initial = await fetchSnapshot(prompt.sessionId, controller.signal);
 		if (!initial) return;
 		if (prompt.json) process.stdout.write(`${JSON.stringify(initial)}\n`);
+		if (!prompt.json) writeCompactionFailure(initial);
 		renderer.snapshot(initial, () => true, false, true);
 		let cursor = initial.cursor;
 		let events = await subscribe(prompt.sessionId, cursor, controller.signal);
@@ -368,10 +536,16 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 			}),
 		});
 		if (submitted.status !== 202) {
+			const exhausted =
+				submitted.status === 409 &&
+				((await submitted.json().catch(() => undefined)) as { code?: string } | undefined)?.code ===
+					"context_exhausted";
 			process.stderr.write(
-				submitted.status === 404
-					? `ker: session ${prompt.sessionId} was not found\n`
-					: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
+				exhausted
+					? "ker: this session's context is full and could not be compacted — start a new session with `ker new`, or try `ker compact`\n"
+					: submitted.status === 404
+						? `ker: session ${prompt.sessionId} was not found\n`
+						: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
 			);
 			process.exitCode = 1;
 			return;
@@ -484,6 +658,8 @@ class Renderer {
 	readonly #turnStatuses = new Map<Protocol.TurnId, Protocol.TurnSnapshot["status"]>();
 	readonly #promptMessageIds = new Set<Protocol.MessageId>();
 	readonly #developerEntryIds = new Set<string>();
+	readonly #compactionEntryIds = new Set<string>();
+	readonly #compactionTurnIds = new Set<Protocol.TurnId>();
 	readonly #undeliveredMessageIds = new Set<Protocol.MessageId>();
 	readonly #monitor: boolean;
 
@@ -520,6 +696,10 @@ class Renderer {
 	}
 
 	event(event: Protocol.Event, matches: (turnId: Protocol.TurnId) => boolean): void {
+		if (event.type === "pruned") {
+			if (this.#monitor) writePruned(event.toolCallIds.length, event.tokensBefore, event.tokensAfter);
+			return;
+		}
 		if (!("turnId" in event) || !matches(event.turnId)) return;
 		if (event.type === "turn_cancel_requested") this.#transition(event.turnId, "cancelling");
 		if (event.type === "turn_terminal") this.#transition(event.turnId, event.reason);
@@ -539,6 +719,13 @@ class Renderer {
 			process.stderr.write(`ker: prompt was not delivered: ${event.reason} (turn ${event.turnId})\n`);
 		}
 		if (event.type === "error") writeError(event);
+		if (event.type === "compacted") {
+			this.#compaction(event.turnId, undefined, event.summary, event.tokensBefore, event.tokensAfter, true);
+		}
+		if (event.type === "compaction_skipped" && !this.#compactionTurnIds.has(event.turnId)) {
+			this.#compactionTurnIds.add(event.turnId);
+			process.stderr.write(`ker: nothing to compact (turn ${event.turnId})\n`);
+		}
 	}
 
 	#conversation(
@@ -592,11 +779,15 @@ class Renderer {
 				flush(entry.turnId);
 				this.#developer(entry.id, entry.content, render);
 			}
+			if (entry.role === "compaction") {
+				flush(entry.turnId);
+				this.#compaction(entry.turnId, entry.id, entry.summary, entry.tokensBefore, entry.tokensAfter, render);
+			}
 			if (entries[index + 1]?.turnId !== entry.turnId) flush(entry.turnId);
 		}
 		for (const turnId of pendingByTurn.keys()) flush(turnId);
 		for (const item of [snapshot.queue.running, ...snapshot.queue.waiting]) {
-			if (!item || !matches(item.turnId)) continue;
+			if (!item || item.kind !== "prompt" || !matches(item.turnId)) continue;
 			this.#prompt(item.messageId, item.text, render);
 		}
 	}
@@ -635,6 +826,23 @@ class Renderer {
 		this.#developerEntryIds.add(id);
 		if (render) writeAttributed("ker: ", text);
 	}
+
+	#compaction(
+		turnId: Protocol.TurnId,
+		entryId: string | undefined,
+		summary: string,
+		tokensBefore: number,
+		tokensAfter: number,
+		render: boolean,
+	): void {
+		if (entryId && this.#compactionEntryIds.has(entryId)) return;
+		if (entryId) this.#compactionEntryIds.add(entryId);
+		if (this.#compactionTurnIds.has(turnId)) return;
+		this.#compactionTurnIds.add(turnId);
+		if (!render) return;
+		writeCompacted(tokensBefore, tokensAfter);
+		writeAttributed("ker: ", summary);
+	}
 }
 
 function parsePrompt(args: string[]): PromptArgs | undefined {
@@ -665,6 +873,23 @@ function queueIsIdle(queue: Protocol.QueueSnapshot): boolean {
 
 function formatTokens(tokens: number): string {
 	return tokens.toLocaleString("en-US");
+}
+
+function writeCompacted(tokensBefore: number, tokensAfter: number): void {
+	process.stderr.write(`ker: compacted (${formatTokens(tokensBefore)} → ${formatTokens(tokensAfter)} tokens)\n`);
+}
+
+function writePruned(count: number, tokensBefore: number, tokensAfter: number): void {
+	process.stderr.write(
+		`ker: pruned ${count} tool outputs (${formatTokens(tokensBefore)} → ${formatTokens(tokensAfter)} tokens)\n`,
+	);
+}
+
+// A compaction that failed belongs to its own turn, which a prompt run never follows, so the session
+// state carries it forward to the next person who prompts.
+function writeCompactionFailure(snapshot: Protocol.SessionSnapshot): void {
+	if (!snapshot.compactionFailure) return;
+	process.stderr.write(`ker: last automatic compaction failed — ${snapshot.compactionFailure.message}\n`);
 }
 
 function writeIdle(): void {
@@ -745,6 +970,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions [--all] | stats [id] | cancel [id] | monitor [id]\n       ker [--json] [--session <id> | -c|--continue] <prompt>\n       ker daemon | login | logout\n",
+		"usage: ker [--json] new | sessions [--all] | stats [id] | cancel [id] | compact [id] | monitor [id]\n       ker [--json] [--session <id> | -c|--continue] <prompt>\n       ker daemon | login | logout\n",
 	);
 }

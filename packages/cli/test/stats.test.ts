@@ -51,6 +51,20 @@ test("stats JSON emits only the session, model, and usage snapshot", async (t) =
 	});
 });
 
+test("stats reports an outstanding compaction failure above the cumulative breakdown", async (t) => {
+	const failing = snapshot();
+	failing.compactionFailure = { turnId: "turn-compact", message: "Compaction did not reduce the context" };
+	const controlled = controlStats(t, ["stats", "session-1"], jsonResponse(failing));
+
+	await run();
+
+	assert.match(
+		controlled.stdout.join(""),
+		/Context: 68,000 \/ 272,000 tokens \(25\.0%\)\nCompaction: last attempt failed — Compaction did not reduce the context\nCumulative:/,
+	);
+	assert.equal(controlled.stderr.join(""), "");
+});
+
 test("stats reports missing and unreadable sessions", async (t) => {
 	await t.test("missing", async (t) => {
 		const controlled = controlStats(t, ["stats", "missing"], jsonResponse({}, 404));

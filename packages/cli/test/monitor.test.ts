@@ -287,6 +287,66 @@ test("monitor", async (t) => {
 		await running;
 	});
 
+	await t.test("renders compaction entries and live outcomes once", async (t) => {
+		const compacted: Protocol.ConversationEntry = {
+			id: "compaction-1",
+			parentId: null,
+			turnId: "compact-1",
+			role: "compaction",
+			summary: "saved summary",
+			tokensBefore: 1_000,
+			tokensAfter: 200,
+			firstKeptEntryId: "entry-1",
+		};
+		const initial = { ...emptySnapshot(), entries: [compacted] };
+		const controlled = controlMonitor(t, { initial, recovered: initial });
+		const running = run();
+		await controlled.firstSubscribed.promise;
+		controlled.emit([
+			{
+				actor: "process",
+				sessionId: "session-1",
+				turnId: "compact-1",
+				type: "compacted",
+				summary: "saved summary",
+				tokensBefore: 1_000,
+				tokensAfter: 200,
+				firstKeptEntryId: "entry-1",
+			},
+			{
+				actor: "process",
+				sessionId: "session-1",
+				turnId: "compact-2",
+				type: "compaction_skipped",
+				reason: "nothing_to_compact",
+			},
+			{
+				actor: "process",
+				sessionId: "session-1",
+				type: "pruned",
+				toolCallIds: ["call-1", "call-2"],
+				tokensBefore: 120_000,
+				tokensAfter: 60_000,
+			},
+		]);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		controlled.closeFirst();
+		await controlled.followingSubscribed.promise;
+
+		assert.equal(
+			controlled.stderr.join(""),
+			[
+				"ker: compacted (1,000 → 200 tokens)\n",
+				"ker: saved summary\n",
+				"ker: waiting for turns\n",
+				"ker: nothing to compact (turn compact-2)\n",
+				"ker: pruned 2 tool outputs (120,000 → 60,000 tokens)\n",
+			].join(""),
+		);
+		findNewSignalListener(controlled.signalListeners)("SIGINT");
+		await running;
+	});
+
 	await t.test("JSON output contains only snapshots and event envelopes", async (t) => {
 		const controlled = controlMonitor(t, { json: true });
 		const running = run();
@@ -600,10 +660,11 @@ function session(): Protocol.SessionDescriptor {
 	};
 }
 
-function queueItem(turnId: string, state: Protocol.QueueItem["state"]): Protocol.QueueItem {
+function queueItem(turnId: string, state: Protocol.PromptQueueItem["state"]): Protocol.PromptQueueItem {
 	return {
 		id: `queue-${turnId}`,
 		turnId,
+		kind: "prompt",
 		messageId: `message-${turnId}`,
 		text: "hello",
 		state,

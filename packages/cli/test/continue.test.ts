@@ -38,6 +38,60 @@ test("a JSON bare prompt prints the new session snapshot before event envelopes"
 	assert.equal(controlled.stderr.join(""), "");
 });
 
+test("a prompt reports an outstanding compaction failure without touching the answer", async (t) => {
+	const compactionFailure = { turnId: "turn-compact", message: "Compacted context is still too close" };
+	const controlled = controlPrompt(t, { args: ["hello"], compactionFailure });
+	const running = run();
+	await controlled.promptStarted.promise;
+	controlled.complete();
+	await running;
+
+	assert.equal(
+		controlled.stderr.join(""),
+		"ker: last automatic compaction failed — Compacted context is still too close\n",
+	);
+	assert.equal(controlled.stdout.join(""), "answer\n");
+	assert.equal(process.exitCode, undefined);
+});
+
+test("a JSON prompt leaves an outstanding compaction failure to the snapshot it prints", async (t) => {
+	const compactionFailure = { turnId: "turn-compact", message: "Compacted context is still too close" };
+	const controlled = controlPrompt(t, { args: ["--json", "hello"], compactionFailure });
+	const running = run();
+	await controlled.promptStarted.promise;
+	controlled.complete();
+	await running;
+
+	assert.equal(controlled.stderr.join(""), "");
+	const first = JSON.parse(controlled.stdout.join("").trim().split("\n")[0]) as Protocol.SessionSnapshot;
+	assert.deepEqual(first.compactionFailure, compactionFailure);
+});
+
+test("an exhausted context is refused with a way out rather than a bare status", async (t) => {
+	const controlled = controlPrompt(t, {
+		args: ["hello"],
+		promptRejection: { status: 409, body: { code: "context_exhausted" } },
+	});
+
+	await run();
+
+	assert.equal(
+		controlled.stderr.join(""),
+		"ker: this session's context is full and could not be compacted — start a new session with `ker new`, or try `ker compact`\n",
+	);
+	assert.equal(controlled.stdout.join(""), "");
+	assert.equal(process.exitCode, 1);
+});
+
+test("an unexplained rejection still reports its status", async (t) => {
+	const controlled = controlPrompt(t, { args: ["hello"], promptRejection: { status: 409, body: {} } });
+
+	await run();
+
+	assert.equal(controlled.stderr.join(""), "ker: daemon rejected the prompt (HTTP 409)\n");
+	assert.equal(process.exitCode, 1);
+});
+
 test("a bare prompt stops when session creation fails", async (t) => {
 	const controlled = controlPrompt(t, { args: ["hello"], createStatus: 500 });
 
@@ -116,6 +170,8 @@ function controlPrompt(
 		args: string[];
 		createStatus?: number;
 		sessions?: Protocol.SessionDescriptor[];
+		compactionFailure?: Protocol.CompactionFailure;
+		promptRejection?: { status: number; body: object };
 	},
 ): ControlledPrompt {
 	const originalFetch = globalThis.fetch;
@@ -171,7 +227,7 @@ function controlPrompt(
 			const session =
 				options.sessions?.find((candidate) => candidate.id === sessionId) ??
 				(sessionId === createdSession.id ? createdSession : descriptor(sessionId));
-			return jsonResponse(snapshot(session), 200);
+			return jsonResponse({ ...snapshot(session), compactionFailure: options.compactionFailure }, 200);
 		}
 		const eventsMatch = url.pathname.match(/^\/sessions\/([^/]+)\/events$/);
 		if (eventsMatch) {
@@ -184,6 +240,9 @@ function controlPrompt(
 			promptSessionIds.push(sessionId);
 			promptBodies.push(JSON.parse(String(init?.body)) as { text: string });
 			promptStarted.resolve();
+			if (options.promptRejection) {
+				return jsonResponse(options.promptRejection.body, options.promptRejection.status);
+			}
 			return jsonResponse(admission(sessionId), 202);
 		}
 		throw new Error(`Unexpected request to ${url.pathname}`);

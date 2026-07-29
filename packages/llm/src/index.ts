@@ -4,6 +4,8 @@ import { models } from "./models.generated.ts";
 
 export type { Model, Provider, Usage } from "@ker-ai/protocol";
 
+// Call ids are unique within a session. An adapter whose native ids are only turn-scoped namespaces
+// them before emitting a call, so durable records can identify one result without touching another.
 export interface ToolCall {
 	callId: string;
 	itemId?: string;
@@ -33,19 +35,24 @@ export interface Tool {
 	parameters: Record<string, unknown>;
 }
 
-// OpenAI's reasoning-effort levels. Unset omits `effort` from the request, so the model uses its server
-// default, which is none on gpt-5.x.
+// Provider-normalized reasoning levels. An adapter translates supported values to its native
+// vocabulary and rejects unsupported ones; unset uses the provider's server default.
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface StreamOptions {
 	tools?: Tool[];
 	instructions?: string;
 	reasoningEffort?: ReasoningEffort;
+	// Unset means no caller-imposed cap. An adapter omits the provider field where possible, or chooses
+	// the largest legal allowance for the rendered request when the provider requires a value.
+	maxOutputTokens?: number;
 	signal?: AbortSignal;
 }
 
 export type FinishReason = "stop" | "length" | "content_filter";
 
+// Provider adapters normalize native context-window rejections or stop reasons to an error with
+// contextOverflow set, so the engine can retry a smaller request without provider-specific logic.
 export type Event =
 	| { type: "delta"; text: string }
 	| { type: "reasoning_delta"; text: string }
@@ -53,7 +60,13 @@ export type Event =
 	| { type: "reasoning"; item: unknown }
 	| { type: "done"; reason: FinishReason; usage: Usage }
 	| { type: "aborted" }
-	| { type: "error"; message: string; retryable: boolean; retryAfterMs?: number };
+	| {
+			type: "error";
+			message: string;
+			retryable: boolean;
+			retryAfterMs?: number;
+			contextOverflow?: true;
+	  };
 
 // How stream() reaches OpenAI: a plain API key against the public API, or a ChatGPT-subscription
 // OAuth access token (with the account id decoded from it) against the Codex backend.
@@ -118,6 +131,7 @@ export async function* stream(
 				reasoning: { effort: opts?.reasoningEffort, summary: "auto" },
 				tools,
 				instructions: opts?.instructions,
+				max_output_tokens: opts?.maxOutputTokens,
 			},
 			{ signal: opts?.signal },
 		);
@@ -240,6 +254,7 @@ interface Classified {
 	message: string;
 	retryable: boolean;
 	retryAfterMs?: number;
+	contextOverflow?: true;
 }
 
 // Reduce any failure to the fields of a terminal error event: a readable message, whether retrying
@@ -255,13 +270,25 @@ export function classifyError(err: unknown): Classified {
 	if (err instanceof APIError) {
 		const status = err.status;
 		const retryable = status === 408 || status === 409 || status === 429 || (status !== undefined && status >= 500);
-		return { message: err.message, retryable, retryAfterMs: retryable ? parseRetryAfterMs(err.headers) : undefined };
+		const contextOverflow =
+			status === 400 && (err.code === "context_length_exceeded" || /context_length_exceeded/i.test(err.message));
+		return {
+			message: err.message,
+			retryable,
+			retryAfterMs: retryable ? parseRetryAfterMs(err.headers) : undefined,
+			...(contextOverflow ? { contextOverflow: true as const } : {}),
+		};
 	}
 	if (err instanceof Error) {
 		const retryable = /stream ended before a terminal|rate.?limit|server.?error|overloaded|try.?again|timed? out/i.test(
 			err.message,
 		);
-		return { message: err.message, retryable };
+		const contextOverflow = /context_length_exceeded/i.test(err.message);
+		return {
+			message: err.message,
+			retryable,
+			...(contextOverflow ? { contextOverflow: true as const } : {}),
+		};
 	}
 	return { message: String(err), retryable: false };
 }

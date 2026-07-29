@@ -38,6 +38,25 @@ test("surfaces a top-level provider error without retrying an invalid prompt", a
 	]);
 });
 
+test("normalizes a top-level context overflow error", async (t) => {
+	mockStream(t, [
+		{
+			type: "error",
+			code: "context_length_exceeded",
+			message: "The request is too large",
+		} as ResponseStreamEvent,
+	]);
+
+	assert.deepEqual(await collectStream(), [
+		{
+			type: "error",
+			message: "context_length_exceeded: The request is too large",
+			retryable: false,
+			contextOverflow: true,
+		},
+	]);
+});
+
 test("maps a max-output incomplete response to a length finish", async (t) => {
 	mockStream(t, [incompleteEvent("max_output_tokens")]);
 
@@ -107,6 +126,29 @@ test("passes the abort signal to OpenAI and reports cancellation separately", as
 	}
 
 	assert.deepEqual(events, [{ type: "aborted" }]);
+});
+
+test("passes the output token cap to OpenAI", async (t) => {
+	t.mock.method(responsesPrototype, "create", (...args: Parameters<OpenAI["responses"]["create"]>) => {
+		assert.equal(args[0].max_output_tokens, 1234);
+		return {
+			async *[Symbol.asyncIterator]() {
+				yield completedEvent();
+			},
+		} as never;
+	});
+
+	const events: Event[] = [];
+	for await (const event of stream(
+		"gpt-5",
+		[{ role: "user", content: "hello" }],
+		{ kind: "apikey", key: "test" },
+		{ maxOutputTokens: 1234 },
+	)) {
+		events.push(event);
+	}
+
+	assert.equal(events.at(-1)?.type, "done");
 });
 
 function mockStream(t: TestContext, events: ResponseStreamEvent[]) {

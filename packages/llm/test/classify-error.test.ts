@@ -32,6 +32,17 @@ test("treats auth and bad-request errors as terminal without a delay", () => {
 	assert.equal(classifyError(new APIError(400, undefined, "bad request", new Headers())).retryable, false);
 });
 
+test("classifies context overflow from the API code and message fallback", () => {
+	const apiError = new APIError(
+		400,
+		{ code: "context_length_exceeded", message: "request is too large" },
+		undefined,
+		new Headers(),
+	);
+	assert.equal(classifyError(apiError).contextOverflow, true);
+	assert.equal(classifyError(new Error("context_length_exceeded: too many tokens")).contextOverflow, true);
+});
+
 test("classifies a plain Error by matching its message", () => {
 	assert.equal(classifyError(new Error("the model is overloaded")).retryable, true);
 	assert.equal(classifyError(new Error("stream ended before a terminal response event")).retryable, true);
