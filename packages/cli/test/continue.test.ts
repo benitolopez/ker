@@ -67,6 +67,31 @@ test("a JSON prompt leaves an outstanding compaction failure to the snapshot it 
 	assert.deepEqual(first.compactionFailure, compactionFailure);
 });
 
+test("an exhausted context is refused with a way out rather than a bare status", async (t) => {
+	const controlled = controlPrompt(t, {
+		args: ["hello"],
+		promptRejection: { status: 409, body: { code: "context_exhausted" } },
+	});
+
+	await run();
+
+	assert.equal(
+		controlled.stderr.join(""),
+		"ker: this session's context is full and could not be compacted — start a new session with `ker new`, or try `ker compact`\n",
+	);
+	assert.equal(controlled.stdout.join(""), "");
+	assert.equal(process.exitCode, 1);
+});
+
+test("an unexplained rejection still reports its status", async (t) => {
+	const controlled = controlPrompt(t, { args: ["hello"], promptRejection: { status: 409, body: {} } });
+
+	await run();
+
+	assert.equal(controlled.stderr.join(""), "ker: daemon rejected the prompt (HTTP 409)\n");
+	assert.equal(process.exitCode, 1);
+});
+
 test("a bare prompt stops when session creation fails", async (t) => {
 	const controlled = controlPrompt(t, { args: ["hello"], createStatus: 500 });
 
@@ -146,6 +171,7 @@ function controlPrompt(
 		createStatus?: number;
 		sessions?: Protocol.SessionDescriptor[];
 		compactionFailure?: Protocol.CompactionFailure;
+		promptRejection?: { status: number; body: object };
 	},
 ): ControlledPrompt {
 	const originalFetch = globalThis.fetch;
@@ -214,6 +240,9 @@ function controlPrompt(
 			promptSessionIds.push(sessionId);
 			promptBodies.push(JSON.parse(String(init?.body)) as { text: string });
 			promptStarted.resolve();
+			if (options.promptRejection) {
+				return jsonResponse(options.promptRejection.body, options.promptRejection.status);
+			}
 			return jsonResponse(admission(sessionId), 202);
 		}
 		throw new Error(`Unexpected request to ${url.pathname}`);

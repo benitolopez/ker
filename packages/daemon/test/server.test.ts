@@ -1638,6 +1638,37 @@ test("a successful compaction clears the backoff and reports no failure", async 
 	assert.equal(controlled.requests.length, 3);
 });
 
+test("a context the model can no longer hold refuses prompts while manual compaction stays open", async (t) => {
+	const controlled = backoffFactory();
+	const running = await startServer(t, controlled.factory, {
+		compaction: { ...BACKOFF_COMPACTION, enabled: false },
+	});
+	const session = await createSession(running.url);
+
+	await prompt(running.url, session.id, "100000");
+	await waitForIdle(running.url, session.id);
+	const admitted = await rawPrompt(running.url, session.id, { text: "still fits" });
+	assert.equal(admitted.status, 202);
+
+	await prompt(running.url, session.id, "272000");
+	await waitForIdle(running.url, session.id);
+	const refused = await rawPrompt(running.url, session.id, { text: "over the ceiling" });
+	assert.equal(refused.status, 409);
+	assert.deepEqual(await readJson(refused.body), { code: "context_exhausted" });
+	assert.equal((await rawCompact(running.url, session.id, {})).status, 202);
+});
+
+test("a rescuable over-ceiling context is compacted instead of refused", async (t) => {
+	const controlled = backoffFactory("compacted");
+	const running = await startServer(t, controlled.factory, { compaction: BACKOFF_COMPACTION });
+	const session = await createSession(running.url);
+
+	await prompt(running.url, session.id, "272000");
+	await waitForIdle(running.url, session.id);
+	assert.equal(controlled.requests.length, 1);
+	assert.equal((await rawPrompt(running.url, session.id, { text: "after the rescue" })).status, 202);
+});
+
 test("a cancelled automatic compaction does not back off", async (t) => {
 	const controlled = backoffFactory("hang");
 	const running = await startServer(t, controlled.factory, { compaction: BACKOFF_COMPACTION });

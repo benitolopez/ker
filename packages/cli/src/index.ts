@@ -536,10 +536,16 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 			}),
 		});
 		if (submitted.status !== 202) {
+			const exhausted =
+				submitted.status === 409 &&
+				((await submitted.json().catch(() => undefined)) as { code?: string } | undefined)?.code ===
+					"context_exhausted";
 			process.stderr.write(
-				submitted.status === 404
-					? `ker: session ${prompt.sessionId} was not found\n`
-					: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
+				exhausted
+					? "ker: this session's context is full and could not be compacted — start a new session with `ker new`, or try `ker compact`\n"
+					: submitted.status === 404
+						? `ker: session ${prompt.sessionId} was not found\n`
+						: `ker: daemon rejected the prompt (HTTP ${submitted.status})\n`,
 			);
 			process.exitCode = 1;
 			return;

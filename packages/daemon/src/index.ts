@@ -249,12 +249,27 @@ class Registry {
 		return { state, replay: state.tail.filter((envelope) => envelope.sequence > cursor.sequence) };
 	}
 
-	async admit(sessionId: Protocol.SessionId, text: string): Promise<Protocol.PromptAdmission | "missing"> {
+	async admit(
+		sessionId: Protocol.SessionId,
+		text: string,
+	): Promise<Protocol.PromptAdmission | "missing" | "context_exhausted"> {
 		if (!this.#catalog.has(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			await this.#maybePrune(state);
 			const compaction = this.#maybeCompactionItem(state);
+			// The provider would reject a request this large, and nothing queued can shrink it, so the
+			// refusal names a way out instead of leaving the turn to fail against the model.
+			const rescued =
+				compaction !== undefined || [state.queue.running, ...state.queue.waiting].some((i) => i?.kind === "compaction");
+			const contextWindow = state.model?.contextWindow;
+			if (
+				!rescued &&
+				contextWindow !== undefined &&
+				Engine.estimateContextTokens(state.harness.snapshot().messages) >= contextWindow
+			) {
+				return "context_exhausted";
+			}
 			const messageId = randomUUID();
 			const turnId = randomUUID();
 			const queueItemId = randomUUID();
@@ -1414,6 +1429,10 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 			const admitted = await manager.admit(sessionId, prompt.text);
 			if (admitted === "missing") {
 				res.writeHead(404).end();
+				return;
+			}
+			if (admitted === "context_exhausted") {
+				writeJson(res, 409, { code: "context_exhausted" });
 				return;
 			}
 			writeJson(res, 202, admitted);

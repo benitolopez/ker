@@ -144,6 +144,12 @@ nothing to compact. `--json` prints its admission and raw event envelopes. Autom
 the same per-session FIFO queue, so it is visible to monitors and can be cancelled like any other
 running turn.
 
+An automatic compaction that cannot succeed — because the summary would not shrink the context, or
+would land too near the threshold — is discarded rather than applied, and the next attempt waits
+until the context has grown noticeably. Prompts and `stats` report that the last attempt failed, and
+`compact` still runs on demand. If the context outgrows the model window with no compaction able to
+rescue it, a prompt is refused with that explanation instead of failing against the provider.
+
 `npx ker --json monitor "$SESSION_ID"` keeps the diagnostic wire view unchanged: it prints the initial
 `SessionSnapshot`, raw event envelopes, and another snapshot line whenever the event cursor requires a
 resync. The event tail is bounded, so this feed does not promise a complete historical replay.
@@ -173,7 +179,7 @@ npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
 Sessions are stored under `KER_SESSION_DIR` when set, otherwise at `~/.ker/sessions`, grouped by
-canonical Git root and session ID. Protocol v12 uses session-local queue snapshots, and session logs
+canonical Git root and session ID. Protocol v13 uses session-local queue snapshots, and session logs
 use record format v3. Older store versions are reported as unreadable and left byte-for-byte unchanged
 until manually removed.
 
