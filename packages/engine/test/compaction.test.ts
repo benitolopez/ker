@@ -8,10 +8,13 @@ import {
 	createHarness,
 	type EngineConfig,
 	estimateContextTokens,
+	pruneToolOutputs,
 	stripAssistantUsage,
 } from "../src/index.ts";
 
 const USAGE: Protocol.Usage = { input: 8, output: 2, cacheRead: 0, cacheWrite: 0, total: 10 };
+const PRUNED_OUTPUT_PLACEHOLDER =
+	"[Old tool output removed to free context space. Re-read the file or re-run the command if you still need it.]";
 
 test("keeps an assistant cut point and its complete tool step", async () => {
 	const messages: Llm.Message[] = [
@@ -475,6 +478,68 @@ test("computes the compaction gate pair with comparable normalized estimates", a
 	assert(result.outcome.tokensBefore < estimateContextTokens(messages));
 });
 
+test("prunes only worthwhile old tool output beyond the protected turns and token budget", () => {
+	const messages = prunableHistory();
+	const original = structuredClone(messages);
+
+	const result = pruneToolOutputs(messages);
+
+	assert(result);
+	assert.deepEqual(result.toolCallIds, ["call-b", "call-a"]);
+	assert.deepEqual(messages, original);
+	assert(result.tokensAfter < result.tokensBefore);
+	for (const message of result.messages) {
+		if (message.role === "assistant") assert.equal(message.usage, undefined);
+	}
+	const tools = new Map(
+		result.messages.flatMap((message) =>
+			message.role === "tool" ? [[message.toolCallId, message.content] as const] : [],
+		),
+	);
+	assert.equal(tools.get("call-a"), PRUNED_OUTPUT_PLACEHOLDER);
+	assert.equal(tools.get("call-b"), PRUNED_OUTPUT_PLACEHOLDER);
+	assert.notEqual(tools.get("call-c"), PRUNED_OUTPUT_PLACEHOLDER);
+	assert.notEqual(tools.get("call-previous"), PRUNED_OUTPUT_PLACEHOLDER);
+	assert.notEqual(tools.get("call-current"), PRUNED_OUTPUT_PLACEHOLDER);
+});
+
+test("does not prune when the comparable context reduction is below the minimum", () => {
+	const messages: Llm.Message[] = [
+		...toolTurn("small", 40_000),
+		...toolTurn("protected", 160_000),
+		{ role: "user", content: "previous" },
+		{ role: "assistant", content: "previous answer" },
+		{ role: "user", content: "current" },
+		{ role: "assistant", content: "current answer" },
+	];
+
+	assert.equal(pruneToolOutputs(messages), undefined);
+});
+
+test("skips an existing prune placeholder without spending the protection budget", () => {
+	const messages = prunableHistory().map((message) =>
+		message.role === "tool" && message.toolCallId === "call-c"
+			? { ...message, content: PRUNED_OUTPUT_PLACEHOLDER }
+			: message,
+	);
+
+	const result = pruneToolOutputs(messages);
+
+	assert(result);
+	assert.deepEqual(result.toolCallIds, ["call-a"]);
+	const existing = result.messages.find((message) => message.role === "tool" && message.toolCallId === "call-c");
+	assert.equal(existing?.role, "tool");
+	if (existing?.role === "tool") assert.equal(existing.content, PRUNED_OUTPUT_PLACEHOLDER);
+});
+
+test("fails closed when a selected tool call id is duplicated", () => {
+	const messages = prunableHistory().map((message) =>
+		message.role === "tool" && message.toolCallId === "call-current" ? { ...message, toolCallId: "call-b" } : message,
+	);
+
+	assert.equal(pruneToolOutputs(messages), undefined);
+});
+
 test("aborts a summary stream without changing history", async () => {
 	const started = Promise.withResolvers<void>();
 	const controller = new AbortController();
@@ -660,6 +725,31 @@ function longHistory(): Llm.Message[] {
 		{ role: "assistant", content: "old response".repeat(50) },
 		{ role: "user", content: "recent request".repeat(10) },
 		{ role: "assistant", content: "recent response".repeat(10) },
+	];
+}
+
+function prunableHistory(): Llm.Message[] {
+	return [
+		...toolTurn("a", 120_000),
+		...toolTurn("b", 120_000),
+		...toolTurn("c", 120_000),
+		...toolTurn("previous", 120_000),
+		...toolTurn("current", 120_000),
+	];
+}
+
+function toolTurn(id: string, size: number): Llm.Message[] {
+	return [
+		{ role: "user", content: `request ${id}` },
+		{
+			role: "assistant",
+			content: "",
+			toolCalls: [{ callId: `call-${id}`, name: "read", arguments: "{}" }],
+			provider: "openai",
+			model: "test-model",
+			usage: USAGE,
+		},
+		{ role: "tool", toolCallId: `call-${id}`, content: id.repeat(Math.ceil(size / id.length)).slice(0, size) },
 	];
 }
 

@@ -56,13 +56,21 @@ export interface CompactionRecord extends RecordBase {
 	tokensAfter: number;
 }
 
+export interface PruneRecord extends RecordBase {
+	type: "prune";
+	toolCallIds: string[];
+	tokensBefore: number;
+	tokensAfter: number;
+}
+
 export type StoredRecord =
 	| SessionRecord
 	| EventRecord
 	| ConversationRecord
 	| IdentityRecord
 	| AssistantRecord
-	| CompactionRecord;
+	| CompactionRecord
+	| PruneRecord;
 
 export type Payload =
 	| { type: "session"; session: Protocol.SessionDescriptor }
@@ -82,6 +90,12 @@ export type Payload =
 			turnId: Protocol.TurnId;
 			summary: string;
 			firstKeptEntryId: string;
+			tokensBefore: number;
+			tokensAfter: number;
+	  }
+	| {
+			type: "prune";
+			toolCallIds: string[];
 			tokensBefore: number;
 			tokensAfter: number;
 	  };

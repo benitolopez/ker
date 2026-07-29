@@ -69,7 +69,8 @@ Or set `OPENAI_API_KEY` in the environment. `model` is optional and defaults to 
 `recoveryWindowMinutes` is optional and defaults to `0`: after a daemon restart, queued prompts older
 than that many minutes are dropped as `expired` instead of auto-running, and `0` drops all of them.
 The optional `compaction` object accepts `enabled` (default `true`), `reserveTokens` (default `16384`),
-and `keepRecentTokens` (default `20000`).
+`keepRecentTokens` (default `20000`), `prune` (default `true`), and an optional `reasoningEffort`
+override. Without that override, compaction inherits the session effort.
 
 **ChatGPT subscription.** Sign in with your OpenAI account instead of a key:
 
@@ -172,7 +173,7 @@ npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
 Sessions are stored under `KER_SESSION_DIR` when set, otherwise at `~/.ker/sessions`, grouped by
-canonical Git root and session ID. Protocol v11 uses session-local queue snapshots, and session logs
+canonical Git root and session ID. Protocol v12 uses session-local queue snapshots, and session logs
 use record format v3. Older store versions are reported as unreadable and left byte-for-byte unchanged
 until manually removed.
 

@@ -186,6 +186,14 @@ export interface CompactionSkippedEvent extends TurnEventBase {
 	reason: "nothing_to_compact";
 }
 
+export interface PrunedEvent extends EventBase {
+	actor: "process";
+	type: "pruned";
+	toolCallIds: string[];
+	tokensBefore: number;
+	tokensAfter: number;
+}
+
 export interface MessageDeliveredEvent extends TurnEventBase {
 	actor: "human";
 	modelRole: "user";
@@ -329,6 +337,7 @@ export type Event =
 	| CompactionSubmittedEvent
 	| CompactedEvent
 	| CompactionSkippedEvent
+	| PrunedEvent
 	| MessageDeliveredEvent
 	| MessageUndeliveredEvent
 	| TurnCancelRequestedEvent
@@ -348,7 +357,7 @@ export type Event =
 	| ToolCallEvent
 	| ToolResultEvent;
 
-export type TurnEvent = Exclude<Event, QueueChangedEvent>;
+export type TurnEvent = Exclude<Event, QueueChangedEvent | PrunedEvent>;
 
 export interface EventEnvelope {
 	epoch: string;
@@ -383,7 +392,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "11" as const;
+export const PROTOCOL_VERSION = "12" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

@@ -75,6 +75,10 @@ const SUMMARY_MAX_TOKENS = 8_192;
 const OUTPUT_HEADROOM_TOKENS = 32_000;
 const INPUT_BUDGET_FALLBACK_CHARS = 400_000;
 const MAX_CONTEXT_OVERFLOW_RETRIES = 3;
+const PRUNE_PROTECT_TOKENS = 40_000;
+const PRUNE_MINIMUM_TOKENS = 20_000;
+const PRUNED_OUTPUT_PLACEHOLDER =
+	"[Old tool output removed to free context space. Re-read the file or re-run the command if you still need it.]";
 
 // Holds one credential-bound conversation in memory and runs the agent loop. Initial auth is checked
 // before the user message enters history. Completed tool calls always trigger the next model request.
@@ -408,6 +412,56 @@ export function stripAssistantUsage(message: Llm.Message): Llm.Message {
 	if (message.role !== "assistant") return structuredClone(message);
 	const { provider: _provider, model: _model, usage: _usage, ...rest } = message;
 	return structuredClone(rest);
+}
+
+export interface PruneOutcome {
+	toolCallIds: string[];
+	messages: Llm.Message[];
+	tokensBefore: number;
+	tokensAfter: number;
+}
+
+export function pruneToolOutputs(messages: readonly Llm.Message[]): PruneOutcome | undefined {
+	let userTurns = 0;
+	let protectedTokens = 0;
+	const toolCallIds: string[] = [];
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role === "user") {
+			userTurns++;
+			continue;
+		}
+		if (userTurns < 2 || message.role !== "tool" || message.content === PRUNED_OUTPUT_PLACEHOLDER) {
+			continue;
+		}
+		protectedTokens += Math.ceil(message.content.length / 4);
+		if (protectedTokens > PRUNE_PROTECT_TOKENS) toolCallIds.push(message.toolCallId);
+	}
+	if (toolCallIds.length === 0) return undefined;
+
+	const selected = new Set(toolCallIds);
+	const occurrences = new Map<string, number>();
+	for (const message of messages) {
+		if (message.role !== "tool" || !selected.has(message.toolCallId)) continue;
+		occurrences.set(message.toolCallId, (occurrences.get(message.toolCallId) ?? 0) + 1);
+	}
+	if ([...occurrences.values()].some((count) => count > 1)) return undefined;
+
+	const normalizedBefore = messages.map(stripAssistantUsage);
+	const after = applyPrune(normalizedBefore, toolCallIds);
+	const tokensBefore = estimateContextTokens(normalizedBefore);
+	const tokensAfter = estimateContextTokens(after);
+	if (tokensBefore - tokensAfter < PRUNE_MINIMUM_TOKENS) return undefined;
+	return { toolCallIds, messages: after, tokensBefore, tokensAfter };
+}
+
+export function applyPrune(messages: readonly Llm.Message[], toolCallIds: readonly string[]): Llm.Message[] {
+	const selected = new Set(toolCallIds);
+	return messages.map((message) => {
+		const normalized = stripAssistantUsage(message);
+		if (normalized.role !== "tool" || !selected.has(normalized.toolCallId)) return normalized;
+		return { ...normalized, content: PRUNED_OUTPUT_PLACEHOLDER };
+	});
 }
 
 // Summarize the removable prefix without changing live history. The caller persists the result before

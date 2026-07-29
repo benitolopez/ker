@@ -20,6 +20,7 @@ import {
 	type Payload,
 	projectKey,
 	SessionStore,
+	type StoredRecord,
 	type StoredSession,
 } from "./store.ts";
 
@@ -249,6 +250,7 @@ class Registry {
 		if (!this.#catalog.has(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
+			await this.#maybePrune(state);
 			const compaction = this.#maybeCompactionItem(state);
 			const messageId = randomUUID();
 			const turnId = randomUUID();
@@ -459,27 +461,7 @@ class Registry {
 		const conversation = stored.records.filter(
 			(record): record is ConversationRecord => record.type === "conversation",
 		);
-		const compaction = stored.records.findLast((record): record is CompactionRecord => record.type === "compaction");
-		const projectedMessages = (() => {
-			if (!compaction) return conversation.map((record) => structuredClone(record.message));
-			const firstKeptIndex = conversation.findIndex((record) => record.id === compaction.firstKeptEntryId);
-			if (firstKeptIndex === -1) {
-				throw new Error(
-					`Compaction ${compaction.recordId} refers to missing conversation entry ${compaction.firstKeptEntryId}`,
-				);
-			}
-			const compactionIndex = stored.records.indexOf(compaction);
-			const recordPositions = new Map(stored.records.map((record, index) => [record.recordId, index]));
-			return [
-				Engine.compactionSummaryMessage(compaction.summary),
-				...conversation.slice(firstKeptIndex).map((record) => {
-					if ((recordPositions.get(record.recordId) ?? Number.POSITIVE_INFINITY) < compactionIndex) {
-						return Engine.stripAssistantUsage(record.message);
-					}
-					return structuredClone(record.message);
-				}),
-			];
-		})();
+		const projectedMessages = projectMessages(stored.records);
 		const identity = stored.records.findLast(
 			(record): record is IdentityRecord => record.type === "identity",
 		)?.identity;
@@ -1138,6 +1120,7 @@ class Registry {
 	async #advanceQueue(state: SessionState, finishedItemId: Protocol.QueueItemId): Promise<void> {
 		if (state.queue.running?.id !== finishedItemId) return;
 		state.queue.running = undefined;
+		await this.#maybePrune(state);
 		const compaction = this.#maybeCompactionItem(state);
 		const next = compaction ? undefined : this.#stopping ? undefined : state.queue.waiting.shift();
 		const item = compaction ?? (next ? state.items.get(next.id) : undefined);
@@ -1155,6 +1138,7 @@ class Registry {
 
 	async #startNext(state: SessionState): Promise<void> {
 		if (this.#stopping || state.queue.running) return;
+		await this.#maybePrune(state);
 		const compaction = this.#maybeCompactionItem(state);
 		const next = compaction ? undefined : state.queue.waiting.shift();
 		const item = compaction ?? (next ? state.items.get(next.id) : undefined);
@@ -1171,6 +1155,45 @@ class Registry {
 		payloads.push(this.#queueChangedPayload(state));
 		await this.#appendAndPublish(state, payloads);
 		this.#start(running, state);
+	}
+
+	async #maybePrune(state: SessionState): Promise<void> {
+		const contextWindow = state.model?.contextWindow;
+		if (this.#stopping || !this.#compaction.prune || contextWindow === undefined || state.activeTurn) return;
+		const snapshot = state.harness.snapshot();
+		if (snapshot.messages.length !== state.persistedMessageCount) return;
+		const trigger = contextWindow - this.#compaction.reserveTokens;
+		if (Engine.estimateContextTokens(snapshot.messages) <= trigger) return;
+		const outcome = Engine.pruneToolOutputs(snapshot.messages);
+		if (!outcome) return;
+
+		const replacement = this.#harnessFactory(
+			{ messages: outcome.messages, identity: state.identity },
+			state.stored.session.cwd,
+		);
+		state.queue.revision++;
+		await this.#appendAndPublish(state, [
+			{
+				type: "prune",
+				toolCallIds: outcome.toolCallIds,
+				tokensBefore: outcome.tokensBefore,
+				tokensAfter: outcome.tokensAfter,
+			},
+			{
+				type: "event",
+				event: {
+					actor: "process",
+					sessionId: state.stored.session.id,
+					type: "pruned",
+					toolCallIds: outcome.toolCallIds,
+					tokensBefore: outcome.tokensBefore,
+					tokensAfter: outcome.tokensAfter,
+				},
+			},
+			this.#queueChangedPayload(state),
+		]);
+		state.harness = replacement;
+		state.persistedMessageCount = outcome.messages.length;
 	}
 
 	#maybeCompactionItem(
@@ -1242,6 +1265,43 @@ class Registry {
 		);
 		return running;
 	}
+}
+
+interface ProjectedMessage {
+	message: Llm.Message;
+	entryId?: string;
+}
+
+// Applies context mutations in log order. Compaction slices the current projection so an earlier
+// prune stays applied when its tool result falls inside the kept tail.
+function projectMessages(records: readonly StoredRecord[]): Llm.Message[] {
+	let projected: ProjectedMessage[] = [];
+	for (const record of records) {
+		if (record.type === "conversation") {
+			projected.push({ message: structuredClone(record.message), entryId: record.id });
+			continue;
+		}
+		if (record.type === "prune") {
+			const messages = Engine.applyPrune(
+				projected.map((entry) => entry.message),
+				record.toolCallIds,
+			);
+			projected = projected.map((entry, index) => ({ ...entry, message: messages[index] }));
+			continue;
+		}
+		if (record.type !== "compaction") continue;
+		const firstKeptIndex = projected.findIndex((entry) => entry.entryId === record.firstKeptEntryId);
+		if (firstKeptIndex === -1) {
+			throw new Error(`Compaction ${record.recordId} refers to missing conversation entry ${record.firstKeptEntryId}`);
+		}
+		projected = [
+			{ message: Engine.compactionSummaryMessage(record.summary) },
+			...projected
+				.slice(firstKeptIndex)
+				.map((entry) => ({ ...entry, message: Engine.stripAssistantUsage(entry.message) })),
+		];
+	}
+	return projected.map((entry) => entry.message);
 }
 
 async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMessage, res: ServerResponse) {

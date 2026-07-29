@@ -59,6 +59,28 @@ test("serializes concurrent appends within one session", async (t) => {
 	assert.equal(loaded.records.length, 3);
 });
 
+test("round-trips prune records", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-prune-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const session = await store.create(baseDir);
+	await session.log.append([
+		{
+			type: "prune",
+			toolCallIds: ["call-1", "call-2"],
+			tokensBefore: 120_000,
+			tokensAfter: 60_000,
+		},
+	]);
+
+	const loaded = await store.loadSession(session.log.path);
+	const prune = loaded.records.find((record) => record.type === "prune");
+	assert(prune);
+	assert.deepEqual(prune.toolCallIds, ["call-1", "call-2"]);
+	assert.equal(prune.tokensBefore, 120_000);
+	assert.equal(prune.tokensAfter, 60_000);
+});
+
 test("truncates only a malformed final partial line", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-torn-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));

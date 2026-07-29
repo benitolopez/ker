@@ -320,6 +320,14 @@ test("monitor", async (t) => {
 				type: "compaction_skipped",
 				reason: "nothing_to_compact",
 			},
+			{
+				actor: "process",
+				sessionId: "session-1",
+				type: "pruned",
+				toolCallIds: ["call-1", "call-2"],
+				tokensBefore: 120_000,
+				tokensAfter: 60_000,
+			},
 		]);
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		controlled.closeFirst();
@@ -332,6 +340,7 @@ test("monitor", async (t) => {
 				"ker: saved summary\n",
 				"ker: waiting for turns\n",
 				"ker: nothing to compact (turn compact-2)\n",
+				"ker: pruned 2 tool outputs (120,000 → 60,000 tokens)\n",
 			].join(""),
 		);
 		findNewSignalListener(controlled.signalListeners)("SIGINT");

@@ -686,6 +686,10 @@ class Renderer {
 	}
 
 	event(event: Protocol.Event, matches: (turnId: Protocol.TurnId) => boolean): void {
+		if (event.type === "pruned") {
+			if (this.#monitor) writePruned(event.toolCallIds.length, event.tokensBefore, event.tokensAfter);
+			return;
+		}
 		if (!("turnId" in event) || !matches(event.turnId)) return;
 		if (event.type === "turn_cancel_requested") this.#transition(event.turnId, "cancelling");
 		if (event.type === "turn_terminal") this.#transition(event.turnId, event.reason);
@@ -863,6 +867,12 @@ function formatTokens(tokens: number): string {
 
 function writeCompacted(tokensBefore: number, tokensAfter: number): void {
 	process.stderr.write(`ker: compacted (${formatTokens(tokensBefore)} → ${formatTokens(tokensAfter)} tokens)\n`);
+}
+
+function writePruned(count: number, tokensBefore: number, tokensAfter: number): void {
+	process.stderr.write(
+		`ker: pruned ${count} tool outputs (${formatTokens(tokensBefore)} → ${formatTokens(tokensAfter)} tokens)\n`,
+	);
 }
 
 function writeIdle(): void {

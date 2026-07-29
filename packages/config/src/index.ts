@@ -13,6 +13,7 @@ export interface CompactionSettings {
 	reserveTokens: number;
 	keepRecentTokens: number;
 	reasoningEffort?: ReasoningEffort;
+	prune: boolean;
 }
 
 export interface Config {
@@ -40,6 +41,7 @@ export function loadConfig(): Config {
 			reserveTokens: file.compaction?.reserveTokens ?? 16_384,
 			keepRecentTokens: file.compaction?.keepRecentTokens ?? 20_000,
 			reasoningEffort: file.compaction?.reasoningEffort,
+			prune: file.compaction?.prune ?? true,
 		},
 		recoveryWindowMinutes: file.recoveryWindowMinutes ?? 0,
 	};

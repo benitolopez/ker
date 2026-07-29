@@ -12,6 +12,8 @@ import { createDaemon, type DaemonOptions, type Harness } from "../src/index.ts"
 import { type Payload, SessionStore, type StoredRecord } from "../src/store.ts";
 
 const LOCAL_HOST = "127.0.0.1:5537";
+const PRUNED_OUTPUT_PLACEHOLDER =
+	"[Old tool output removed to free context space. Re-read the file or re-run the command if you still need it.]";
 
 test("creates and lists explicit durable sessions", async (t) => {
 	const running = await startServer(t, immediateFactory());
@@ -891,7 +893,7 @@ test("restart expires a waiting compaction without emitting a prompt delivery fa
 	const running = await startServer(t, passiveFactory(captured), {
 		sessionDir,
 		recoveryWindowMinutes: 0,
-		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
 
 	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
@@ -1106,7 +1108,7 @@ test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
 test("manual compaction validates instructions and reports a durable skip", async (t) => {
 	const requests: Engine.CompactionRequest[] = [];
 	const running = await startServer(t, compactionFactory(requests, "skipped"), {
-		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
 	const session = await createSession(running.url);
 
@@ -1145,7 +1147,7 @@ test("rejects a compaction that does not shrink without recording or rebuilding"
 		},
 		{
 			sessionDir,
-			compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+			compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 		},
 	);
 	const session = await createSession(running.url);
@@ -1188,7 +1190,7 @@ test("applies the bounded watermark only to automatic compaction", async (t) => 
 		},
 		{
 			sessionDir,
-			compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1 },
+			compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1, prune: false },
 		},
 	);
 	const session = await createSession(running.url);
@@ -1227,7 +1229,7 @@ test("applies the bounded watermark only to automatic compaction", async (t) => 
 test("a non-positive automatic trigger skips compaction while manual compaction still runs", async (t) => {
 	const requests: Engine.CompactionRequest[] = [];
 	const running = await startServer(t, compactionFactory(requests, "compacted"), {
-		compaction: { enabled: true, reserveTokens: 272_000, keepRecentTokens: 1 },
+		compaction: { enabled: true, reserveTokens: 272_000, keepRecentTokens: 1, prune: false },
 	});
 	const session = await createSession(running.url);
 	const admittedPrompt = await prompt(running.url, session.id, "do not compact automatically");
@@ -1254,7 +1256,7 @@ test("restart interrupts a compaction that crashed before its record was appende
 	const captured: Engine.HarnessState[] = [];
 	const running = await startServer(t, passiveFactory(captured), {
 		sessionDir,
-		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
 
 	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
@@ -1297,7 +1299,7 @@ test("restart completes a compaction that crashed after its record was appended"
 	const captured: Engine.HarnessState[] = [];
 	const running = await startServer(t, passiveFactory(captured), {
 		sessionDir,
-		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
 
 	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
@@ -1353,7 +1355,7 @@ test("cancelling a running compaction leaves history and the harness untouched",
 	};
 	const running = await startServer(t, factory, {
 		sessionDir,
-		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
 	const session = await createSession(running.url);
 	const response = await rawCompact(running.url, session.id, {});
@@ -1403,7 +1405,7 @@ test("cancelling a waiting compaction does not emit a prompt delivery failure or
 		},
 		{
 			sessionDir,
-			compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+			compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 		},
 	);
 	const session = await createSession(running.url);
@@ -1450,7 +1452,7 @@ test("repeat compaction uses the latest summary and the next prompt persists no 
 	const requests: Engine.CompactionRequest[] = [];
 	const running = await startServer(t, compactionFactory(requests, "compacted"), {
 		sessionDir,
-		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
 	const session = await createSession(running.url);
 	const firstPrompt = await prompt(running.url, session.id, "first");
@@ -1489,7 +1491,7 @@ test("repeat compaction uses the latest summary and the next prompt persists no 
 test("automatic compaction stays latched until a prompt usage event rearms it", { timeout: 10_000 }, async (t) => {
 	const requests: Engine.CompactionRequest[] = [];
 	const running = await startServer(t, compactionFactory(requests, "skipped"), {
-		compaction: { enabled: true, reserveTokens: 271_999, keepRecentTokens: 1 },
+		compaction: { enabled: true, reserveTokens: 271_999, keepRecentTokens: 1, prune: false },
 	});
 	const session = await createSession(running.url);
 	const first = await prompt(running.url, session.id, "first");
@@ -1561,7 +1563,7 @@ test("an over-ceiling idle session compacts before admitting its next prompt", a
 	const requests: Engine.CompactionRequest[] = [];
 	const running = await startServer(t, compactionFactory(requests, "compacted"), {
 		sessionDir,
-		compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1 },
+		compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1, prune: false },
 	});
 
 	const admitted = await prompt(running.url, seeded.session.id, "rescue me");
@@ -1588,7 +1590,7 @@ test(
 		const requests: Engine.CompactionRequest[] = [];
 		const running = await startServer(t, compactionFactory(requests, "compacted"), {
 			sessionDir,
-			compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1 },
+			compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1, prune: false },
 		});
 		const session = await createSession(running.url);
 		const admitted = await prompt(running.url, session.id, "remember this");
@@ -1614,6 +1616,226 @@ test(
 		assert.equal(catalog.idle, true);
 	},
 );
+
+test("prunes old tool output before admission and avoids compaction below the threshold", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-prune-only-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedPrunableSession(store);
+	const prune = Engine.pruneToolOutputs(seeded.messages);
+	assert(prune);
+	const threshold = Math.floor((prune.tokensBefore + prune.tokensAfter) / 2);
+	const requests: Engine.CompactionRequest[] = [];
+	const running = await startServer(t, compactionFactory(requests, "skipped"), {
+		sessionDir,
+		compaction: {
+			enabled: true,
+			reserveTokens: 272_000 - threshold,
+			keepRecentTokens: 1,
+			prune: true,
+		},
+	});
+
+	const admission = await prompt(running.url, seeded.session.session.id, "continue");
+	assert.equal(admission.status, "running");
+	assert.equal(admission.queue.running?.kind, "prompt");
+	await waitForTerminal(running.url, seeded.session.session.id, admission.turnId);
+
+	assert.equal(requests.length, 0);
+	const stored = await store.loadSession(seeded.session.log.path);
+	assert.equal(stored.records.filter((record) => record.type === "prune").length, 1);
+	assert.equal(stored.records.filter((record) => record.type === "event" && record.event.type === "pruned").length, 1);
+	const snapshot = await getSnapshot(running.url, seeded.session.session.id);
+	assert.equal(
+		snapshot.entries.some((entry) => entry.role === "compaction"),
+		false,
+	);
+	const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+	assert.equal(catalog.idle, true);
+});
+
+test("queues compaction after pruning when the reduced context stays above the threshold", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-prune-then-compact-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedPrunableSession(store);
+	const prune = Engine.pruneToolOutputs(seeded.messages);
+	assert(prune);
+	const requests: Engine.CompactionRequest[] = [];
+	const running = await startServer(t, compactionFactory(requests, "skipped"), {
+		sessionDir,
+		compaction: {
+			enabled: true,
+			reserveTokens: 272_000 - (prune.tokensAfter - 1),
+			keepRecentTokens: 1,
+			prune: true,
+		},
+	});
+
+	const admission = await prompt(running.url, seeded.session.session.id, "continue");
+	assert.equal(admission.status, "waiting");
+	assert.equal(admission.queue.running?.kind, "compaction");
+	await waitForTerminal(running.url, seeded.session.session.id, admission.turnId);
+
+	assert.equal(requests.length, 1);
+	const stored = await store.loadSession(seeded.session.log.path);
+	const pruneIndex = stored.records.findIndex((record) => record.type === "prune");
+	const compactionIndex = stored.records.findIndex(
+		(record) => record.type === "event" && record.event.type === "compaction_submitted",
+	);
+	assert(pruneIndex !== -1 && pruneIndex < compactionIndex);
+});
+
+test("builds the pruned harness before appending the durable record", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-prune-factory-failure-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const seeded = await seedPrunableSession(store);
+	const base = compactionFactory([], "skipped");
+	let harnessCreations = 0;
+	const running = await startServer(
+		t,
+		(initial, cwd) => {
+			harnessCreations++;
+			if (harnessCreations === 2) throw new Error("factory failed");
+			return base(initial, cwd);
+		},
+		{
+			sessionDir,
+			compaction: {
+				enabled: true,
+				reserveTokens: 271_999,
+				keepRecentTokens: 1,
+				prune: true,
+			},
+		},
+	);
+
+	const response = await rawPrompt(running.url, seeded.session.session.id, { text: "continue" });
+
+	assert.equal(response.status, 500);
+	assert.equal(harnessCreations, 2);
+	const stored = await store.loadSession(seeded.session.log.path);
+	assert.equal(
+		stored.records.some((record) => record.type === "prune"),
+		false,
+	);
+});
+
+test("replay applies prune records and strips stale assistant usage", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-prune-replay-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const session = await store.create(process.cwd());
+	const usage: Protocol.Usage = { input: 80_000, output: 1, cacheRead: 0, cacheWrite: 0, total: 80_001 };
+	await session.log.append([
+		{
+			type: "conversation",
+			id: "entry-assistant",
+			parentId: null,
+			turnId: "turn-old",
+			message: {
+				role: "assistant",
+				content: "",
+				toolCalls: [{ callId: "call-old", name: "read", arguments: "{}" }],
+				provider: "openai",
+				model: "gpt-5.4-mini",
+				usage,
+			},
+		},
+		{
+			type: "conversation",
+			id: "entry-tool",
+			parentId: "entry-assistant",
+			turnId: "turn-old",
+			message: { role: "tool", toolCallId: "call-old", content: "large output" },
+		},
+		{ type: "prune", toolCallIds: ["call-old"], tokensBefore: 80_001, tokensAfter: 30 },
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				type: "queue_changed",
+				queue: { revision: 1, waiting: [] },
+			},
+		},
+	]);
+	const captured: Engine.HarnessState[] = [];
+	const running = await startServer(t, passiveFactory(captured), { sessionDir });
+	await getSnapshot(running.url, session.session.id);
+
+	const assistant = captured[0]?.messages[0];
+	assert.equal(assistant?.role, "assistant");
+	if (assistant?.role === "assistant") assert.equal(assistant.usage, undefined);
+	const tool = captured[0]?.messages[1];
+	assert.equal(tool?.role, "tool");
+	if (tool?.role === "tool") assert.equal(tool.content, PRUNED_OUTPUT_PLACEHOLDER);
+});
+
+test("ordered replay keeps pruned output through compaction in either record order", async (t) => {
+	const liveProjection = Engine.applyPrune(
+		[
+			Engine.compactionSummaryMessage("summary"),
+			{
+				role: "assistant",
+				content: "",
+				toolCalls: [{ callId: "call-old", name: "read", arguments: "{}" }],
+			},
+			{ role: "tool", toolCallId: "call-old", content: "large output" },
+		],
+		["call-old"],
+	);
+	for (const order of ["prune-first", "compaction-first"] as const) {
+		const sessionDir = await mkdtemp(join(tmpdir(), `ker-daemon-prune-${order}-`));
+		t.after(() => rm(sessionDir, { recursive: true, force: true }));
+		const store = new SessionStore({ baseDir: sessionDir });
+		const session = await seedInterleavedContext(store, order);
+		const captured: Engine.HarnessState[] = [];
+		const running = await startServer(t, passiveFactory(captured), { sessionDir });
+		await getSnapshot(running.url, session.session.id);
+
+		assert.deepEqual(captured[0]?.messages, liveProjection);
+	}
+});
+
+test("a log ending on a pruned event replays consistently during recovery", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-prune-recovery-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const session = await store.create(process.cwd());
+	await session.log.append([
+		{
+			type: "conversation",
+			id: "entry-tool",
+			parentId: null,
+			turnId: "turn-old",
+			message: { role: "tool", toolCallId: "call-old", content: "large output" },
+		},
+		{ type: "prune", toolCallIds: ["call-old"], tokensBefore: 30_000, tokensAfter: 30 },
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				type: "pruned",
+				toolCallIds: ["call-old"],
+				tokensBefore: 30_000,
+				tokensAfter: 30,
+			},
+		},
+	]);
+	const captured: Engine.HarnessState[] = [];
+	const running = await startServer(t, passiveFactory(captured), { sessionDir });
+	const snapshot = await getSnapshot(running.url, session.session.id);
+
+	assert.equal(snapshot.queue.running, undefined);
+	const tool = captured[0]?.messages[0];
+	assert.equal(tool?.role, "tool");
+	if (tool?.role === "tool") assert.equal(tool.content, PRUNED_OUTPUT_PLACEHOLDER);
+	const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+	assert.equal(catalog.idle, false);
+});
 
 test("replay projects the latest compaction while preserving every transcript entry", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-replay-"));
@@ -2169,6 +2391,106 @@ async function seedRunningCompaction(store: SessionStore, compacted: boolean) {
 	return { session, item };
 }
 
+async function seedPrunableSession(store: SessionStore) {
+	const session = await store.create(process.cwd());
+	const messages = ["a", "b", "c", "previous", "current"].flatMap(prunableToolTurn);
+	const payloads: Payload[] = messages.map((message, index) => ({
+		type: "conversation",
+		id: `entry-${index}`,
+		parentId: index === 0 ? null : `entry-${index - 1}`,
+		turnId: `turn-${Math.floor(index / 3)}`,
+		message,
+	}));
+	payloads.push(
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				turnId: "turn-current",
+				type: "usage",
+				provider: "openai",
+				model: "gpt-5.4-mini",
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+			},
+		},
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				type: "queue_changed",
+				queue: { revision: 1, waiting: [] },
+			},
+		},
+	);
+	await session.log.append(payloads);
+	return { session, messages };
+}
+
+function prunableToolTurn(id: string): Engine.HarnessState["messages"] {
+	const content = id.repeat(Math.ceil(120_000 / id.length)).slice(0, 120_000);
+	return [
+		{ role: "user", content: `request ${id}` },
+		{
+			role: "assistant",
+			content: "",
+			toolCalls: [{ callId: `call-${id}`, name: "read", arguments: "{}" }],
+		},
+		{ role: "tool", toolCallId: `call-${id}`, content },
+	];
+}
+
+async function seedInterleavedContext(store: SessionStore, order: "prune-first" | "compaction-first") {
+	const session = await store.create(process.cwd());
+	const prune: Payload = {
+		type: "prune",
+		toolCallIds: ["call-old"],
+		tokensBefore: 30_000,
+		tokensAfter: 30,
+	};
+	const compaction: Payload = {
+		type: "compaction",
+		turnId: "turn-compact",
+		summary: "summary",
+		firstKeptEntryId: "entry-owner",
+		tokensBefore: 30_000,
+		tokensAfter: 30,
+	};
+	const mutations = order === "prune-first" ? [prune, compaction] : [compaction, prune];
+	await session.log.append([
+		{
+			type: "conversation",
+			id: "entry-owner",
+			parentId: null,
+			turnId: "turn-old",
+			message: {
+				role: "assistant",
+				content: "",
+				toolCalls: [{ callId: "call-old", name: "read", arguments: "{}" }],
+			},
+		},
+		{
+			type: "conversation",
+			id: "entry-tool",
+			parentId: "entry-owner",
+			turnId: "turn-old",
+			message: { role: "tool", toolCallId: "call-old", content: "large output" },
+		},
+		...mutations,
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				type: "queue_changed",
+				queue: { revision: 1, waiting: [] },
+			},
+		},
+	]);
+	return session;
+}
+
 async function seedCancellingWithWaiting(store: SessionStore) {
 	const session = await seedRunning(store, [], "cancelling");
 	const running: Protocol.PromptQueueItem = {
@@ -2441,6 +2763,7 @@ async function startServer(
 			enabled: true,
 			reserveTokens: 16_384,
 			keepRecentTokens: 20_000,
+			prune: true,
 		},
 	});
 	await new Promise<void>((resolve, reject) => {

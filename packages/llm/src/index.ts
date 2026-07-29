@@ -4,6 +4,8 @@ import { models } from "./models.generated.ts";
 
 export type { Model, Provider, Usage } from "@ker-ai/protocol";
 
+// Call ids are unique within a session. An adapter whose native ids are only turn-scoped namespaces
+// them before emitting a call, so durable records can identify one result without touching another.
 export interface ToolCall {
 	callId: string;
 	itemId?: string;
