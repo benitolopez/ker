@@ -341,6 +341,55 @@ test("retries a pre-output failure with fresh auth and yields summary usage", as
 	assert.deepEqual(observed, { auth: 2, streams: 2 });
 });
 
+test("retries a failure that arrives mid-summary and keeps only the last attempt's text", async () => {
+	let streams = 0;
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* () {
+				streams++;
+				if (streams === 1) {
+					yield { type: "delta", text: "partial from the lost attempt" };
+					yield { type: "error", message: "connection reset", retryable: true, retryAfterMs: 0 };
+					return;
+				}
+				yield { type: "delta", text: "complete summary" };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{ messages: longHistory() },
+	);
+
+	const result = await collect(harness.compact(request()));
+
+	assert.equal(streams, 2);
+	assert.equal(result.outcome.kind, "compacted");
+	if (result.outcome.kind === "compacted") assert.equal(result.outcome.summary, "complete summary");
+	assert.deepEqual(
+		result.events.map((event) => event.type),
+		["retry", "usage"],
+	);
+});
+
+test("reports an exhausted transient failure as retryable", async () => {
+	let streams = 0;
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* () {
+				streams++;
+				yield { type: "error", message: "OpenAI request timed out", retryable: true, retryAfterMs: 0 };
+			},
+		},
+		{ messages: longHistory() },
+	);
+
+	const result = await collect(harness.compact(request()));
+
+	assert.equal(streams, 4);
+	assert.deepEqual(result.outcome, { kind: "stopped", retryable: true });
+});
+
 test("treats a length-limited summary as an error", async () => {
 	const harness = createHarness(
 		config(),

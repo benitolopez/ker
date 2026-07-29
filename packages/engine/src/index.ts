@@ -54,7 +54,9 @@ export type CompactionOutcome =
 			messages: Llm.Message[];
 	  }
 	| { kind: "skipped"; reason: "nothing_to_compact" }
-	| { kind: "stopped" }
+	// retryable marks a transient provider failure that spent its retries here, so a later attempt
+	// can still succeed without the conversation changing.
+	| { kind: "stopped"; retryable?: true }
 	| { kind: "aborted" };
 
 export interface HarnessState {
@@ -465,7 +467,9 @@ export function applyPrune(messages: readonly Llm.Message[], toolCallIds: readon
 }
 
 // Summarize the removable prefix without changing live history. The caller persists the result before
-// replacing its harness, so a failed append leaves the conversation untouched.
+// replacing its harness, so a failed append leaves the conversation untouched. Every attempt rebuilds
+// the summary from scratch, so unlike a visible model response this one retries even after partial
+// text arrived.
 async function* compactMessages(
 	config: EngineConfig,
 	dependencies: Dependencies,
@@ -503,7 +507,6 @@ async function* compactMessages(
 
 	let prompt = initialPrompt.prompt;
 	let budgetChars = initialBudgetChars;
-	let summary = "";
 	let transientAttempts = 0;
 	let overflowRetries = 0;
 	let firstAttempt = true;
@@ -518,7 +521,7 @@ async function* compactMessages(
 			return { kind: "stopped" };
 		}
 		const auth = authResult.auth;
-		let sawOutput = false;
+		let summary = "";
 		let pending: { delayMs: number; message: string } | undefined;
 		let overflowPending: { message: string } | undefined;
 
@@ -528,7 +531,6 @@ async function* compactMessages(
 			signal,
 		})) {
 			if (signal?.aborted || event.type === "aborted") return { kind: "aborted" };
-			if (event.type !== "done" && event.type !== "error") sawOutput = true;
 			if (event.type === "delta") summary += event.text;
 			if (event.type === "done") {
 				const provider = Llm.providerOf(auth);
@@ -613,18 +615,17 @@ async function* compactMessages(
 					}
 					prompt = nextPrompt.prompt;
 					budgetChars = nextBudgetChars;
-					summary = "";
 					overflowRetries++;
 					overflowPending = { message: event.message };
 					break;
 				}
-				if (!sawOutput && event.retryable && transientAttempts < MAX_RETRIES) {
+				if (event.retryable && transientAttempts < MAX_RETRIES) {
 					const delayMs = Math.min(event.retryAfterMs ?? BASE_DELAY_MS * 2 ** transientAttempts, MAX_DELAY_MS);
 					pending = { delayMs, message: event.message };
 					break;
 				}
 				yield { actor: "process", ...scope, type: "error", message: event.message };
-				return { kind: "stopped" };
+				return event.retryable ? { kind: "stopped", retryable: true } : { kind: "stopped" };
 			}
 		}
 
