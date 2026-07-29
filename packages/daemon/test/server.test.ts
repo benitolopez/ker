@@ -1130,6 +1130,121 @@ test("manual compaction validates instructions and reports a durable skip", asyn
 	);
 });
 
+test("rejects a compaction that does not shrink without recording or rebuilding", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-no-shrink-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const requests: Engine.CompactionRequest[] = [];
+	const factory = compactionFactory(requests, { tokensBefore: 17, tokensAfter: 17 });
+	let harnessCreations = 0;
+	const running = await startServer(
+		t,
+		(initial, cwd) => {
+			harnessCreations++;
+			return factory(initial, cwd);
+		},
+		{
+			sessionDir,
+			compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20 },
+		},
+	);
+	const session = await createSession(running.url);
+	const admittedPrompt = await prompt(running.url, session.id, "remember");
+	await waitForTerminal(running.url, session.id, admittedPrompt.turnId);
+	const response = await rawCompact(running.url, session.id, {});
+	const admitted = await readJson<Protocol.CompactionAdmission>(response.body);
+	await waitForTerminal(running.url, session.id, admitted.turnId);
+
+	const snapshot = await getSnapshot(running.url, session.id);
+	assert.equal(snapshot.turns.find((turn) => turn.id === admitted.turnId)?.status, "error");
+	assert.equal(harnessCreations, 1);
+	const [catalog] = await store.scanCatalog();
+	const stored = await store.loadSession(catalog.path);
+	assert.equal(
+		stored.records.some((record) => record.type === "compaction"),
+		false,
+	);
+	const error = stored.records.find(
+		(record) => record.type === "event" && record.event.type === "error" && record.event.turnId === admitted.turnId,
+	);
+	assert.equal(error?.type, "event");
+	if (error?.type === "event" && error.event.type === "error") {
+		assert.equal(error.event.message, "Compaction did not reduce the context (17 → 17 tokens)");
+	}
+});
+
+test("applies the bounded watermark only to automatic compaction", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-watermark-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const requests: Engine.CompactionRequest[] = [];
+	const factory = compactionFactory(requests, { tokensBefore: 17, tokensAfter: 6 });
+	let harnessCreations = 0;
+	const running = await startServer(
+		t,
+		(initial, cwd) => {
+			harnessCreations++;
+			return factory(initial, cwd);
+		},
+		{
+			sessionDir,
+			compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1 },
+		},
+	);
+	const session = await createSession(running.url);
+	const promptAdmission = await prompt(running.url, session.id, "cross the threshold");
+	await waitForCompactionAttempts(running.url, session.id, requests, 1);
+
+	const afterAuto = await getSnapshot(running.url, session.id);
+	const autoTurn = afterAuto.turns.find((turn) => turn.id !== promptAdmission.turnId);
+	assert.equal(autoTurn?.status, "error");
+	assert.equal(harnessCreations, 1);
+	const afterAutoStored = await store.loadSession((await store.scanCatalog())[0].path);
+	const autoError = afterAutoStored.records.find(
+		(record) => record.type === "event" && record.event.type === "error" && record.event.turnId === autoTurn?.id,
+	);
+	assert.equal(autoError?.type, "event");
+	if (autoError?.type === "event" && autoError.event.type === "error") {
+		assert.equal(autoError.event.message, "Compacted context is still too close to the compaction threshold");
+	}
+	assert.equal(
+		afterAutoStored.records.some((record) => record.type === "compaction"),
+		false,
+	);
+
+	const response = await rawCompact(running.url, session.id, {});
+	const manual = await readJson<Protocol.CompactionAdmission>(response.body);
+	await waitForTerminal(running.url, session.id, manual.turnId);
+
+	const afterManual = await getSnapshot(running.url, session.id);
+	assert.equal(afterManual.turns.find((turn) => turn.id === manual.turnId)?.status, "completed");
+	assert.equal(harnessCreations, 2);
+	const afterManualStored = await store.loadSession((await store.scanCatalog())[0].path);
+	assert.equal(afterManualStored.records.filter((record) => record.type === "compaction").length, 1);
+});
+
+test("a non-positive automatic trigger skips compaction while manual compaction still runs", async (t) => {
+	const requests: Engine.CompactionRequest[] = [];
+	const running = await startServer(t, compactionFactory(requests, "compacted"), {
+		compaction: { enabled: true, reserveTokens: 272_000, keepRecentTokens: 1 },
+	});
+	const session = await createSession(running.url);
+	const admittedPrompt = await prompt(running.url, session.id, "do not compact automatically");
+	await waitForTerminal(running.url, session.id, admittedPrompt.turnId);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+
+	assert.equal(requests.length, 0);
+	const response = await rawCompact(running.url, session.id, {});
+	const manual = await readJson<Protocol.CompactionAdmission>(response.body);
+	await waitForTerminal(running.url, session.id, manual.turnId);
+
+	assert.equal(requests.length, 1);
+	assert.equal(
+		(await getSnapshot(running.url, session.id)).turns.find((turn) => turn.id === manual.turnId)?.status,
+		"completed",
+	);
+});
+
 test("restart interrupts a compaction that crashed before its record was appended", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-crash-before-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
@@ -1445,7 +1560,7 @@ test("an over-ceiling idle session compacts before admitting its next prompt", a
 	const requests: Engine.CompactionRequest[] = [];
 	const running = await startServer(t, compactionFactory(requests, "compacted"), {
 		sessionDir,
-		compaction: { enabled: true, reserveTokens: 271_999, keepRecentTokens: 1 },
+		compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1 },
 	});
 
 	const admitted = await prompt(running.url, seeded.session.id, "rescue me");
@@ -1472,7 +1587,7 @@ test(
 		const requests: Engine.CompactionRequest[] = [];
 		const running = await startServer(t, compactionFactory(requests, "compacted"), {
 			sessionDir,
-			compaction: { enabled: true, reserveTokens: 271_999, keepRecentTokens: 1 },
+			compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1 },
 		});
 		const session = await createSession(running.url);
 		const admitted = await prompt(running.url, session.id, "remember this");
@@ -1646,7 +1761,7 @@ test("shutdown aborts and awaits active turns in every session", async (t) => {
 
 function compactionFactory(
 	requests: Engine.CompactionRequest[],
-	outcome: "compacted" | "skipped",
+	outcome: "compacted" | "skipped" | { tokensBefore: number; tokensAfter: number },
 ): NonNullable<DaemonOptions["harnessFactory"]> {
 	return (initial) => {
 		const state = structuredClone(initial);
@@ -1672,8 +1787,8 @@ function compactionFactory(
 					kind: "compacted",
 					summary,
 					keptCount: kept.length,
-					tokensBefore: 17,
-					tokensAfter: 5,
+					tokensBefore: typeof outcome === "string" ? 17 : outcome.tokensBefore,
+					tokensAfter: typeof outcome === "string" ? 5 : outcome.tokensAfter,
 					messages,
 				};
 			},

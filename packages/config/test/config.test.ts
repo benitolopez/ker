@@ -16,6 +16,7 @@ test("uses compaction defaults when the config block is absent", async (t) => {
 		enabled: true,
 		reserveTokens: 16_384,
 		keepRecentTokens: 20_000,
+		reasoningEffort: undefined,
 	});
 });
 
@@ -26,13 +27,14 @@ test("merges partial compaction settings with defaults", async (t) => {
 	await mkdir(join(directory, "ker"), { recursive: true });
 	await writeFile(
 		join(directory, "ker", "config.json"),
-		JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 4_000 } }),
+		JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 4_000, reasoningEffort: "xhigh" } }),
 	);
 
 	assert.deepEqual(loadConfig().compaction, {
 		enabled: false,
 		reserveTokens: 16_384,
 		keepRecentTokens: 4_000,
+		reasoningEffort: "xhigh",
 	});
 });
 

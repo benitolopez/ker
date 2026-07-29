@@ -2,7 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
-import { type CompactionOutcome, compactionSummaryMessage, createHarness, type EngineConfig } from "../src/index.ts";
+import {
+	type CompactionOutcome,
+	compactionSummaryMessage,
+	createHarness,
+	type EngineConfig,
+	estimateContextTokens,
+	stripAssistantUsage,
+} from "../src/index.ts";
 
 const USAGE: Protocol.Usage = { input: 8, output: 2, cacheRead: 0, cacheWrite: 0, total: 10 };
 
@@ -87,7 +94,7 @@ test("serializes roles while truncating tool arguments and results and omitting 
 		{ messages },
 	);
 
-	await collect(harness.compact(request({ keepRecentTokens: 20, reserveTokens: 100, maxOutputTokens: 50 })));
+	await collect(harness.compact(request({ keepRecentTokens: 20 })));
 
 	assert.match(prompt, /^<conversation>\n\[User\]: old request/);
 	assert.match(prompt, /\[Developer\]: control text/);
@@ -96,7 +103,7 @@ test("serializes roles while truncating tool arguments and results and omitting 
 	assert.match(prompt, /\[Tool result\]: r{2000}\n\n\[\.\.\. 100 more characters truncated\]/);
 	assert.doesNotMatch(prompt, /must-not-appear/);
 	assert.equal(options?.instructions, "Summary system prompt");
-	assert.equal(options?.maxOutputTokens, 50);
+	assert.equal(options?.maxOutputTokens, undefined);
 	assert.equal(options?.tools, undefined);
 });
 
@@ -152,7 +159,7 @@ test("retries a pre-output failure with fresh auth and yields summary usage", as
 					return;
 				}
 				yield { type: "delta", text: "summary" };
-				yield { type: "done", reason: "length", usage: USAGE };
+				yield { type: "done", reason: "stop", usage: USAGE };
 			},
 		},
 		{ messages: longHistory() },
@@ -166,6 +173,70 @@ test("retries a pre-output failure with fresh auth and yields summary usage", as
 		["retry", "usage"],
 	);
 	assert.deepEqual(observed, { auth: 2, streams: 2 });
+});
+
+test("treats a length-limited summary as an error", async () => {
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* () {
+				yield { type: "delta", text: "incomplete summary" };
+				yield { type: "done", reason: "length", usage: USAGE };
+			},
+		},
+		{ messages: longHistory() },
+	);
+
+	const result = await collect(harness.compact(request()));
+
+	assert.equal(result.outcome.kind, "stopped");
+	assert.deepEqual(
+		result.events.map((event) => event.type),
+		["usage", "error"],
+	);
+	const error = result.events.at(-1);
+	assert.equal(error?.type, "error");
+	if (error?.type === "error") assert.equal(error.message, "The summary hit the model's output limit");
+});
+
+test("rejects a summary above the hard size limit", async () => {
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* () {
+				yield { type: "delta", text: "s".repeat(32_769) };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{ messages: longHistory() },
+	);
+
+	const result = await collect(harness.compact(request()));
+
+	assert.equal(result.outcome.kind, "stopped");
+	const error = result.events.at(-1);
+	assert.equal(error?.type, "error");
+	if (error?.type === "error") assert.match(error.message, /8192-token size limit/);
+});
+
+test("uses the compaction reasoning override and otherwise inherits the session effort", async () => {
+	const observed: Array<Llm.ReasoningEffort | undefined> = [];
+	const harness = createHarness(
+		{ ...config(), reasoningEffort: "high" },
+		{
+			stream: async function* (_model, _messages, _auth, options) {
+				observed.push(options?.reasoningEffort);
+				yield { type: "delta", text: "summary" };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{ messages: longHistory() },
+	);
+
+	await collect(harness.compact(request({ reasoningEffort: "low" })));
+	await collect(harness.compact(request()));
+
+	assert.deepEqual(observed, ["low", "high"]);
 });
 
 test("returns a non-mutating replacement with a developer summary and stripped kept usage", async () => {
@@ -208,6 +279,37 @@ test("returns a non-mutating replacement with a developer summary and stripped k
 			usage: USAGE,
 		},
 	]);
+});
+
+test("computes the compaction gate pair with comparable normalized estimates", async () => {
+	const anchoredUsage: Protocol.Usage = {
+		input: 90_000,
+		output: 10_000,
+		cacheRead: 0,
+		cacheWrite: 0,
+		total: 100_000,
+	};
+	const messages: Llm.Message[] = [
+		{ role: "user", content: "old request".repeat(60) },
+		{
+			role: "assistant",
+			content: "old response".repeat(60),
+			provider: "openai",
+			model: "test-model",
+			usage: anchoredUsage,
+		},
+		{ role: "user", content: "recent request".repeat(10) },
+		{ role: "assistant", content: "recent response".repeat(10) },
+	];
+	const harness = successfulHarness(messages);
+
+	const result = await collect(harness.compact(request({ keepRecentTokens: 20 })));
+
+	assert.equal(result.outcome.kind, "compacted");
+	if (result.outcome.kind !== "compacted") return;
+	const normalized = messages.map(stripAssistantUsage);
+	assert.equal(result.outcome.tokensBefore, estimateContextTokens(normalized));
+	assert(result.outcome.tokensBefore < estimateContextTokens(messages));
 });
 
 test("aborts a summary stream without changing history", async () => {
@@ -323,7 +425,6 @@ function request(overrides: Partial<Parameters<ReturnType<typeof createHarness>[
 		sessionId: "session-1",
 		turnId: "turn-1",
 		keepRecentTokens: 20,
-		reserveTokens: 100,
 		...overrides,
 	};
 }

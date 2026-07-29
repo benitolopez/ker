@@ -45,45 +45,41 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep the entire summary under roughly 2,000 tokens. Prefer dropping resolved or stale detail over exceeding the budget. Preserve exact file paths, function names, and error messages.`;
 const COMPACTION_UPDATE_INSTRUCTIONS = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
+Produce a replacement summary, not an append-only update. Preserve unresolved requirements, active decisions, current state, exact identifiers, still-relevant failures, and next steps. Remove superseded plans, completed procedural detail, duplicated facts, and stale observations.
 
 Use this EXACT format:
 
 ## Goal
-[Preserve existing goals, add new ones if the task expanded]
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
 ## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
+- [Any unresolved constraints, preferences, or requirements]
+- [Or "(none)" if none remain]
 
 ## Progress
 ### Done
-- [x] [Include previously done items AND newly completed items]
+- [x] [Completed tasks or changes that remain relevant]
 
 ### In Progress
-- [ ] [Current work - update based on progress]
+- [ ] [Current work]
 
 ### Blocked
-- [Current blockers - remove if resolved]
+- [Current blockers, if any]
 
 ## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+- **[Decision]**: [Brief rationale]
 
 ## Next Steps
-1. [Update based on current state]
+1. [Ordered list of what should happen next]
 
 ## Critical Context
-- [Preserve important context, add new if needed]
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep the entire summary under roughly 2,000 tokens. Prefer dropping resolved or stale detail over exceeding the budget. Preserve exact file paths, function names, and error messages.`;
 
 function createRead(cwd: string): Engine.Tool {
 	return {

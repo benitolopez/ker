@@ -33,14 +33,16 @@ export interface Tool {
 	parameters: Record<string, unknown>;
 }
 
-// OpenAI's reasoning-effort levels. Unset omits `effort` from the request, so the model uses its server
-// default, which is none on gpt-5.x.
+// Provider-normalized reasoning levels. An adapter translates supported values to its native
+// vocabulary and rejects unsupported ones; unset uses the provider's server default.
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface StreamOptions {
 	tools?: Tool[];
 	instructions?: string;
 	reasoningEffort?: ReasoningEffort;
+	// Unset means no caller-imposed cap. An adapter omits the provider field where possible, or chooses
+	// the largest legal allowance for the rendered request when the provider requires a value.
 	maxOutputTokens?: number;
 	signal?: AbortSignal;
 }

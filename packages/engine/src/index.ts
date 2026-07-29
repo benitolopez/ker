@@ -38,8 +38,7 @@ export interface CompactionRequest {
 	sessionId: Protocol.SessionId;
 	turnId: Protocol.TurnId;
 	keepRecentTokens: number;
-	reserveTokens: number;
-	maxOutputTokens?: number;
+	reasoningEffort?: Llm.ReasoningEffort;
 	instructions?: string;
 	previousSummary?: string;
 }
@@ -70,6 +69,7 @@ const ABORTED_HISTORY_MARKER =
 const COMPACTION_SUMMARY_PREFIX =
 	"The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const SUMMARY_CONTENT_MAX_CHARS = 2_000;
+const SUMMARY_MAX_TOKENS = 8_192;
 
 // Holds one credential-bound conversation in memory and runs the agent loop. Initial auth is checked
 // before the user message enters history. Completed tool calls always trigger the next model request.
@@ -439,8 +439,6 @@ async function* compactMessages(
 		role: "user",
 		content: `<conversation>\n${conversation}\n</conversation>${previous}\n\n${template}${focus}`,
 	};
-	const maximum = Math.floor(request.reserveTokens * 0.8);
-	const maxOutputTokens = request.maxOutputTokens === undefined ? maximum : Math.min(maximum, request.maxOutputTokens);
 	let summary = "";
 
 	for (let attempt = 0; ; attempt++) {
@@ -457,8 +455,7 @@ async function* compactMessages(
 
 		for await (const event of dependencies.stream(config.model, [prompt], auth, {
 			instructions: config.compaction.systemPrompt,
-			reasoningEffort: config.reasoningEffort,
-			maxOutputTokens,
+			reasoningEffort: request.reasoningEffort ?? config.reasoningEffort,
 			signal,
 		})) {
 			if (signal?.aborted || event.type === "aborted") return { kind: "aborted" };
@@ -483,6 +480,15 @@ async function* compactMessages(
 					};
 					return { kind: "stopped" };
 				}
+				if (event.reason === "length") {
+					yield {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: "The summary hit the model's output limit",
+					};
+					return { kind: "stopped" };
+				}
 				const content = summary.trim();
 				if (!content) {
 					yield {
@@ -493,13 +499,23 @@ async function* compactMessages(
 					};
 					return { kind: "stopped" };
 				}
+				if (Math.ceil(content.length / 4) > SUMMARY_MAX_TOKENS) {
+					yield {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: `The summary exceeded the ${SUMMARY_MAX_TOKENS}-token size limit`,
+					};
+					return { kind: "stopped" };
+				}
 				if (signal?.aborted) return { kind: "aborted" };
-				const nextMessages = [compactionSummaryMessage(content), ...messages.slice(cut).map(stripAssistantUsage)];
+				const normalizedMessages = messages.map(stripAssistantUsage);
+				const nextMessages = [compactionSummaryMessage(content), ...normalizedMessages.slice(cut)];
 				return {
 					kind: "compacted",
 					summary: content,
 					keptCount: messages.length - cut,
-					tokensBefore: estimateContextTokens(messages),
+					tokensBefore: estimateContextTokens(normalizedMessages),
 					tokensAfter: estimateContextTokens(nextMessages),
 					messages: nextMessages,
 				};

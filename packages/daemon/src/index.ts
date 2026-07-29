@@ -657,8 +657,9 @@ class Registry {
 				{
 					...scope,
 					keepRecentTokens: this.#compaction.keepRecentTokens,
-					reserveTokens: this.#compaction.reserveTokens,
-					maxOutputTokens: state.model?.maxOutputTokens,
+					...(this.#compaction.reasoningEffort === undefined
+						? {}
+						: { reasoningEffort: this.#compaction.reasoningEffort }),
 					...(item.instructions === undefined ? {} : { instructions: item.instructions }),
 					...(previousSummary === undefined ? {} : { previousSummary }),
 				},
@@ -713,6 +714,33 @@ class Registry {
 						reason: outcome.reason,
 					});
 					await this.#finishTurn(state, turn);
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+
+				const trigger =
+					state.model?.contextWindow === undefined
+						? undefined
+						: state.model.contextWindow - this.#compaction.reserveTokens;
+				const watermark =
+					item.source === "auto" && trigger !== undefined && trigger > 0
+						? trigger - Math.min(this.#compaction.reserveTokens, Math.floor(trigger / 2))
+						: undefined;
+				const gateError =
+					outcome.tokensAfter >= outcome.tokensBefore
+						? `Compaction did not reduce the context (${outcome.tokensBefore} → ${outcome.tokensAfter} tokens)`
+						: watermark !== undefined && outcome.tokensAfter > watermark
+							? "Compacted context is still too close to the compaction threshold"
+							: undefined;
+				if (gateError) {
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: gateError,
+					});
+					await this.#finishTurn(state, turn, "error");
 					state.activeTurn = undefined;
 					await this.#advanceQueue(state, item.id);
 					return;
@@ -1150,14 +1178,16 @@ class Registry {
 		if (
 			this.#stopping ||
 			!this.#compaction.enabled ||
-			state.model?.contextWindow === undefined ||
 			state.compactionAttempted ||
-			[state.queue.running, ...state.queue.waiting].some((item) => item?.kind === "compaction") ||
-			Engine.estimateContextTokens(state.harness.snapshot().messages) <=
-				state.model.contextWindow - this.#compaction.reserveTokens
+			[state.queue.running, ...state.queue.waiting].some((item) => item?.kind === "compaction")
 		) {
 			return undefined;
 		}
+		const contextWindow = state.model?.contextWindow;
+		if (contextWindow === undefined) return undefined;
+		const trigger = contextWindow - this.#compaction.reserveTokens;
+		if (trigger <= 0) return undefined;
+		if (Engine.estimateContextTokens(state.harness.snapshot().messages) <= trigger) return undefined;
 		return this.#createCompactionItem(state, "auto");
 	}
 
