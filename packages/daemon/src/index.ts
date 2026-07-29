@@ -11,6 +11,7 @@ import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
 import {
 	type AssistantRecord,
 	type CatalogedSession,
+	type CompactionRecord,
 	type ConversationRecord,
 	canonicalDirectory,
 	canonicalProjectRoot,
@@ -33,6 +34,10 @@ const CANCELLED_DURING_RESTART_HISTORY_MARKER =
 
 export interface Harness {
 	send(input: Engine.UserMessage, signal?: AbortSignal): AsyncIterable<Protocol.TurnEvent>;
+	compact(
+		input: Engine.CompactionRequest,
+		signal?: AbortSignal,
+	): AsyncGenerator<Protocol.TurnEvent, Engine.CompactionOutcome>;
 	snapshot(): Engine.HarnessState;
 }
 
@@ -41,6 +46,7 @@ export interface DaemonOptions {
 	sessionDir?: string;
 	eventTailSize?: number;
 	recoveryWindowMinutes?: number;
+	compaction?: Config.CompactionSettings;
 }
 
 export type Daemon = Server & { shutdown(): Promise<void> };
@@ -48,11 +54,13 @@ export type Daemon = Server & { shutdown(): Promise<void> };
 // The HTTP server is synchronous to construct; session discovery and recovery finish before a route responds.
 export function createDaemon(options: DaemonOptions = {}): Daemon {
 	const manager = (async () => {
+		const config = Config.loadConfig();
 		const registry = new Registry({
 			store: new SessionStore({ baseDir: options.sessionDir }),
-			harnessFactory: options.harnessFactory ?? createConfiguredHarness,
+			harnessFactory: options.harnessFactory ?? ((state, cwd) => createConfiguredHarness(state, cwd, config)),
 			eventTailSize: options.eventTailSize ?? DEFAULT_EVENT_TAIL_SIZE,
-			recoveryWindowMinutes: options.recoveryWindowMinutes ?? Config.loadConfig().recoveryWindowMinutes,
+			recoveryWindowMinutes: options.recoveryWindowMinutes ?? config.recoveryWindowMinutes,
+			compaction: options.compaction ?? config.compaction,
 		});
 		await registry.initialize();
 		return registry;
@@ -79,11 +87,11 @@ interface RegistryOptions {
 	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	eventTailSize: number;
 	recoveryWindowMinutes: number;
+	compaction: Config.CompactionSettings;
 }
 
 interface ActiveTurn {
 	item: Protocol.QueueItem;
-	message: Engine.UserMessage;
 	delivered: boolean;
 	controller: AbortController;
 	done: PromiseWithResolvers<void>;
@@ -110,6 +118,7 @@ interface SessionState {
 	queue: Protocol.QueueSnapshot;
 	queueLock: Promise<void>;
 	activeTurn?: ActiveTurn;
+	compactionAttempted: boolean;
 }
 
 type CatalogEntry = CatalogedSession & { stored?: StoredSession };
@@ -121,6 +130,7 @@ class Registry {
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #eventTailSize: number;
 	readonly #recoveryWindowMinutes: number;
+	readonly #compaction: Config.CompactionSettings;
 	readonly #catalog = new Map<Protocol.SessionId, CatalogEntry>();
 	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
 	#stopping = false;
@@ -130,6 +140,7 @@ class Registry {
 		this.#harnessFactory = options.harnessFactory;
 		this.#eventTailSize = options.eventTailSize;
 		this.#recoveryWindowMinutes = options.recoveryWindowMinutes;
+		this.#compaction = options.compaction;
 	}
 
 	async initialize(): Promise<void> {
@@ -207,9 +218,11 @@ class Registry {
 					contextTokens: Engine.estimateContextTokens(state.harness.snapshot().messages),
 					cumulative: { ...state.cumulativeUsage },
 				},
-				entries: state.stored.records
-					.filter((record): record is ConversationRecord => record.type === "conversation")
-					.map(toConversationEntry),
+				entries: state.stored.records.flatMap((record) => {
+					if (record.type === "conversation") return [toConversationEntry(record)];
+					if (record.type === "compaction") return [toCompactionEntry(record)];
+					return [];
+				}),
 				messages: state.messages.map((message) => ({ ...message })),
 				active: state.active ? { ...state.active } : undefined,
 				turns: [...turns.values()],
@@ -236,13 +249,15 @@ class Registry {
 		if (!this.#catalog.has(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
+			const compaction = this.#maybeCompactionItem(state);
 			const messageId = randomUUID();
 			const turnId = randomUUID();
 			const queueItemId = randomUUID();
 			const status: Protocol.AdmissionStatus = state.queue.running || this.#stopping ? "waiting" : "running";
-			const item: Protocol.QueueItem = {
+			const item: Protocol.PromptQueueItem = {
 				id: queueItemId,
 				turnId,
+				kind: "prompt",
 				messageId,
 				text,
 				state: status,
@@ -252,7 +267,9 @@ class Registry {
 			if (status === "running") state.queue.running = item;
 			if (status === "waiting") state.queue.waiting.push(item);
 			state.queue.revision++;
-			await this.#appendAndPublish(state, [
+			const payloads: Payload[] = [];
+			if (compaction) payloads.push(this.#compactionSubmittedPayload(state, compaction, "process"));
+			payloads.push(
 				{
 					type: "event",
 					event: {
@@ -267,7 +284,9 @@ class Registry {
 					},
 				},
 				this.#queueChangedPayload(state),
-			]);
+			);
+			await this.#appendAndPublish(state, payloads);
+			if (compaction?.state === "running") this.#start(compaction, state);
 			if (status === "running") this.#start(item, state);
 			return {
 				status,
@@ -275,6 +294,30 @@ class Registry {
 				turnId,
 				messageId,
 				queueItemId,
+				queue: cloneQueue(state.queue),
+			};
+		});
+	}
+
+	async compactNow(
+		sessionId: Protocol.SessionId,
+		instructions?: string,
+	): Promise<Protocol.CompactionAdmission | "missing"> {
+		if (!this.#catalog.has(sessionId)) return "missing";
+		const state = await this.#state(sessionId);
+		return this.#withQueueLock(state, async () => {
+			const item = this.#createCompactionItem(state, "manual", instructions);
+			state.queue.revision++;
+			await this.#appendAndPublish(state, [
+				this.#compactionSubmittedPayload(state, item, "human"),
+				this.#queueChangedPayload(state),
+			]);
+			if (item.state === "running") this.#start(item, state);
+			return {
+				status: item.state,
+				sessionId,
+				turnId: item.turnId,
+				queueItemId: item.id,
 				queue: cloneQueue(state.queue),
 			};
 		});
@@ -319,12 +362,14 @@ class Registry {
 			const [removed] = state.queue.waiting.splice(index, 1);
 			if (!state.items.has(removed.id)) return "turn_unavailable";
 			state.queue.revision++;
-			await this.#appendAndPublish(state, [
+			const payloads: Payload[] = [
 				{
 					type: "event",
 					event: { actor: "human", sessionId, turnId, type: "turn_cancel_requested" },
 				},
-				{
+			];
+			if (removed.kind === "prompt") {
+				payloads.push({
 					type: "event",
 					event: {
 						actor: "process",
@@ -335,7 +380,9 @@ class Registry {
 						text: removed.text,
 						reason: "cancelled",
 					},
-				},
+				});
+			}
+			payloads.push(
 				{ type: "event", event: { actor: "process", sessionId, turnId, type: "cancelled" } },
 				{
 					type: "event",
@@ -343,7 +390,8 @@ class Registry {
 				},
 				{ type: "event", event: { actor: "process", sessionId, turnId, type: "end" } },
 				this.#queueChangedPayload(state),
-			]);
+			);
+			await this.#appendAndPublish(state, payloads);
 			return { status: "cancelled", sessionId, turnId };
 		});
 	}
@@ -411,6 +459,27 @@ class Registry {
 		const conversation = stored.records.filter(
 			(record): record is ConversationRecord => record.type === "conversation",
 		);
+		const compaction = stored.records.findLast((record): record is CompactionRecord => record.type === "compaction");
+		const projectedMessages = (() => {
+			if (!compaction) return conversation.map((record) => structuredClone(record.message));
+			const firstKeptIndex = conversation.findIndex((record) => record.id === compaction.firstKeptEntryId);
+			if (firstKeptIndex === -1) {
+				throw new Error(
+					`Compaction ${compaction.recordId} refers to missing conversation entry ${compaction.firstKeptEntryId}`,
+				);
+			}
+			const compactionIndex = stored.records.indexOf(compaction);
+			const recordPositions = new Map(stored.records.map((record, index) => [record.recordId, index]));
+			return [
+				Engine.compactionSummaryMessage(compaction.summary),
+				...conversation.slice(firstKeptIndex).map((record) => {
+					if ((recordPositions.get(record.recordId) ?? Number.POSITIVE_INFINITY) < compactionIndex) {
+						return Engine.stripAssistantUsage(record.message);
+					}
+					return structuredClone(record.message);
+				}),
+			];
+		})();
 		const identity = stored.records.findLast(
 			(record): record is IdentityRecord => record.type === "identity",
 		)?.identity;
@@ -439,13 +508,27 @@ class Registry {
 				items.set(event.queueItemId, {
 					id: event.queueItemId,
 					turnId: event.turnId,
+					kind: "prompt",
 					messageId: event.messageId,
 					text: event.text,
 					state: event.admission,
 					submittedAt: record.at,
 				});
 			}
-			if (event.type === "queue_changed" && event.queue.revision > queue.revision) queue = cloneQueue(event.queue);
+			if (event.type === "compaction_submitted") {
+				items.set(event.queueItemId, {
+					id: event.queueItemId,
+					turnId: event.turnId,
+					kind: "compaction",
+					source: event.source,
+					...(event.instructions === undefined ? {} : { instructions: event.instructions }),
+					state: event.admission,
+					submittedAt: record.at,
+				});
+			}
+			if (event.type === "queue_changed" && event.queue.revision > queue.revision) {
+				queue = normalizeQueue(event.queue);
+			}
 		}
 		// Queue items restore from the queue snapshot, not the submission records: the snapshot
 		// carries each item's original submittedAt, which recovery expiry depends on.
@@ -461,7 +544,7 @@ class Registry {
 			return [restored];
 		});
 		const state: Engine.HarnessState = {
-			messages: conversation.map((record) => record.message),
+			messages: projectedMessages,
 			identity,
 		};
 		return {
@@ -481,19 +564,13 @@ class Registry {
 			items,
 			queue: { revision: queue.revision, running: restoredRunning, waiting },
 			queueLock: Promise.resolve(),
+			compactionAttempted: false,
 		};
 	}
 
 	#start(item: Protocol.QueueItem, state: SessionState): void {
-		const message: Engine.UserMessage = {
-			sessionId: state.stored.session.id,
-			turnId: item.turnId,
-			messageId: item.messageId,
-			text: item.text,
-		};
 		const turn: ActiveTurn = {
 			item,
-			message,
 			delivered: false,
 			controller: new AbortController(),
 			done: Promise.withResolvers<void>(),
@@ -501,15 +578,26 @@ class Registry {
 			cancellationRequested: false,
 		};
 		state.activeTurn = turn;
+		if (item.kind === "compaction") {
+			void this.#runCompaction(state, turn);
+			return;
+		}
 		void this.#runTurn(state, turn);
 	}
 
 	async #runTurn(state: SessionState, turn: ActiveTurn): Promise<void> {
+		if (turn.item.kind !== "prompt") throw new Error(`Queue item ${turn.item.id} is not a prompt`);
+		const message: Engine.UserMessage = {
+			sessionId: state.stored.session.id,
+			turnId: turn.item.turnId,
+			messageId: turn.item.messageId,
+			text: turn.item.text,
+		};
 		let failureReason: "aborted" | "error" | undefined;
 		try {
-			for await (const event of state.harness.send(turn.message, turn.controller.signal)) {
+			for await (const event of state.harness.send(message, turn.controller.signal)) {
 				if (turn.terminal) continue;
-				if (event.type === "message_delivered" && event.messageId === turn.message.messageId) turn.delivered = true;
+				if (event.type === "message_delivered" && event.messageId === message.messageId) turn.delivered = true;
 				if (event.type === "aborted") {
 					failureReason = "aborted";
 				}
@@ -527,8 +615,8 @@ class Registry {
 				failureReason = "aborted";
 				await this.#recordHarnessEvent(state, {
 					actor: "process",
-					sessionId: turn.message.sessionId,
-					turnId: turn.message.turnId,
+					sessionId: message.sessionId,
+					turnId: message.turnId,
 					type: "aborted",
 				});
 			}
@@ -536,8 +624,8 @@ class Registry {
 				failureReason = "error";
 				await this.#recordHarnessEvent(state, {
 					actor: "process",
-					sessionId: turn.message.sessionId,
-					turnId: turn.message.turnId,
+					sessionId: message.sessionId,
+					turnId: message.turnId,
 					type: "error",
 					message: error instanceof Error ? error.message : String(error),
 				});
@@ -551,6 +639,137 @@ class Registry {
 		}
 	}
 
+	async #runCompaction(state: SessionState, turn: ActiveTurn): Promise<void> {
+		if (turn.item.kind !== "compaction") throw new Error(`Queue item ${turn.item.id} is not a compaction`);
+		const item = turn.item;
+		const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
+		let outcome: Engine.CompactionOutcome | undefined;
+		let failure: { error: unknown } | undefined;
+		try {
+			const snapshot = state.harness.snapshot();
+			if (snapshot.messages.length !== state.persistedMessageCount) {
+				throw new Error("Cannot compact while conversation messages are awaiting persistence");
+			}
+			const previousSummary = state.stored.records.findLast(
+				(record): record is CompactionRecord => record.type === "compaction",
+			)?.summary;
+			const generator = state.harness.compact(
+				{
+					...scope,
+					keepRecentTokens: this.#compaction.keepRecentTokens,
+					reserveTokens: this.#compaction.reserveTokens,
+					maxOutputTokens: state.model?.maxOutputTokens,
+					...(item.instructions === undefined ? {} : { instructions: item.instructions }),
+					...(previousSummary === undefined ? {} : { previousSummary }),
+				},
+				turn.controller.signal,
+			);
+			while (true) {
+				const next = await generator.next();
+				if (next.done) {
+					outcome = next.value;
+					break;
+				}
+				if (!turn.terminal) await this.#recordHarnessEvent(state, next.value);
+			}
+		} catch (error) {
+			failure = { error };
+		}
+
+		try {
+			await this.#withQueueLock(state, async () => {
+				if (state.activeTurn !== turn || turn.terminal) return;
+				const aborted = turn.cancellationRequested || turn.controller.signal.aborted || outcome?.kind === "aborted";
+				if (aborted) {
+					await this.#recordHarnessEvent(state, { actor: "process", ...scope, type: "aborted" });
+					await this.#finishTurn(state, turn, "aborted");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				if (failure !== undefined) {
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: failure.error instanceof Error ? failure.error.message : String(failure.error),
+					});
+					await this.#finishTurn(state, turn, "error");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				if (!outcome || outcome.kind === "stopped" || outcome.kind === "aborted") {
+					await this.#finishTurn(state, turn, "error");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				if (outcome.kind === "skipped") {
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						...scope,
+						type: "compaction_skipped",
+						reason: outcome.reason,
+					});
+					await this.#finishTurn(state, turn);
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+
+				const conversation = state.stored.records.filter(
+					(record): record is ConversationRecord => record.type === "conversation",
+				);
+				const firstKept = conversation.at(-outcome.keptCount);
+				if (!firstKept) {
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: "Compaction kept messages that do not map to the transcript",
+					});
+					await this.#finishTurn(state, turn, "error");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				await this.#appendAndPublish(state, [
+					{
+						type: "compaction",
+						turnId: item.turnId,
+						summary: outcome.summary,
+						firstKeptEntryId: firstKept.id,
+						tokensBefore: outcome.tokensBefore,
+						tokensAfter: outcome.tokensAfter,
+					},
+					{
+						type: "event",
+						event: {
+							actor: "process",
+							...scope,
+							type: "compacted",
+							summary: outcome.summary,
+							tokensBefore: outcome.tokensBefore,
+							tokensAfter: outcome.tokensAfter,
+							firstKeptEntryId: firstKept.id,
+						},
+					},
+				]);
+				state.harness = this.#harnessFactory(
+					{ messages: outcome.messages, identity: state.identity },
+					state.stored.session.cwd,
+				);
+				state.persistedMessageCount = outcome.messages.length;
+				await this.#finishTurn(state, turn);
+				state.activeTurn = undefined;
+				await this.#advanceQueue(state, item.id);
+			});
+		} finally {
+			turn.done.resolve();
+		}
+	}
+
 	async #completeTurn(state: SessionState, turn: ActiveTurn, failureReason?: "aborted" | "error"): Promise<void> {
 		await this.#withQueueLock(state, async () => {
 			if (state.activeTurn !== turn || turn.terminal) return;
@@ -559,8 +778,8 @@ class Registry {
 			if (aborted && failureReason !== "aborted") {
 				await this.#recordHarnessEvent(state, {
 					actor: "process",
-					sessionId: turn.message.sessionId,
-					turnId: turn.message.turnId,
+					sessionId: state.stored.session.id,
+					turnId: turn.item.turnId,
 					type: "aborted",
 				});
 			}
@@ -571,8 +790,9 @@ class Registry {
 	}
 
 	async #finishTurn(state: SessionState, turn: ActiveTurn, failureReason?: "aborted" | "error"): Promise<void> {
-		const scope = { sessionId: turn.message.sessionId, turnId: turn.message.turnId };
-		const reason = failureReason ?? (!turn.delivered || state.active ? "error" : "completed");
+		const scope = { sessionId: state.stored.session.id, turnId: turn.item.turnId };
+		const promptIncomplete = turn.item.kind === "prompt" && (!turn.delivered || state.active !== undefined);
+		const reason = failureReason ?? (promptIncomplete ? "error" : "completed");
 		if (!failureReason && reason === "error") {
 			await this.#recordHarnessEvent(state, {
 				actor: "process",
@@ -581,14 +801,14 @@ class Registry {
 				message: "The turn ended before all submitted input and model output became terminal",
 			});
 		}
-		if (!turn.delivered) {
+		if (turn.item.kind === "prompt" && !turn.delivered) {
 			const undeliveredReason = reason === "completed" ? "error" : reason;
 			await this.#recordHarnessEvent(state, {
 				actor: "process",
 				...scope,
 				type: "message_undelivered",
-				messageId: turn.message.messageId,
-				text: turn.message.text,
+				messageId: turn.item.messageId,
+				text: turn.item.text,
 				reason: undeliveredReason,
 			});
 		}
@@ -680,6 +900,10 @@ class Registry {
 		if (event.type === "usage") {
 			state.model = Llm.getModel(event.provider, event.model);
 			state.cumulativeUsage = addUsage(state.cumulativeUsage, event.usage);
+			const compactionPending = [state.queue.running, ...state.queue.waiting].some(
+				(item) => item?.kind === "compaction",
+			);
+			if (!compactionPending) state.compactionAttempted = false;
 		}
 		if (event.type === "turn_terminal") state.turns.set(event.turnId, event.reason);
 	}
@@ -696,8 +920,8 @@ class Registry {
 		};
 	}
 
-	// Runs only during restart recovery, never while the daemon is live: waiting prompts older
-	// than the recovery window are dropped as expired instead of auto-running unattended.
+	// Runs only during restart recovery, never while the daemon is live: waiting work older
+	// than the recovery window is dropped as expired instead of auto-running unattended.
 	async #drainExpiredWaiting(state: SessionState): Promise<void> {
 		if (state.queue.waiting.length === 0) return;
 		const now = Date.now();
@@ -710,8 +934,9 @@ class Registry {
 		state.queue.revision++;
 		const payloads: Payload[] = expired.flatMap((item): Payload[] => {
 			const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
-			return [
-				{
+			const terminal: Payload[] = [];
+			if (item.kind === "prompt") {
+				terminal.push({
 					type: "event",
 					event: {
 						actor: "process",
@@ -721,10 +946,13 @@ class Registry {
 						text: item.text,
 						reason: "expired",
 					},
-				},
+				});
+			}
+			terminal.push(
 				{ type: "event", event: { actor: "process", ...scope, type: "turn_terminal", reason: "expired" } },
 				{ type: "event", event: { actor: "process", ...scope, type: "end" } },
-			];
+			);
+			return terminal;
 		});
 		payloads.push(this.#queueChangedPayload(state));
 		await this.#appendAndPublish(state, payloads);
@@ -740,6 +968,30 @@ class Registry {
 			if (!hasEnd) {
 				await this.#appendAndPublish(state, [{ type: "event", event: { actor: "process", ...scope, type: "end" } }]);
 			}
+			await this.#advanceQueue(state, item.id);
+			return;
+		}
+		if (item.kind === "compaction") {
+			const compacted = state.stored.records.some(
+				(record) => record.type === "compaction" && record.turnId === item.turnId,
+			);
+			const reason = compacted ? "completed" : cancellation ? "aborted" : "interrupted";
+			const payloads: Payload[] = [];
+			if (!compacted) {
+				payloads.push({
+					type: "event",
+					event: {
+						actor: "process",
+						...scope,
+						type: cancellation ? "aborted" : "interrupted",
+					},
+				});
+			}
+			payloads.push(
+				{ type: "event", event: { actor: "process", ...scope, type: "turn_terminal", reason } },
+				{ type: "event", event: { actor: "process", ...scope, type: "end" } },
+			);
+			await this.#appendAndPublish(state, payloads);
 			await this.#advanceQueue(state, item.id);
 			return;
 		}
@@ -856,29 +1108,99 @@ class Registry {
 
 	async #advanceQueue(state: SessionState, finishedItemId: Protocol.QueueItemId): Promise<void> {
 		if (state.queue.running?.id !== finishedItemId) return;
-		const next = this.#stopping ? undefined : state.queue.waiting.shift();
-		const item = next ? state.items.get(next.id) : undefined;
-		if (next && !item) throw new Error(`Queue item ${next.id} has no submitted prompt`);
+		state.queue.running = undefined;
+		const compaction = this.#maybeCompactionItem(state);
+		const next = compaction ? undefined : this.#stopping ? undefined : state.queue.waiting.shift();
+		const item = compaction ?? (next ? state.items.get(next.id) : undefined);
+		if (next && !item) throw new Error(`Queue item ${next.id} has no submission event`);
 		const running = item ? { ...item, state: "running" as const } : undefined;
 		if (running) state.items.set(running.id, running);
 		state.queue.running = running;
 		state.queue.revision++;
-		await this.#appendAndPublish(state, [this.#queueChangedPayload(state)]);
+		const payloads: Payload[] = [];
+		if (compaction) payloads.push(this.#compactionSubmittedPayload(state, compaction, "process"));
+		payloads.push(this.#queueChangedPayload(state));
+		await this.#appendAndPublish(state, payloads);
 		if (running) this.#start(running, state);
 	}
 
 	async #startNext(state: SessionState): Promise<void> {
-		if (this.#stopping || state.queue.running || state.queue.waiting.length === 0) return;
-		const next = state.queue.waiting.shift();
-		if (!next) return;
-		const item = state.items.get(next.id);
-		if (!item) throw new Error(`Queue item ${next.id} has no submitted prompt`);
+		if (this.#stopping || state.queue.running) return;
+		const compaction = this.#maybeCompactionItem(state);
+		const next = compaction ? undefined : state.queue.waiting.shift();
+		const item = compaction ?? (next ? state.items.get(next.id) : undefined);
+		if (!item) {
+			if (next) throw new Error(`Queue item ${next.id} has no submission event`);
+			return;
+		}
 		const running = { ...item, state: "running" as const };
 		state.items.set(running.id, running);
 		state.queue.running = running;
 		state.queue.revision++;
-		await this.#appendAndPublish(state, [this.#queueChangedPayload(state)]);
+		const payloads: Payload[] = [];
+		if (compaction) payloads.push(this.#compactionSubmittedPayload(state, compaction, "process"));
+		payloads.push(this.#queueChangedPayload(state));
+		await this.#appendAndPublish(state, payloads);
 		this.#start(running, state);
+	}
+
+	#maybeCompactionItem(
+		state: SessionState,
+	): (Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus }) | undefined {
+		if (
+			this.#stopping ||
+			!this.#compaction.enabled ||
+			state.model?.contextWindow === undefined ||
+			state.compactionAttempted ||
+			[state.queue.running, ...state.queue.waiting].some((item) => item?.kind === "compaction") ||
+			Engine.estimateContextTokens(state.harness.snapshot().messages) <=
+				state.model.contextWindow - this.#compaction.reserveTokens
+		) {
+			return undefined;
+		}
+		return this.#createCompactionItem(state, "auto");
+	}
+
+	#createCompactionItem(
+		state: SessionState,
+		source: Protocol.CompactionSource,
+		instructions?: string,
+	): Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus } {
+		const status: Protocol.AdmissionStatus = state.queue.running || this.#stopping ? "waiting" : "running";
+		const item: Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus } = {
+			id: randomUUID(),
+			turnId: randomUUID(),
+			kind: "compaction",
+			source,
+			...(instructions === undefined ? {} : { instructions }),
+			state: status,
+			submittedAt: new Date().toISOString(),
+		};
+		state.compactionAttempted = true;
+		state.items.set(item.id, item);
+		if (status === "running") state.queue.running = item;
+		if (status === "waiting") state.queue.waiting.push(item);
+		return item;
+	}
+
+	#compactionSubmittedPayload(
+		state: SessionState,
+		item: Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus },
+		actor: "human" | "process",
+	): Extract<Payload, { type: "event" }> {
+		return {
+			type: "event",
+			event: {
+				actor,
+				sessionId: state.stored.session.id,
+				turnId: item.turnId,
+				type: "compaction_submitted",
+				queueItemId: item.id,
+				source: item.source,
+				...(item.instructions === undefined ? {} : { instructions: item.instructions }),
+				admission: item.state,
+			},
+		};
 	}
 
 	#withQueueLock<T>(state: SessionState, operation: () => Promise<T>): Promise<T> {
@@ -987,6 +1309,26 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 			return;
 		}
 
+		const compactMatch = url.pathname.match(/^\/sessions\/([^/]+)\/compact$/);
+		if (req.method === "POST" && compactMatch) {
+			const sessionId = decodeURIComponent(compactMatch[1]);
+			if (writeUnreadableSession(manager, sessionId, res)) return;
+			const parsed = await readJsonBody(req, res);
+			if (parsed === undefined) return;
+			const compact = parseCompactRequest(parsed);
+			if (!compact) {
+				writeJson(res, 400, { code: "invalid_compaction" });
+				return;
+			}
+			const admitted = await manager.compactNow(sessionId, compact.instructions);
+			if (admitted === "missing") {
+				res.writeHead(404).end();
+				return;
+			}
+			writeJson(res, 202, admitted);
+			return;
+		}
+
 		const cancelMatch = url.pathname.match(/^\/sessions\/([^/]+)\/turns\/([^/]+)\/cancel$/);
 		if (req.method === "POST" && cancelMatch) {
 			const sessionId = decodeURIComponent(cancelMatch[1]);
@@ -1069,8 +1411,20 @@ function toConversationEntry(record: ConversationRecord): Protocol.ConversationE
 	};
 }
 
-function createConfiguredHarness(state: Engine.HarnessState, cwd: string): Harness {
-	const config = Config.loadConfig();
+function toCompactionEntry(record: CompactionRecord): Protocol.ConversationEntry {
+	return {
+		id: record.recordId,
+		parentId: null,
+		turnId: record.turnId,
+		role: "compaction",
+		summary: record.summary,
+		tokensBefore: record.tokensBefore,
+		tokensAfter: record.tokensAfter,
+		firstKeptEntryId: record.firstKeptEntryId,
+	};
+}
+
+function createConfiguredHarness(state: Engine.HarnessState, cwd: string, config: Config.Config): Harness {
 	const definition = Agent.createDefinition(cwd);
 	return Engine.createHarness(
 		{
@@ -1078,6 +1432,7 @@ function createConfiguredHarness(state: Engine.HarnessState, cwd: string): Harne
 			getAuth: (signal) => Auth.resolveAuth(config.apiKey, signal),
 			tools: definition.tools,
 			systemPrompt: definition.systemPrompt,
+			compaction: definition.compaction,
 			reasoningEffort: config.reasoningEffort,
 		},
 		undefined,
@@ -1139,6 +1494,33 @@ function parsePromptRequest(value: unknown): PromptRequest | undefined {
 		return undefined;
 	}
 	return { text: prompt.text };
+}
+
+function parseCompactRequest(value: unknown): Protocol.CompactRequest | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const compact = value as Record<string, unknown>;
+	if (Object.keys(compact).some((key) => key !== "instructions")) return undefined;
+	if (
+		compact.instructions !== undefined &&
+		(typeof compact.instructions !== "string" || compact.instructions.trim() === "")
+	) {
+		return undefined;
+	}
+	return compact.instructions === undefined ? {} : { instructions: compact.instructions };
+}
+
+function normalizeQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {
+	return {
+		revision: queue.revision,
+		running: queue.running ? normalizeQueueItem(queue.running) : undefined,
+		waiting: queue.waiting.map(normalizeQueueItem),
+	};
+}
+
+function normalizeQueueItem(item: Protocol.QueueItem): Protocol.QueueItem {
+	if (item.kind === "prompt" || item.kind === "compaction") return { ...item };
+	const legacy = item as Omit<Protocol.PromptQueueItem, "kind">;
+	return { ...legacy, kind: "prompt" };
 }
 
 function cloneQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {

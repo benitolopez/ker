@@ -261,6 +261,7 @@ test("classifies idle sessions from the final complete record", async (t) => {
 					running: {
 						id: "queue-1",
 						turnId: "turn-1",
+						kind: "prompt",
 						messageId: "message-1",
 						text: "hello",
 						state: "running",
@@ -283,6 +284,49 @@ test("classifies idle sessions from the final complete record", async (t) => {
 	assert.equal(idleById.get(busy.session.id), false);
 	assert.equal(idleById.get(midTurn.session.id), false);
 	assert.equal(idleById.get(torn.session.id), false);
+});
+
+test("round-trips compaction records and classifies their completed queue as idle", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-compaction-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const session = await store.create(baseDir);
+	await session.log.append([
+		{
+			type: "conversation",
+			id: "entry-1",
+			parentId: null,
+			turnId: "turn-1",
+			message: { role: "user", content: "hello" },
+		},
+		{
+			type: "compaction",
+			turnId: "turn-compact",
+			summary: "summary",
+			firstKeptEntryId: "entry-1",
+			tokensBefore: 100,
+			tokensAfter: 20,
+		},
+		{
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: session.session.id,
+				type: "queue_changed",
+				queue: { revision: 2, waiting: [] },
+			},
+		},
+	]);
+
+	const [catalog] = await store.scanCatalog();
+	assert.equal(catalog.idle, true);
+	const loaded = await store.loadSession(catalog.path);
+	const compacted = loaded.records.find((record) => record.type === "compaction");
+	assert.equal(compacted?.type, "compaction");
+	if (compacted?.type === "compaction") {
+		assert.equal(compacted.firstKeptEntryId, "entry-1");
+		assert.equal(compacted.summary, "summary");
+	}
 });
 
 test("uses KER_SESSION_DIR before the user-owned default", (t) => {

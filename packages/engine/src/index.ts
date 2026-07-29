@@ -13,6 +13,7 @@ export interface EngineConfig {
 	getAuth: (signal?: AbortSignal) => Promise<Llm.Auth>;
 	tools: Tool[];
 	systemPrompt: string;
+	compaction: CompactionTemplate;
 	reasoningEffort?: Llm.ReasoningEffort;
 }
 
@@ -27,6 +28,35 @@ export interface UserMessage {
 	text: string;
 }
 
+export interface CompactionTemplate {
+	systemPrompt: string;
+	initialInstructions: string;
+	updateInstructions: string;
+}
+
+export interface CompactionRequest {
+	sessionId: Protocol.SessionId;
+	turnId: Protocol.TurnId;
+	keepRecentTokens: number;
+	reserveTokens: number;
+	maxOutputTokens?: number;
+	instructions?: string;
+	previousSummary?: string;
+}
+
+export type CompactionOutcome =
+	| {
+			kind: "compacted";
+			summary: string;
+			keptCount: number;
+			tokensBefore: number;
+			tokensAfter: number;
+			messages: Llm.Message[];
+	  }
+	| { kind: "skipped"; reason: "nothing_to_compact" }
+	| { kind: "stopped" }
+	| { kind: "aborted" };
+
 export interface HarnessState {
 	messages: Llm.Message[];
 	identity?: Protocol.Identity;
@@ -37,6 +67,9 @@ const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30_000;
 const ABORTED_HISTORY_MARKER =
 	"The previous turn was interrupted by the user. Aborted tools may have partially executed.";
+const COMPACTION_SUMMARY_PREFIX =
+	"The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+const SUMMARY_CONTENT_MAX_CHARS = 2_000;
 
 // Holds one credential-bound conversation in memory and runs the agent loop. Initial auth is checked
 // before the user message enters history. Completed tool calls always trigger the next model request.
@@ -143,7 +176,14 @@ export function createHarness(
 		return { messages: structuredClone(messages), identity };
 	}
 
-	return { messages, send, snapshot };
+	async function* compact(
+		request: CompactionRequest,
+		signal?: AbortSignal,
+	): AsyncGenerator<Protocol.TurnEvent, CompactionOutcome> {
+		return yield* compactMessages(config, dependencies, messages, identity, request, signal);
+	}
+
+	return { messages, send, compact, snapshot };
 }
 
 type StepOutcome =
@@ -353,6 +393,207 @@ function messageCharacters(message: Llm.Message): number {
 		}
 	}, 0);
 	return message.content.length + calls + reasoning;
+}
+
+export function compactionSummaryMessage(summary: string): Llm.Message {
+	return { role: "developer", content: `${COMPACTION_SUMMARY_PREFIX}${summary}\n</summary>` };
+}
+
+export function stripAssistantUsage(message: Llm.Message): Llm.Message {
+	if (message.role !== "assistant") return structuredClone(message);
+	const { provider: _provider, model: _model, usage: _usage, ...rest } = message;
+	return structuredClone(rest);
+}
+
+// Summarize the removable prefix without changing live history. The caller persists the result before
+// replacing its harness, so a failed append leaves the conversation untouched.
+async function* compactMessages(
+	config: EngineConfig,
+	dependencies: Dependencies,
+	messages: Llm.Message[],
+	identity: Protocol.Identity | undefined,
+	request: CompactionRequest,
+	signal?: AbortSignal,
+): AsyncGenerator<Protocol.TurnEvent, CompactionOutcome> {
+	const cut = findCompactionCut(messages, request.keepRecentTokens);
+	if (cut === undefined || cut === 0) return { kind: "skipped", reason: "nothing_to_compact" };
+	const conversation = serializeConversation(messages.slice(0, cut));
+	if (!conversation) return { kind: "skipped", reason: "nothing_to_compact" };
+
+	const scope = { sessionId: request.sessionId, turnId: request.turnId };
+	const initialAuth = await resolveAuth(config, scope, identity, signal);
+	if (initialAuth.kind === "aborted") return { kind: "aborted" };
+	if (initialAuth.kind === "error") {
+		yield initialAuth.event;
+		return { kind: "stopped" };
+	}
+
+	const template = request.previousSummary
+		? config.compaction.updateInstructions
+		: config.compaction.initialInstructions;
+	const focus = request.instructions ? `\n\nAdditional focus: ${request.instructions}` : "";
+	const previous = request.previousSummary
+		? `\n\n<previous-summary>\n${request.previousSummary}\n</previous-summary>`
+		: "";
+	const prompt: Llm.Message = {
+		role: "user",
+		content: `<conversation>\n${conversation}\n</conversation>${previous}\n\n${template}${focus}`,
+	};
+	const maximum = Math.floor(request.reserveTokens * 0.8);
+	const maxOutputTokens = request.maxOutputTokens === undefined ? maximum : Math.min(maximum, request.maxOutputTokens);
+	let summary = "";
+
+	for (let attempt = 0; ; attempt++) {
+		if (signal?.aborted) return { kind: "aborted" };
+		const authResult: AuthResult = attempt === 0 ? initialAuth : await resolveAuth(config, scope, identity, signal);
+		if (authResult.kind === "aborted") return { kind: "aborted" };
+		if (authResult.kind === "error") {
+			yield authResult.event;
+			return { kind: "stopped" };
+		}
+		const auth = authResult.auth;
+		let sawOutput = false;
+		let pending: { delayMs: number; message: string } | undefined;
+
+		for await (const event of dependencies.stream(config.model, [prompt], auth, {
+			instructions: config.compaction.systemPrompt,
+			reasoningEffort: config.reasoningEffort,
+			maxOutputTokens,
+			signal,
+		})) {
+			if (signal?.aborted || event.type === "aborted") return { kind: "aborted" };
+			if (event.type !== "done" && event.type !== "error") sawOutput = true;
+			if (event.type === "delta") summary += event.text;
+			if (event.type === "done") {
+				const provider = Llm.providerOf(auth);
+				yield {
+					actor: "process",
+					...scope,
+					type: "usage",
+					provider,
+					model: config.model,
+					usage: event.usage,
+				};
+				if (event.reason === "content_filter") {
+					yield {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: "The model response was stopped by a content filter",
+					};
+					return { kind: "stopped" };
+				}
+				const content = summary.trim();
+				if (!content) {
+					yield {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: "Summarization returned no content",
+					};
+					return { kind: "stopped" };
+				}
+				if (signal?.aborted) return { kind: "aborted" };
+				const nextMessages = [compactionSummaryMessage(content), ...messages.slice(cut).map(stripAssistantUsage)];
+				return {
+					kind: "compacted",
+					summary: content,
+					keptCount: messages.length - cut,
+					tokensBefore: estimateContextTokens(messages),
+					tokensAfter: estimateContextTokens(nextMessages),
+					messages: nextMessages,
+				};
+			}
+			if (event.type === "error") {
+				if (!sawOutput && event.retryable && attempt < MAX_RETRIES) {
+					const delayMs = Math.min(event.retryAfterMs ?? BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+					pending = { delayMs, message: event.message };
+					break;
+				}
+				yield { actor: "process", ...scope, type: "error", message: event.message };
+				return { kind: "stopped" };
+			}
+		}
+
+		if (!pending) return { kind: "stopped" };
+		yield {
+			actor: "process",
+			...scope,
+			type: "retry",
+			attempt: attempt + 1,
+			maxAttempts: MAX_RETRIES,
+			delayMs: pending.delayMs,
+			message: pending.message,
+		};
+		try {
+			await sleep(pending.delayMs, undefined, { signal });
+		} catch (error) {
+			if (signal?.aborted) return { kind: "aborted" };
+			throw error;
+		}
+	}
+}
+
+function findCompactionCut(messages: readonly Llm.Message[], keepRecentTokens: number): number | undefined {
+	let accumulated = 0;
+	let crossing: number | undefined;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		accumulated += Math.ceil(messageCharacters(messages[index]) / 4);
+		if (accumulated < keepRecentTokens) continue;
+		crossing = index;
+		break;
+	}
+	if (crossing === undefined) return undefined;
+	const crossingMessage = messages[crossing];
+	if (isCompactionCutMessage(crossingMessage)) return crossing;
+	if (crossingMessage.role === "tool") {
+		const toolCallId = crossingMessage.toolCallId;
+		const owner = messages.findLastIndex(
+			(message, index) =>
+				index < crossing &&
+				message.role === "assistant" &&
+				(message.toolCalls ?? []).some((call) => call.callId === toolCallId),
+		);
+		if (owner !== -1) return owner;
+	}
+	for (let index = crossing + 1; index < messages.length; index++) {
+		if (isCompactionCutMessage(messages[index])) return index;
+	}
+	return undefined;
+}
+
+function isCompactionCutMessage(message: Llm.Message): boolean {
+	if (message.role === "tool") return false;
+	return message.role !== "developer" || !message.content.startsWith(COMPACTION_SUMMARY_PREFIX);
+}
+
+function serializeConversation(messages: readonly Llm.Message[]): string {
+	const parts: string[] = [];
+	for (const message of messages) {
+		if (message.role === "user") {
+			if (message.content) parts.push(`[User]: ${message.content}`);
+			continue;
+		}
+		if (message.role === "developer") {
+			if (!message.content.startsWith(COMPACTION_SUMMARY_PREFIX) && message.content) {
+				parts.push(`[Developer]: ${message.content}`);
+			}
+			continue;
+		}
+		if (message.role === "tool") {
+			if (message.content) parts.push(`[Tool result]: ${truncateForSummary(message.content)}`);
+			continue;
+		}
+		if (message.content) parts.push(`[Assistant]: ${message.content}`);
+		const calls = (message.toolCalls ?? []).map((call) => `${call.name}(${truncateForSummary(call.arguments)})`);
+		if (calls.length > 0) parts.push(`[Assistant tool calls]: ${calls.join("; ")}`);
+	}
+	return parts.join("\n\n");
+}
+
+function truncateForSummary(text: string): string {
+	if (text.length <= SUMMARY_CONTENT_MAX_CHARS) return text;
+	return `${text.slice(0, SUMMARY_CONTENT_MAX_CHARS)}\n\n[... ${text.length - SUMMARY_CONTENT_MAX_CHARS} more characters truncated]`;
 }
 
 type AuthResult =

@@ -930,6 +930,11 @@ function createConfig(tools: Tool[] = []): EngineConfig {
 		getAuth: async () => ({ kind: "apikey", key: "test" }),
 		tools,
 		systemPrompt: "Test system prompt",
+		compaction: {
+			systemPrompt: "Summary system prompt",
+			initialInstructions: "Initial summary instructions",
+			updateInstructions: "Update summary instructions",
+		},
 	};
 }
 

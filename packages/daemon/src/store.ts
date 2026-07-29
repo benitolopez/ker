@@ -47,7 +47,22 @@ export interface AssistantRecord extends RecordBase {
 	message: Protocol.AssistantMessage;
 }
 
-export type StoredRecord = SessionRecord | EventRecord | ConversationRecord | IdentityRecord | AssistantRecord;
+export interface CompactionRecord extends RecordBase {
+	type: "compaction";
+	turnId: Protocol.TurnId;
+	summary: string;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	tokensAfter: number;
+}
+
+export type StoredRecord =
+	| SessionRecord
+	| EventRecord
+	| ConversationRecord
+	| IdentityRecord
+	| AssistantRecord
+	| CompactionRecord;
 
 export type Payload =
 	| { type: "session"; session: Protocol.SessionDescriptor }
@@ -61,7 +76,15 @@ export type Payload =
 			message: Engine.HarnessState["messages"][number];
 	  }
 	| { type: "identity"; identity: Protocol.Identity }
-	| { type: "assistant"; message: Protocol.AssistantMessage };
+	| { type: "assistant"; message: Protocol.AssistantMessage }
+	| {
+			type: "compaction";
+			turnId: Protocol.TurnId;
+			summary: string;
+			firstKeptEntryId: string;
+			tokensBefore: number;
+			tokensAfter: number;
+	  };
 
 export interface StoredSession {
 	log: SessionLog;

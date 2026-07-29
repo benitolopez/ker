@@ -109,6 +109,29 @@ test("passes the abort signal to OpenAI and reports cancellation separately", as
 	assert.deepEqual(events, [{ type: "aborted" }]);
 });
 
+test("passes the output token cap to OpenAI", async (t) => {
+	t.mock.method(responsesPrototype, "create", (...args: Parameters<OpenAI["responses"]["create"]>) => {
+		assert.equal(args[0].max_output_tokens, 1234);
+		return {
+			async *[Symbol.asyncIterator]() {
+				yield completedEvent();
+			},
+		} as never;
+	});
+
+	const events: Event[] = [];
+	for await (const event of stream(
+		"gpt-5",
+		[{ role: "user", content: "hello" }],
+		{ kind: "apikey", key: "test" },
+		{ maxOutputTokens: 1234 },
+	)) {
+		events.push(event);
+	}
+
+	assert.equal(events.at(-1)?.type, "done");
+});
+
 function mockStream(t: TestContext, events: ResponseStreamEvent[]) {
 	t.mock.method(
 		responsesPrototype,

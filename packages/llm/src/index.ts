@@ -41,6 +41,7 @@ export interface StreamOptions {
 	tools?: Tool[];
 	instructions?: string;
 	reasoningEffort?: ReasoningEffort;
+	maxOutputTokens?: number;
 	signal?: AbortSignal;
 }
 
@@ -118,6 +119,7 @@ export async function* stream(
 				reasoning: { effort: opts?.reasoningEffort, summary: "auto" },
 				tools,
 				instructions: opts?.instructions,
+				max_output_tokens: opts?.maxOutputTokens,
 			},
 			{ signal: opts?.signal },
 		);

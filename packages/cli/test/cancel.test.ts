@@ -142,6 +142,7 @@ function queue(): Protocol.QueueSnapshot {
 		running: {
 			id: "queue-1",
 			turnId: "turn-1",
+			kind: "prompt",
 			messageId: "message-1",
 			text: "hello",
 			state: "running",

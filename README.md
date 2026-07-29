@@ -34,6 +34,8 @@ Thank you for your interest and understanding.
   to the credential identity that started it.
 - Bounded tool output: `read` pages large files, and `bash` keeps a bounded tail while spilling
   the full stream to a private temporary file.
+- Transparent context compaction that summarizes older history near the model ceiling while keeping
+  the complete transcript on disk. Compaction can also be requested manually.
 
 Not there yet: a TUI, queue editing, or any provider other than OpenAI.
 
@@ -66,6 +68,8 @@ Or set `OPENAI_API_KEY` in the environment. `model` is optional and defaults to 
 `reasoningEffort` is optional and accepts `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
 `recoveryWindowMinutes` is optional and defaults to `0`: after a daemon restart, queued prompts older
 than that many minutes are dropped as `expired` instead of auto-running, and `0` drops all of them.
+The optional `compaction` object accepts `enabled` (default `true`), `reserveTokens` (default `16384`),
+and `keepRecentTokens` (default `20000`).
 
 **ChatGPT subscription.** Sign in with your OpenAI account instead of a key:
 
@@ -115,8 +119,9 @@ npx ker --session "$SESSION_ID" "my name is Beni"
 npx ker --session "$SESSION_ID" "what's my name?"
 ```
 
-To find a session ID later, run `npx ker sessions`; the ID is the first column. `stats`, `cancel`, and
-`monitor` accept an optional ID and default to the latest session for the exact current directory.
+To find a session ID later, run `npx ker sessions`; the ID is the first column. `stats`, `cancel`,
+`compact`, and `monitor` accept an optional ID and default to the latest session for the exact current
+directory.
 
 Monitor renders the current conversation state in turn order, then follows new turns. Assistant text
 is the only monitor output written to stdout. Delivered, running, and waiting prompts are prefixed
@@ -129,8 +134,14 @@ monitor prints `ker: waiting for turns` to stderr and continues following:
 ```sh
 npx ker sessions
 npx ker stats
+npx ker compact
 npx ker monitor
 ```
+
+`compact` waits for the compaction turn and reports either the context reduction or that there was
+nothing to compact. `--json` prints its admission and raw event envelopes. Automatic compaction uses
+the same per-session FIFO queue, so it is visible to monitors and can be cancelled like any other
+running turn.
 
 `npx ker --json monitor "$SESSION_ID"` keeps the diagnostic wire view unchanged: it prints the initial
 `SessionSnapshot`, raw event envelopes, and another snapshot line whenever the event cursor requires a
@@ -161,9 +172,9 @@ npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
 Sessions are stored under `KER_SESSION_DIR` when set, otherwise at `~/.ker/sessions`, grouped by
-canonical Git root and session ID. Protocol v9 uses session-local queue
-snapshots, and session logs use record format v2. Older v1 logs are reported as unreadable and left
-byte-for-byte unchanged until manually removed.
+canonical Git root and session ID. Protocol v11 uses session-local queue snapshots, and session logs
+use record format v3. Older store versions are reported as unreadable and left byte-for-byte unchanged
+until manually removed.
 
 Concurrent sessions intentionally use their recorded working directories without worktree isolation.
 Running two sessions against the same files can therefore conflict. Cooperative cancellation cannot

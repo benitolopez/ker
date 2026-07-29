@@ -9,6 +9,7 @@ export type QueueItemId = string;
 
 export type AdmissionStatus = "running" | "waiting";
 export type CancellationStatus = "cancelling" | "cancelled" | "aborted";
+export type CompactionSource = "auto" | "manual";
 export type TurnTerminalReason = "completed" | "aborted" | "error" | "interrupted" | "cancelled" | "expired";
 export type AssistantTerminalReason = "completed" | "length" | "aborted" | "error";
 export type Provider = "openai" | "openai-codex";
@@ -56,14 +57,26 @@ export interface ListSessionsResponse {
 	unreadable: UnreadableSession[];
 }
 
-export interface QueueItem {
+export interface QueueItemBase {
 	id: QueueItemId;
 	turnId: TurnId;
-	messageId: MessageId;
-	text: string;
 	state: "running" | "cancelling" | "waiting";
 	submittedAt: string;
 }
+
+export interface PromptQueueItem extends QueueItemBase {
+	kind: "prompt";
+	messageId: MessageId;
+	text: string;
+}
+
+export interface CompactionQueueItem extends QueueItemBase {
+	kind: "compaction";
+	source: CompactionSource;
+	instructions?: string;
+}
+
+export type QueueItem = PromptQueueItem | CompactionQueueItem;
 
 export interface QueueSnapshot {
 	revision: number;
@@ -108,7 +121,14 @@ export type ConversationEntry =
 			content: string;
 			toolCalls: Array<{ id: string; name: string; arguments: string }>;
 	  })
-	| (ConversationEntryBase & { role: "tool"; toolCallId: string; content: string });
+	| (ConversationEntryBase & { role: "tool"; toolCallId: string; content: string })
+	| (ConversationEntryBase & {
+			role: "compaction";
+			summary: string;
+			tokensBefore: number;
+			tokensAfter: number;
+			firstKeptEntryId: string;
+	  });
 
 export interface SessionSnapshot {
 	session: SessionDescriptor;
@@ -140,6 +160,30 @@ export interface MessageSubmittedEvent extends TurnEventBase {
 	queueItemId: QueueItemId;
 	text: string;
 	admission: AdmissionStatus;
+}
+
+export interface CompactionSubmittedEvent extends TurnEventBase {
+	actor: "human" | "process";
+	type: "compaction_submitted";
+	queueItemId: QueueItemId;
+	source: CompactionSource;
+	instructions?: string;
+	admission: AdmissionStatus;
+}
+
+export interface CompactedEvent extends TurnEventBase {
+	actor: "process";
+	type: "compacted";
+	summary: string;
+	tokensBefore: number;
+	tokensAfter: number;
+	firstKeptEntryId: string;
+}
+
+export interface CompactionSkippedEvent extends TurnEventBase {
+	actor: "process";
+	type: "compaction_skipped";
+	reason: "nothing_to_compact";
 }
 
 export interface MessageDeliveredEvent extends TurnEventBase {
@@ -282,6 +326,9 @@ export interface ToolResultEvent extends TurnEventBase {
 
 export type Event =
 	| MessageSubmittedEvent
+	| CompactionSubmittedEvent
+	| CompactedEvent
+	| CompactionSkippedEvent
 	| MessageDeliveredEvent
 	| MessageUndeliveredEvent
 	| TurnCancelRequestedEvent
@@ -318,13 +365,25 @@ export interface PromptAdmission {
 	queue: QueueSnapshot;
 }
 
+export interface CompactRequest {
+	instructions?: string;
+}
+
+export interface CompactionAdmission {
+	status: AdmissionStatus;
+	sessionId: SessionId;
+	turnId: TurnId;
+	queueItemId: QueueItemId;
+	queue: QueueSnapshot;
+}
+
 export interface TurnCancellationResult {
 	status: CancellationStatus;
 	sessionId: SessionId;
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "10" as const;
+export const PROTOCOL_VERSION = "11" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;
