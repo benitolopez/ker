@@ -197,6 +197,9 @@ async function runStats(sessionId: Protocol.SessionId, json: boolean): Promise<v
 	process.stdout.write(
 		window ? `Context: ${context} / ${formatTokens(window)} tokens${percentage}\n` : `Context: ${context} tokens\n`,
 	);
+	if (snapshot.compactionFailure) {
+		process.stdout.write(`Compaction: last attempt failed — ${snapshot.compactionFailure.message}\n`);
+	}
 	process.stdout.write("Cumulative:\n");
 	process.stdout.write(`  Input: ${formatTokens(snapshot.usage.cumulative.input)}\n`);
 	process.stdout.write(`  Output: ${formatTokens(snapshot.usage.cumulative.output)}\n`);
@@ -512,6 +515,7 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 		const initial = await fetchSnapshot(prompt.sessionId, controller.signal);
 		if (!initial) return;
 		if (prompt.json) process.stdout.write(`${JSON.stringify(initial)}\n`);
+		if (!prompt.json) writeCompactionFailure(initial);
 		renderer.snapshot(initial, () => true, false, true);
 		let cursor = initial.cursor;
 		let events = await subscribe(prompt.sessionId, cursor, controller.signal);
@@ -873,6 +877,13 @@ function writePruned(count: number, tokensBefore: number, tokensAfter: number): 
 	process.stderr.write(
 		`ker: pruned ${count} tool outputs (${formatTokens(tokensBefore)} → ${formatTokens(tokensAfter)} tokens)\n`,
 	);
+}
+
+// A compaction that failed belongs to its own turn, which a prompt run never follows, so the session
+// state carries it forward to the next person who prompts.
+function writeCompactionFailure(snapshot: Protocol.SessionSnapshot): void {
+	if (!snapshot.compactionFailure) return;
+	process.stderr.write(`ker: last automatic compaction failed — ${snapshot.compactionFailure.message}\n`);
 }
 
 function writeIdle(): void {

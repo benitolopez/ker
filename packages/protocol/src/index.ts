@@ -130,11 +130,19 @@ export type ConversationEntry =
 			firstKeptEntryId: string;
 	  });
 
+// The most recent automatic compaction failure that no later compaction has cleared. Clients surface
+// it so a session that keeps failing to compact is not silently invisible to whoever is prompting.
+export interface CompactionFailure {
+	turnId: TurnId;
+	message: string;
+}
+
 export interface SessionSnapshot {
 	session: SessionDescriptor;
 	identity?: Identity;
 	model?: Model;
 	usage: SessionUsage;
+	compactionFailure?: CompactionFailure;
 	entries: ConversationEntry[];
 	messages: AssistantMessage[];
 	active?: ActiveAssistantMessage;
@@ -392,7 +400,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "12" as const;
+export const PROTOCOL_VERSION = "13" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;
