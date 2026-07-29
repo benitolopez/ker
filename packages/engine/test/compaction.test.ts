@@ -629,6 +629,20 @@ test("retries context overflow with geometrically smaller rendered prompts", asy
 	assert.equal(promptLengths.length, 4);
 	assert(promptLengths.every((length, index) => index === 0 || length < promptLengths[index - 1]));
 	assert(promptLengths.every((length, index) => length <= Math.floor(400_000 / 2 ** index)));
+	assert.deepEqual(
+		result.events.map((event) => event.type),
+		["retry", "retry", "retry", "error"],
+	);
+	assert.deepEqual(
+		result.events.flatMap((event) =>
+			event.type === "retry" ? [[event.attempt, event.maxAttempts, event.delayMs, event.message]] : [],
+		),
+		[
+			[1, 3, 0, "context_length_exceeded"],
+			[2, 3, 0, "context_length_exceeded"],
+			[3, 3, 0, "context_length_exceeded"],
+		],
+	);
 	const error = result.events.at(-1);
 	assert.equal(error?.type, "error");
 	if (error?.type === "error") assert.equal(error.message, "context_length_exceeded");
@@ -656,7 +670,10 @@ test("stops overflow retries when the rendered prompt cannot shrink", async () =
 
 	assert.equal(result.outcome.kind, "stopped");
 	assert.equal(streams, 1);
-	assert.equal(result.events.at(-1)?.type, "error");
+	assert.deepEqual(
+		result.events.map((event) => event.type),
+		["error"],
+	);
 });
 
 test("rejects a changed identity before the summary call", async () => {

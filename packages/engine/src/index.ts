@@ -520,7 +520,7 @@ async function* compactMessages(
 		const auth = authResult.auth;
 		let sawOutput = false;
 		let pending: { delayMs: number; message: string } | undefined;
-		let retryingOverflow = false;
+		let overflowPending: { message: string } | undefined;
 
 		for await (const event of dependencies.stream(config.model, [prompt], auth, {
 			instructions: config.compaction.systemPrompt,
@@ -615,7 +615,7 @@ async function* compactMessages(
 					budgetChars = nextBudgetChars;
 					summary = "";
 					overflowRetries++;
-					retryingOverflow = true;
+					overflowPending = { message: event.message };
 					break;
 				}
 				if (!sawOutput && event.retryable && transientAttempts < MAX_RETRIES) {
@@ -628,7 +628,18 @@ async function* compactMessages(
 			}
 		}
 
-		if (retryingOverflow) continue;
+		if (overflowPending) {
+			yield {
+				actor: "process",
+				...scope,
+				type: "retry",
+				attempt: overflowRetries,
+				maxAttempts: MAX_CONTEXT_OVERFLOW_RETRIES,
+				delayMs: 0,
+				message: overflowPending.message,
+			};
+			continue;
+		}
 		if (!pending) return { kind: "stopped" };
 		yield {
 			actor: "process",
