@@ -99,12 +99,175 @@ test("serializes roles while truncating tool arguments and results and omitting 
 	assert.match(prompt, /^<conversation>\n\[User\]: old request/);
 	assert.match(prompt, /\[Developer\]: control text/);
 	assert.match(prompt, /\[Assistant\]: working/);
-	assert.match(prompt, /\[Assistant tool calls\]: write\(a{2000}\n\n\[\.\.\. 100 more characters truncated\]\)/);
-	assert.match(prompt, /\[Tool result\]: r{2000}\n\n\[\.\.\. 100 more characters truncated\]/);
+	assert.match(prompt, /\[Assistant tool calls\]: write\(a+\n\n\[\.\.\. \d+ characters truncated\]\n\na+\)/);
+	assert.match(prompt, /\[Tool result\]: r+\n\n\[\.\.\. \d+ characters truncated\]\n\nr+/);
+	const argumentStart = prompt.indexOf("write(") + "write(".length;
+	const argumentEnd = prompt.indexOf(")\n\n[Tool result]");
+	assert(argumentEnd - argumentStart <= 2_000);
+	const resultStart = prompt.indexOf("[Tool result]: ") + "[Tool result]: ".length;
+	const resultEnd = prompt.indexOf("\n\n[User]: recent");
+	assert(resultEnd - resultStart <= 2_000);
 	assert.doesNotMatch(prompt, /must-not-appear/);
 	assert.equal(options?.instructions, "Summary system prompt");
 	assert.equal(options?.maxOutputTokens, undefined);
 	assert.equal(options?.tools, undefined);
+});
+
+test("truncates long user content head-and-tail within the message limit", async () => {
+	const longUser = `HEAD-${"a".repeat(6_500)}MIDDLE-${"b".repeat(2_300)}-TAIL`;
+	let prompt = "";
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* (_model, messages) {
+				const message = messages[0];
+				if (message.role === "user") prompt = message.content;
+				yield { type: "delta", text: "summary" };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{
+			messages: [
+				{ role: "user", content: longUser },
+				{ role: "assistant", content: "recent".repeat(20) },
+			],
+		},
+	);
+
+	await collect(harness.compact(request({ keepRecentTokens: 10 })));
+
+	assert.match(prompt, /\[User\]: HEAD-/);
+	assert.match(prompt, /-TAIL\n<\/conversation>/);
+	assert.doesNotMatch(prompt, /MIDDLE/);
+	assert.match(prompt, /\[\.\.\. \d+ characters truncated\]/);
+	const serialized = prompt.slice("<conversation>\n[User]: ".length, prompt.indexOf("\n</conversation>"));
+	assert(serialized.length <= 8_000);
+});
+
+test("omits the oldest serialized messages until the rendered prompt fits", async () => {
+	const oldMessages: Llm.Message[] = Array.from({ length: 8 }, (_, index) => ({
+		role: "user",
+		content: `message-${index}-${"x".repeat(90)}`,
+	}));
+	let prompt = "";
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* (_model, messages) {
+				const message = messages[0];
+				if (message.role === "user") prompt = message.content;
+				yield { type: "delta", text: "summary" };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{ messages: oldMessages },
+	);
+
+	await collect(harness.compact(request({ keepRecentTokens: 1, contextWindow: 200 })));
+
+	const omitted = Number(prompt.match(/\[\.\.\. (\d+) earlier messages omitted/)?.[1]);
+	assert(omitted > 0);
+	for (let index = 0; index < 7; index++) {
+		assert.equal(prompt.includes(`message-${index}-`), index >= omitted);
+	}
+	assert(prompt.length <= 400);
+});
+
+test("scales input headroom down for a small context window", async () => {
+	let prompt = "";
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* (_model, messages) {
+				const message = messages[0];
+				if (message.role === "user") prompt = message.content;
+				yield { type: "delta", text: "summary" };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{ messages: longHistory() },
+	);
+
+	const result = await collect(harness.compact(request({ contextWindow: 100 })));
+
+	assert.equal(result.outcome.kind, "compacted");
+	assert(prompt.length <= 200);
+});
+
+test("keeps the previous summary outside the droppable conversation budget", async () => {
+	const previousSummary = "p".repeat(32_768);
+	let prompt = "";
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* (_model, messages) {
+				const message = messages[0];
+				if (message.role === "user") prompt = message.content;
+				yield { type: "delta", text: "updated" };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{
+			messages: [
+				compactionSummaryMessage(previousSummary),
+				{ role: "user", content: "old".repeat(10_000) },
+				{ role: "assistant", content: "recent".repeat(20) },
+			],
+		},
+	);
+
+	const result = await collect(
+		harness.compact(
+			request({
+				contextWindow: 20_000,
+				keepRecentTokens: 10,
+				previousSummary,
+			}),
+		),
+	);
+
+	assert.equal(result.outcome.kind, "compacted");
+	assert.match(prompt, new RegExp(`<previous-summary>\\n${previousSummary}\\n</previous-summary>`));
+	assert(prompt.length <= 40_000);
+	assert.match(prompt, /earlier messages omitted|characters truncated/);
+});
+
+test("fails before streaming when fixed prompt content cannot fit", async () => {
+	let streams = 0;
+	const previousSummary = "p".repeat(32_768);
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* () {
+				streams++;
+				yield { type: "error", message: "must not stream", retryable: false };
+			},
+		},
+		{
+			messages: [
+				compactionSummaryMessage(previousSummary),
+				{ role: "user", content: "old".repeat(100) },
+				{ role: "assistant", content: "recent".repeat(20) },
+			],
+		},
+	);
+
+	const result = await collect(
+		harness.compact(
+			request({
+				contextWindow: 100,
+				keepRecentTokens: 10,
+				previousSummary,
+			}),
+		),
+	);
+
+	assert.equal(result.outcome.kind, "stopped");
+	assert.equal(streams, 0);
+	assert.equal(result.events[0]?.type, "error");
+	if (result.events[0]?.type === "error") {
+		assert.equal(result.events[0].message, "The summary request cannot fit the model context");
+	}
 });
 
 test("uses the update template, previous summary, and additional focus without serializing the old summary", async () => {
@@ -367,6 +530,68 @@ test("yields a terminal error and stops when summarization fails", async () => {
 		],
 		outcome: { kind: "stopped" },
 	});
+});
+
+test("retries context overflow with geometrically smaller rendered prompts", async () => {
+	const promptLengths: number[] = [];
+	const messages: Llm.Message[] = [
+		...Array.from({ length: 100 }, (_, index) => ({
+			role: "user" as const,
+			content: `${index}-${"x".repeat(7_998)}`,
+		})),
+		{ role: "assistant", content: "recent" },
+	];
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* (_model, providerMessages) {
+				const message = providerMessages[0];
+				if (message.role === "user") promptLengths.push(message.content.length);
+				yield {
+					type: "error",
+					message: "context_length_exceeded",
+					retryable: false,
+					contextOverflow: true,
+				};
+			},
+		},
+		{ messages },
+	);
+
+	const result = await collect(harness.compact(request({ keepRecentTokens: 1 })));
+
+	assert.equal(result.outcome.kind, "stopped");
+	assert.equal(promptLengths.length, 4);
+	assert(promptLengths.every((length, index) => index === 0 || length < promptLengths[index - 1]));
+	assert(promptLengths.every((length, index) => length <= Math.floor(400_000 / 2 ** index)));
+	const error = result.events.at(-1);
+	assert.equal(error?.type, "error");
+	if (error?.type === "error") assert.equal(error.message, "context_length_exceeded");
+});
+
+test("stops overflow retries when the rendered prompt cannot shrink", async () => {
+	let streams = 0;
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* () {
+				streams++;
+				yield {
+					type: "error",
+					message: "context_length_exceeded",
+					retryable: false,
+					contextOverflow: true,
+				};
+			},
+		},
+		{ messages: longHistory() },
+	);
+
+	const result = await collect(harness.compact(request()));
+
+	assert.equal(result.outcome.kind, "stopped");
+	assert.equal(streams, 1);
+	assert.equal(result.events.at(-1)?.type, "error");
 });
 
 test("rejects a changed identity before the summary call", async () => {

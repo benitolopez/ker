@@ -1195,6 +1195,7 @@ test("applies the bounded watermark only to automatic compaction", async (t) => 
 	const promptAdmission = await prompt(running.url, session.id, "cross the threshold");
 	await waitForCompactionAttempts(running.url, session.id, requests, 1);
 
+	assert.equal(requests[0]?.contextWindow, 272_000);
 	const afterAuto = await getSnapshot(running.url, session.id);
 	const autoTurn = afterAuto.turns.find((turn) => turn.id !== promptAdmission.turnId);
 	assert.equal(autoTurn?.status, "error");

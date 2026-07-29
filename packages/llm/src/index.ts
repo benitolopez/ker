@@ -49,6 +49,8 @@ export interface StreamOptions {
 
 export type FinishReason = "stop" | "length" | "content_filter";
 
+// Provider adapters normalize native context-window rejections or stop reasons to an error with
+// contextOverflow set, so the engine can retry a smaller request without provider-specific logic.
 export type Event =
 	| { type: "delta"; text: string }
 	| { type: "reasoning_delta"; text: string }
@@ -56,7 +58,13 @@ export type Event =
 	| { type: "reasoning"; item: unknown }
 	| { type: "done"; reason: FinishReason; usage: Usage }
 	| { type: "aborted" }
-	| { type: "error"; message: string; retryable: boolean; retryAfterMs?: number };
+	| {
+			type: "error";
+			message: string;
+			retryable: boolean;
+			retryAfterMs?: number;
+			contextOverflow?: true;
+	  };
 
 // How stream() reaches OpenAI: a plain API key against the public API, or a ChatGPT-subscription
 // OAuth access token (with the account id decoded from it) against the Codex backend.
@@ -244,6 +252,7 @@ interface Classified {
 	message: string;
 	retryable: boolean;
 	retryAfterMs?: number;
+	contextOverflow?: true;
 }
 
 // Reduce any failure to the fields of a terminal error event: a readable message, whether retrying
@@ -259,13 +268,25 @@ export function classifyError(err: unknown): Classified {
 	if (err instanceof APIError) {
 		const status = err.status;
 		const retryable = status === 408 || status === 409 || status === 429 || (status !== undefined && status >= 500);
-		return { message: err.message, retryable, retryAfterMs: retryable ? parseRetryAfterMs(err.headers) : undefined };
+		const contextOverflow =
+			status === 400 && (err.code === "context_length_exceeded" || /context_length_exceeded/i.test(err.message));
+		return {
+			message: err.message,
+			retryable,
+			retryAfterMs: retryable ? parseRetryAfterMs(err.headers) : undefined,
+			...(contextOverflow ? { contextOverflow: true as const } : {}),
+		};
 	}
 	if (err instanceof Error) {
 		const retryable = /stream ended before a terminal|rate.?limit|server.?error|overloaded|try.?again|timed? out/i.test(
 			err.message,
 		);
-		return { message: err.message, retryable };
+		const contextOverflow = /context_length_exceeded/i.test(err.message);
+		return {
+			message: err.message,
+			retryable,
+			...(contextOverflow ? { contextOverflow: true as const } : {}),
+		};
 	}
 	return { message: String(err), retryable: false };
 }

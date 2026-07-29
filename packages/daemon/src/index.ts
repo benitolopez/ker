@@ -657,6 +657,7 @@ class Registry {
 				{
 					...scope,
 					keepRecentTokens: this.#compaction.keepRecentTokens,
+					...(state.model?.contextWindow === undefined ? {} : { contextWindow: state.model.contextWindow }),
 					...(this.#compaction.reasoningEffort === undefined
 						? {}
 						: { reasoningEffort: this.#compaction.reasoningEffort }),

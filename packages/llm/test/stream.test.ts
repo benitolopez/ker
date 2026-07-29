@@ -38,6 +38,25 @@ test("surfaces a top-level provider error without retrying an invalid prompt", a
 	]);
 });
 
+test("normalizes a top-level context overflow error", async (t) => {
+	mockStream(t, [
+		{
+			type: "error",
+			code: "context_length_exceeded",
+			message: "The request is too large",
+		} as ResponseStreamEvent,
+	]);
+
+	assert.deepEqual(await collectStream(), [
+		{
+			type: "error",
+			message: "context_length_exceeded: The request is too large",
+			retryable: false,
+			contextOverflow: true,
+		},
+	]);
+});
+
 test("maps a max-output incomplete response to a length finish", async (t) => {
 	mockStream(t, [incompleteEvent("max_output_tokens")]);
 

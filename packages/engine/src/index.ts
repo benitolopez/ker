@@ -38,6 +38,7 @@ export interface CompactionRequest {
 	sessionId: Protocol.SessionId;
 	turnId: Protocol.TurnId;
 	keepRecentTokens: number;
+	contextWindow?: number;
 	reasoningEffort?: Llm.ReasoningEffort;
 	instructions?: string;
 	previousSummary?: string;
@@ -68,8 +69,12 @@ const ABORTED_HISTORY_MARKER =
 	"The previous turn was interrupted by the user. Aborted tools may have partially executed.";
 const COMPACTION_SUMMARY_PREFIX =
 	"The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
-const SUMMARY_CONTENT_MAX_CHARS = 2_000;
+const TOOL_CONTENT_MAX_CHARS = 2_000;
+const MESSAGE_MAX_CHARS = 8_000;
 const SUMMARY_MAX_TOKENS = 8_192;
+const OUTPUT_HEADROOM_TOKENS = 32_000;
+const INPUT_BUDGET_FALLBACK_CHARS = 400_000;
+const MAX_CONTEXT_OVERFLOW_RETRIES = 3;
 
 // Holds one credential-bound conversation in memory and runs the agent loop. Initial auth is checked
 // before the user message enters history. Completed tool calls always trigger the next model request.
@@ -417,10 +422,24 @@ async function* compactMessages(
 ): AsyncGenerator<Protocol.TurnEvent, CompactionOutcome> {
 	const cut = findCompactionCut(messages, request.keepRecentTokens);
 	if (cut === undefined || cut === 0) return { kind: "skipped", reason: "nothing_to_compact" };
-	const conversation = serializeConversation(messages.slice(0, cut));
-	if (!conversation) return { kind: "skipped", reason: "nothing_to_compact" };
-
 	const scope = { sessionId: request.sessionId, turnId: request.turnId };
+	const initialBudgetChars =
+		request.contextWindow === undefined
+			? INPUT_BUDGET_FALLBACK_CHARS
+			: 4 *
+				Math.max(0, request.contextWindow - Math.min(OUTPUT_HEADROOM_TOKENS, Math.floor(request.contextWindow / 2)));
+	const initialPrompt = renderCompactionPrompt(messages.slice(0, cut), config.compaction, request, initialBudgetChars);
+	if (initialPrompt.kind === "empty") return { kind: "skipped", reason: "nothing_to_compact" };
+	if (initialPrompt.kind === "too_large") {
+		yield {
+			actor: "process",
+			...scope,
+			type: "error",
+			message: "The summary request cannot fit the model context",
+		};
+		return { kind: "stopped" };
+	}
+
 	const initialAuth = await resolveAuth(config, scope, identity, signal);
 	if (initialAuth.kind === "aborted") return { kind: "aborted" };
 	if (initialAuth.kind === "error") {
@@ -428,22 +447,17 @@ async function* compactMessages(
 		return { kind: "stopped" };
 	}
 
-	const template = request.previousSummary
-		? config.compaction.updateInstructions
-		: config.compaction.initialInstructions;
-	const focus = request.instructions ? `\n\nAdditional focus: ${request.instructions}` : "";
-	const previous = request.previousSummary
-		? `\n\n<previous-summary>\n${request.previousSummary}\n</previous-summary>`
-		: "";
-	const prompt: Llm.Message = {
-		role: "user",
-		content: `<conversation>\n${conversation}\n</conversation>${previous}\n\n${template}${focus}`,
-	};
+	let prompt = initialPrompt.prompt;
+	let budgetChars = initialBudgetChars;
 	let summary = "";
+	let transientAttempts = 0;
+	let overflowRetries = 0;
+	let firstAttempt = true;
 
-	for (let attempt = 0; ; attempt++) {
+	while (true) {
 		if (signal?.aborted) return { kind: "aborted" };
-		const authResult: AuthResult = attempt === 0 ? initialAuth : await resolveAuth(config, scope, identity, signal);
+		const authResult: AuthResult = firstAttempt ? initialAuth : await resolveAuth(config, scope, identity, signal);
+		firstAttempt = false;
 		if (authResult.kind === "aborted") return { kind: "aborted" };
 		if (authResult.kind === "error") {
 			yield authResult.event;
@@ -452,6 +466,7 @@ async function* compactMessages(
 		const auth = authResult.auth;
 		let sawOutput = false;
 		let pending: { delayMs: number; message: string } | undefined;
+		let retryingOverflow = false;
 
 		for await (const event of dependencies.stream(config.model, [prompt], auth, {
 			instructions: config.compaction.systemPrompt,
@@ -521,8 +536,36 @@ async function* compactMessages(
 				};
 			}
 			if (event.type === "error") {
-				if (!sawOutput && event.retryable && attempt < MAX_RETRIES) {
-					const delayMs = Math.min(event.retryAfterMs ?? BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+				if (event.contextOverflow && overflowRetries < MAX_CONTEXT_OVERFLOW_RETRIES) {
+					const nextBudgetChars = Math.floor(budgetChars / 2);
+					const nextPrompt = renderCompactionPrompt(
+						messages.slice(0, cut),
+						config.compaction,
+						request,
+						nextBudgetChars,
+					);
+					if (nextPrompt.kind === "too_large") {
+						yield {
+							actor: "process",
+							...scope,
+							type: "error",
+							message: "The summary request cannot fit the model context",
+						};
+						return { kind: "stopped" };
+					}
+					if (nextPrompt.kind === "empty" || nextPrompt.prompt.content.length >= prompt.content.length) {
+						yield { actor: "process", ...scope, type: "error", message: event.message };
+						return { kind: "stopped" };
+					}
+					prompt = nextPrompt.prompt;
+					budgetChars = nextBudgetChars;
+					summary = "";
+					overflowRetries++;
+					retryingOverflow = true;
+					break;
+				}
+				if (!sawOutput && event.retryable && transientAttempts < MAX_RETRIES) {
+					const delayMs = Math.min(event.retryAfterMs ?? BASE_DELAY_MS * 2 ** transientAttempts, MAX_DELAY_MS);
 					pending = { delayMs, message: event.message };
 					break;
 				}
@@ -531,16 +574,18 @@ async function* compactMessages(
 			}
 		}
 
+		if (retryingOverflow) continue;
 		if (!pending) return { kind: "stopped" };
 		yield {
 			actor: "process",
 			...scope,
 			type: "retry",
-			attempt: attempt + 1,
+			attempt: transientAttempts + 1,
 			maxAttempts: MAX_RETRIES,
 			delayMs: pending.delayMs,
 			message: pending.message,
 		};
+		transientAttempts++;
 		try {
 			await sleep(pending.delayMs, undefined, { signal });
 		} catch (error) {
@@ -583,33 +628,100 @@ function isCompactionCutMessage(message: Llm.Message): boolean {
 	return message.role !== "developer" || !message.content.startsWith(COMPACTION_SUMMARY_PREFIX);
 }
 
-function serializeConversation(messages: readonly Llm.Message[]): string {
+type CompactionPrompt =
+	| { kind: "ready"; prompt: Extract<Llm.Message, { role: "user" }> }
+	| { kind: "empty" }
+	| { kind: "too_large" };
+
+// Fits the complete rendered prompt inside the attempt budget. The previous summary, instructions,
+// and focus stay outside the oldest-first droppable conversation region.
+function renderCompactionPrompt(
+	messages: readonly Llm.Message[],
+	template: CompactionTemplate,
+	request: CompactionRequest,
+	totalBudgetChars: number,
+): CompactionPrompt {
+	const instructions = request.previousSummary ? template.updateInstructions : template.initialInstructions;
+	const previous = request.previousSummary
+		? `\n\n<previous-summary>\n${request.previousSummary}\n</previous-summary>`
+		: "";
+	const focus = request.instructions ? `\n\nAdditional focus: ${request.instructions}` : "";
+	const prefix = "<conversation>\n";
+	const suffix = `\n</conversation>${previous}\n\n${instructions}${focus}`;
+	const conversationBudgetChars = Math.max(0, totalBudgetChars - prefix.length - suffix.length);
+	const conversation = serializeConversation(messages, conversationBudgetChars);
+	if (conversation?.kind === "empty") return { kind: "empty" };
+	if (!conversation) return { kind: "too_large" };
+	const content = `${prefix}${conversation.content}${suffix}`;
+	if (content.length > totalBudgetChars) return { kind: "too_large" };
+	return { kind: "ready", prompt: { role: "user", content } };
+}
+
+function serializeConversation(
+	messages: readonly Llm.Message[],
+	budgetChars: number,
+): { kind: "ready"; content: string } | { kind: "empty" } | undefined {
 	const parts: string[] = [];
 	for (const message of messages) {
 		if (message.role === "user") {
-			if (message.content) parts.push(`[User]: ${message.content}`);
+			if (message.content) {
+				parts.push(`[User]: ${truncateForSummary(message.content, MESSAGE_MAX_CHARS)}`);
+			}
 			continue;
 		}
 		if (message.role === "developer") {
 			if (!message.content.startsWith(COMPACTION_SUMMARY_PREFIX) && message.content) {
-				parts.push(`[Developer]: ${message.content}`);
+				parts.push(`[Developer]: ${truncateForSummary(message.content, MESSAGE_MAX_CHARS)}`);
 			}
 			continue;
 		}
 		if (message.role === "tool") {
-			if (message.content) parts.push(`[Tool result]: ${truncateForSummary(message.content)}`);
+			if (message.content) {
+				parts.push(`[Tool result]: ${truncateForSummary(message.content, TOOL_CONTENT_MAX_CHARS)}`);
+			}
 			continue;
 		}
-		if (message.content) parts.push(`[Assistant]: ${message.content}`);
-		const calls = (message.toolCalls ?? []).map((call) => `${call.name}(${truncateForSummary(call.arguments)})`);
-		if (calls.length > 0) parts.push(`[Assistant tool calls]: ${calls.join("; ")}`);
+		const assistant: string[] = [];
+		if (message.content) assistant.push(`[Assistant]: ${message.content}`);
+		const calls = (message.toolCalls ?? []).map(
+			(call) => `${call.name}(${truncateForSummary(call.arguments, TOOL_CONTENT_MAX_CHARS)})`,
+		);
+		if (calls.length > 0) assistant.push(`[Assistant tool calls]: ${calls.join("; ")}`);
+		if (assistant.length > 0) parts.push(assistant.join("\n\n"));
 	}
-	return parts.join("\n\n");
+	if (parts.length === 0) return { kind: "empty" };
+	const complete = parts.join("\n\n");
+	if (complete.length <= budgetChars) return { kind: "ready", content: complete };
+	const suffixLengths = new Array<number>(parts.length + 1).fill(0);
+	for (let index = parts.length - 1; index >= 0; index--) {
+		suffixLengths[index] = parts[index].length + (index === parts.length - 1 ? 0 : 2 + suffixLengths[index + 1]);
+	}
+	for (let omitted = 1; omitted <= parts.length; omitted++) {
+		const marker = `[... ${omitted} earlier messages omitted from this summary request]`;
+		const remainingLength = omitted === parts.length ? 0 : 2 + suffixLengths[omitted];
+		if (marker.length + remainingLength > budgetChars) continue;
+		return { kind: "ready", content: [marker, ...parts.slice(omitted)].join("\n\n") };
+	}
+	return undefined;
 }
 
-function truncateForSummary(text: string): string {
-	if (text.length <= SUMMARY_CONTENT_MAX_CHARS) return text;
-	return `${text.slice(0, SUMMARY_CONTENT_MAX_CHARS)}\n\n[... ${text.length - SUMMARY_CONTENT_MAX_CHARS} more characters truncated]`;
+// Keeps the opening and latest text while reserving room for the exact truncation marker.
+function truncateForSummary(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	let omitted = text.length;
+	while (true) {
+		const marker = `\n\n[... ${omitted} characters truncated]\n\n`;
+		const available = Math.max(0, limit - marker.length);
+		const nextOmitted = text.length - available;
+		if (nextOmitted !== omitted) {
+			omitted = nextOmitted;
+			continue;
+		}
+		if (available === 0) return marker.slice(0, limit);
+		const head = Math.ceil(available * 0.75);
+		const tail = available - head;
+		return `${text.slice(0, head)}${marker}${text.slice(text.length - tail)}`;
+	}
 }
 
 type AuthResult =
