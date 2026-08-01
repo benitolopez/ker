@@ -54,6 +54,10 @@ export interface CompactionRecord extends RecordBase {
 	firstKeptEntryId: string;
 	tokensBefore: number;
 	tokensAfter: number;
+	systemPrompt?: string;
+	instructions?: string;
+	budgetChars?: number;
+	reasoningEffort?: Protocol.ReasoningEffort | null;
 }
 
 export interface PruneRecord extends RecordBase {
@@ -92,6 +96,10 @@ export type Payload =
 			firstKeptEntryId: string;
 			tokensBefore: number;
 			tokensAfter: number;
+			systemPrompt: string;
+			instructions: string;
+			budgetChars: number;
+			reasoningEffort: Protocol.ReasoningEffort | null;
 	  }
 	| {
 			type: "prune";

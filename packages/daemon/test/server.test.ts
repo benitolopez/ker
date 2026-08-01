@@ -1829,7 +1829,13 @@ test(
 		const requests: Engine.CompactionRequest[] = [];
 		const running = await startServer(t, compactionFactory(requests, "compacted"), {
 			sessionDir,
-			compaction: { enabled: true, reserveTokens: 271_990, keepRecentTokens: 1, prune: false },
+			compaction: {
+				enabled: true,
+				reserveTokens: 271_990,
+				keepRecentTokens: 1,
+				prune: false,
+				reasoningEffort: "high",
+			},
 		});
 		const session = await createSession(running.url);
 		const admitted = await prompt(running.url, session.id, "remember this");
@@ -1843,15 +1849,35 @@ test(
 		);
 		const compacted = snapshot.entries.at(-1);
 		assert.equal(compacted?.role, "compaction");
+		if (compacted?.role === "compaction") {
+			assert.equal(compacted.systemPrompt, "Summary system prompt");
+			assert.equal(compacted.instructions, "Initial summary instructions");
+			assert.equal(compacted.budgetChars, 400_000);
+			assert.equal(compacted.reasoningEffort, "high");
+		}
 		assert.equal(requests.length, 1);
 		const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
 		const records = await new SessionStore({ baseDir: sessionDir }).loadSession(catalog.path);
 		const eventTypes = records.records.flatMap((record) => (record.type === "event" ? [record.event.type] : []));
 		assert(eventTypes.indexOf("compaction_submitted") > eventTypes.indexOf("end"));
-		assert.equal(
-			records.records.some((record) => record.type === "compaction"),
-			true,
+		const record = records.records.find((candidate) => candidate.type === "compaction");
+		assert.equal(record?.type, "compaction");
+		if (record?.type === "compaction") {
+			assert.equal(record.systemPrompt, "Summary system prompt");
+			assert.equal(record.instructions, "Initial summary instructions");
+			assert.equal(record.budgetChars, 400_000);
+			assert.equal(record.reasoningEffort, "high");
+		}
+		const event = records.records.find(
+			(candidate) => candidate.type === "event" && candidate.event.type === "compacted",
 		);
+		assert.equal(event?.type, "event");
+		if (event?.type === "event" && event.event.type === "compacted") {
+			assert.equal("systemPrompt" in event.event, false);
+			assert.equal("instructions" in event.event, false);
+			assert.equal("budgetChars" in event.event, false);
+			assert.equal("reasoningEffort" in event.event, false);
+		}
 		assert.equal(catalog.idle, true);
 	},
 );
@@ -2076,13 +2102,21 @@ test("a log ending on a pruned event replays consistently during recovery", asyn
 	assert.equal(catalog.idle, false);
 });
 
-test("replay projects the latest compaction while preserving every transcript entry", async (t) => {
+test("replay projects a legacy v3 compaction while preserving every transcript entry", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-replay-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
 	const session = await store.create(process.cwd());
 	const oldUsage: Protocol.Usage = { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, total: 20 };
 	const newUsage: Protocol.Usage = { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, total: 30 };
+	const legacyCompaction = {
+		type: "compaction",
+		turnId: "turn-compact",
+		summary: "summary",
+		firstKeptEntryId: "entry-kept-user",
+		tokensBefore: 100,
+		tokensAfter: 25,
+	} as Payload;
 	await session.log.append([
 		{
 			type: "conversation",
@@ -2124,14 +2158,7 @@ test("replay projects the latest compaction while preserving every transcript en
 				usage: oldUsage,
 			},
 		},
-		{
-			type: "compaction",
-			turnId: "turn-compact",
-			summary: "summary",
-			firstKeptEntryId: "entry-kept-user",
-			tokensBefore: 100,
-			tokensAfter: 25,
-		},
+		legacyCompaction,
 		{
 			type: "conversation",
 			id: "entry-new-user",
@@ -2170,6 +2197,14 @@ test("replay projects the latest compaction while preserving every transcript en
 		snapshot.entries.map((entry) => entry.role),
 		["user", "assistant", "user", "assistant", "compaction", "user", "assistant"],
 	);
+	const legacyEntry = snapshot.entries.find((entry) => entry.role === "compaction");
+	assert.equal(legacyEntry?.role, "compaction");
+	if (legacyEntry?.role === "compaction") {
+		assert.equal("systemPrompt" in legacyEntry, false);
+		assert.equal("instructions" in legacyEntry, false);
+		assert.equal("budgetChars" in legacyEntry, false);
+		assert.equal("reasoningEffort" in legacyEntry, false);
+	}
 	const projected = captured[0]?.messages;
 	assert.deepEqual(
 		projected?.map((message) => message.role),
@@ -2265,6 +2300,10 @@ function backoffFactory(outcome: BackoffOutcome = "gate-fail") {
 					keptCount: kept.length,
 					tokensBefore: before,
 					tokensAfter: mode.outcome === "gate-fail" ? before + 1 : 1,
+					systemPrompt: "Summary system prompt",
+					instructions: input.previousSummary ? "Update summary instructions" : "Initial summary instructions",
+					budgetChars: 400_000,
+					reasoningEffort: input.reasoningEffort ?? null,
 					messages: [Engine.compactionSummaryMessage("summary"), ...kept],
 				};
 			},
@@ -2321,6 +2360,10 @@ function compactionFactory(
 					keptCount: kept.length,
 					tokensBefore: typeof outcome === "string" ? 17 : outcome.tokensBefore,
 					tokensAfter: typeof outcome === "string" ? 5 : outcome.tokensAfter,
+					systemPrompt: "Summary system prompt",
+					instructions: input.previousSummary ? "Update summary instructions" : "Initial summary instructions",
+					budgetChars: 400_000,
+					reasoningEffort: input.reasoningEffort ?? null,
 					messages,
 				};
 			},
@@ -2680,6 +2723,10 @@ async function seedRunningCompaction(store: SessionStore, compacted: boolean) {
 				firstKeptEntryId: "entry-kept",
 				tokensBefore: 100,
 				tokensAfter: 20,
+				systemPrompt: "Summary system prompt",
+				instructions: "Initial summary instructions",
+				budgetChars: 400_000,
+				reasoningEffort: null,
 			},
 			{
 				type: "event",
@@ -2765,6 +2812,10 @@ async function seedInterleavedContext(store: SessionStore, order: "prune-first" 
 		firstKeptEntryId: "entry-owner",
 		tokensBefore: 30_000,
 		tokensAfter: 30,
+		systemPrompt: "Summary system prompt",
+		instructions: "Initial summary instructions",
+		budgetChars: 400_000,
+		reasoningEffort: null,
 	};
 	const mutations = order === "prune-first" ? [prune, compaction] : [compaction, prune];
 	await session.log.append([

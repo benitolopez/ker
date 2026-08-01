@@ -328,6 +328,10 @@ test("round-trips compaction records and classifies their completed queue as idl
 			firstKeptEntryId: "entry-1",
 			tokensBefore: 100,
 			tokensAfter: 20,
+			systemPrompt: "Summary system prompt",
+			instructions: "Initial summary instructions",
+			budgetChars: 400_000,
+			reasoningEffort: "high",
 		},
 		{
 			type: "event",
@@ -348,6 +352,10 @@ test("round-trips compaction records and classifies their completed queue as idl
 	if (compacted?.type === "compaction") {
 		assert.equal(compacted.firstKeptEntryId, "entry-1");
 		assert.equal(compacted.summary, "summary");
+		assert.equal(compacted.systemPrompt, "Summary system prompt");
+		assert.equal(compacted.instructions, "Initial summary instructions");
+		assert.equal(compacted.budgetChars, 400_000);
+		assert.equal(compacted.reasoningEffort, "high");
 	}
 });
 

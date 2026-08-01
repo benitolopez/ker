@@ -276,7 +276,7 @@ test("fails before streaming when fixed prompt content cannot fit", async () => 
 test("uses the update template, previous summary, and additional focus without serializing the old summary", async () => {
 	let prompt = "";
 	const harness = createHarness(
-		config(),
+		{ ...config(), reasoningEffort: "high" },
 		{
 			stream: async function* (_model, messages) {
 				const message = messages[0];
@@ -294,12 +294,13 @@ test("uses the update template, previous summary, and additional focus without s
 		},
 	);
 
-	await collect(
+	const result = await collect(
 		harness.compact(
 			request({
 				keepRecentTokens: 20,
 				previousSummary: "old summary",
 				instructions: "focus on tests",
+				reasoningEffort: "low",
 			}),
 		),
 	);
@@ -308,6 +309,12 @@ test("uses the update template, previous summary, and additional focus without s
 	assert.match(prompt, /Update summary instructions/);
 	assert.match(prompt, /Additional focus: focus on tests/);
 	assert.equal(prompt.match(/old summary/g)?.length, 1);
+	assert.equal(result.outcome.kind, "compacted");
+	if (result.outcome.kind !== "compacted") return;
+	assert.equal(result.outcome.systemPrompt, "Summary system prompt");
+	assert.equal(result.outcome.instructions, "Update summary instructions");
+	assert.equal(result.outcome.budgetChars, 400_000);
+	assert.equal(result.outcome.reasoningEffort, "low");
 });
 
 test("retries a pre-output failure with fresh auth and yields summary usage", async () => {
@@ -452,6 +459,13 @@ test("uses the compaction reasoning override and otherwise inherits the session 
 	await collect(harness.compact(request()));
 
 	assert.deepEqual(observed, ["low", "high"]);
+});
+
+test("records an intentionally unset compaction reasoning effort as null", async () => {
+	const result = await collect(successfulHarness(longHistory()).compact(request()));
+
+	assert.equal(result.outcome.kind, "compacted");
+	if (result.outcome.kind === "compacted") assert.equal(result.outcome.reasoningEffort, null);
 });
 
 test("returns a non-mutating replacement with a developer summary and stripped kept usage", async () => {
@@ -695,6 +709,46 @@ test("retries context overflow with geometrically smaller rendered prompts", asy
 	const error = result.events.at(-1);
 	assert.equal(error?.type, "error");
 	if (error?.type === "error") assert.equal(error.message, "context_length_exceeded");
+});
+
+test("records the character budget of the successful context-overflow retry", async () => {
+	const promptLengths: number[] = [];
+	const messages: Llm.Message[] = [
+		...Array.from({ length: 100 }, (_, index) => ({
+			role: "user" as const,
+			content: `${index}-${"x".repeat(7_998)}`,
+		})),
+		{ role: "assistant", content: "recent" },
+	];
+	const harness = createHarness(
+		config(),
+		{
+			stream: async function* (_model, providerMessages) {
+				const message = providerMessages[0];
+				if (message.role === "user") promptLengths.push(message.content.length);
+				if (promptLengths.length === 1) {
+					yield {
+						type: "error",
+						message: "context_length_exceeded",
+						retryable: false,
+						contextOverflow: true,
+					};
+					return;
+				}
+				yield { type: "delta", text: "summary" };
+				yield { type: "done", reason: "stop", usage: USAGE };
+			},
+		},
+		{ messages },
+	);
+
+	const result = await collect(harness.compact(request({ keepRecentTokens: 1 })));
+
+	assert.equal(result.outcome.kind, "compacted");
+	if (result.outcome.kind !== "compacted") return;
+	assert.equal(result.outcome.budgetChars, 200_000);
+	assert.equal(promptLengths.length, 2);
+	assert(promptLengths[1] < promptLengths[0]);
 });
 
 test("stops overflow retries when the rendered prompt cannot shrink", async () => {

@@ -771,6 +771,10 @@ class Registry {
 						firstKeptEntryId: firstKept.id,
 						tokensBefore: outcome.tokensBefore,
 						tokensAfter: outcome.tokensAfter,
+						systemPrompt: outcome.systemPrompt,
+						instructions: outcome.instructions,
+						budgetChars: outcome.budgetChars,
+						reasoningEffort: outcome.reasoningEffort,
 					},
 					{
 						type: "event",
@@ -1552,6 +1556,10 @@ function toCompactionEntry(record: CompactionRecord): Protocol.ConversationEntry
 		tokensBefore: record.tokensBefore,
 		tokensAfter: record.tokensAfter,
 		firstKeptEntryId: record.firstKeptEntryId,
+		...(record.systemPrompt === undefined ? {} : { systemPrompt: record.systemPrompt }),
+		...(record.instructions === undefined ? {} : { instructions: record.instructions }),
+		...(record.budgetChars === undefined ? {} : { budgetChars: record.budgetChars }),
+		...(record.reasoningEffort === undefined ? {} : { reasoningEffort: record.reasoningEffort }),
 	};
 }
 

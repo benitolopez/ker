@@ -51,6 +51,10 @@ export type CompactionOutcome =
 			keptCount: number;
 			tokensBefore: number;
 			tokensAfter: number;
+			systemPrompt: string;
+			instructions: string;
+			budgetChars: number;
+			reasoningEffort: Llm.ReasoningEffort | null;
 			messages: Llm.Message[];
 	  }
 	| { kind: "skipped"; reason: "nothing_to_compact" }
@@ -493,12 +497,17 @@ async function* compactMessages(
 	const cut = findCompactionCut(messages, request.keepRecentTokens);
 	if (cut === undefined || cut === 0) return { kind: "skipped", reason: "nothing_to_compact" };
 	const scope = { sessionId: request.sessionId, turnId: request.turnId };
+	const systemPrompt = config.compaction.systemPrompt;
+	const instructions = request.previousSummary
+		? config.compaction.updateInstructions
+		: config.compaction.initialInstructions;
+	const reasoningEffort = request.reasoningEffort ?? config.reasoningEffort;
 	const initialBudgetChars =
 		request.contextWindow === undefined
 			? INPUT_BUDGET_FALLBACK_CHARS
 			: 4 *
 				Math.max(0, request.contextWindow - Math.min(OUTPUT_HEADROOM_TOKENS, Math.floor(request.contextWindow / 2)));
-	const initialPrompt = renderCompactionPrompt(messages.slice(0, cut), config.compaction, request, initialBudgetChars);
+	const initialPrompt = renderCompactionPrompt(messages.slice(0, cut), instructions, request, initialBudgetChars);
 	if (initialPrompt.kind === "empty") return { kind: "skipped", reason: "nothing_to_compact" };
 	if (initialPrompt.kind === "too_large") {
 		yield {
@@ -538,8 +547,8 @@ async function* compactMessages(
 		let overflowPending: { message: string } | undefined;
 
 		for await (const event of dependencies.stream(config.model, [prompt], auth, {
-			instructions: config.compaction.systemPrompt,
-			reasoningEffort: request.reasoningEffort ?? config.reasoningEffort,
+			instructions: systemPrompt,
+			reasoningEffort,
 			signal,
 		})) {
 			if (signal?.aborted || event.type === "aborted") return { kind: "aborted" };
@@ -600,18 +609,17 @@ async function* compactMessages(
 					keptCount: messages.length - cut,
 					tokensBefore: estimateContextTokens(normalizedMessages),
 					tokensAfter: estimateContextTokens(nextMessages),
+					systemPrompt,
+					instructions,
+					budgetChars,
+					reasoningEffort: reasoningEffort ?? null,
 					messages: nextMessages,
 				};
 			}
 			if (event.type === "error") {
 				if (event.contextOverflow && overflowRetries < MAX_CONTEXT_OVERFLOW_RETRIES) {
 					const nextBudgetChars = Math.floor(budgetChars / 2);
-					const nextPrompt = renderCompactionPrompt(
-						messages.slice(0, cut),
-						config.compaction,
-						request,
-						nextBudgetChars,
-					);
+					const nextPrompt = renderCompactionPrompt(messages.slice(0, cut), instructions, request, nextBudgetChars);
 					if (nextPrompt.kind === "too_large") {
 						yield {
 							actor: "process",
@@ -715,11 +723,10 @@ type CompactionPrompt =
 // and focus stay outside the oldest-first droppable conversation region.
 function renderCompactionPrompt(
 	messages: readonly Llm.Message[],
-	template: CompactionTemplate,
+	instructions: string,
 	request: CompactionRequest,
 	totalBudgetChars: number,
 ): CompactionPrompt {
-	const instructions = request.previousSummary ? template.updateInstructions : template.initialInstructions;
 	const previous = request.previousSummary
 		? `\n\n<previous-summary>\n${request.previousSummary}\n</previous-summary>`
 		: "";
