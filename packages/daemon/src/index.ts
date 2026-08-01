@@ -1533,6 +1533,7 @@ function toConversationEntry(record: ConversationRecord): Protocol.ConversationE
 		...base,
 		role: "assistant",
 		content: record.message.content,
+		...(record.message.reasoningSummary === undefined ? {} : { reasoningSummary: record.message.reasoningSummary }),
 		toolCalls: (record.message.toolCalls ?? []).map((call) => ({
 			id: call.callId,
 			name: call.name,

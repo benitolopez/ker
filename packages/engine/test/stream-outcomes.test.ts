@@ -601,6 +601,84 @@ test("assigns one stable assistant message id and contiguous offsets to a provid
 	assert.equal(completed?.messageId, deltas[0].messageId);
 });
 
+test("stores an assembled reasoning summary on the assistant step", async () => {
+	const reasoning = { type: "reasoning", encrypted_content: "encrypted" };
+	const harness = createHarness(createConfig(), {
+		stream: async function* () {
+			yield { type: "reasoning_delta", text: "Inspect the " };
+			yield { type: "reasoning_delta", text: "relevant file." };
+			yield { type: "reasoning", item: reasoning };
+			yield { type: "done", reason: "stop", usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 } };
+		},
+	});
+
+	await collectEvents(send(harness, "hello"));
+
+	assert.deepEqual(harness.messages.at(-1), {
+		role: "assistant",
+		content: "",
+		toolCalls: [],
+		reasoning: [reasoning],
+		reasoningSummary: "Inspect the relevant file.",
+		provider: "openai",
+		model: "test-model",
+		usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 },
+	});
+});
+
+test("keeps a reasoning summary when its assistant step is aborted", async () => {
+	const harness = createHarness(createConfig(), {
+		stream: async function* () {
+			yield { type: "reasoning_delta", text: "The operation may have changed state." };
+			yield { type: "aborted" };
+		},
+	});
+
+	await collectEvents(send(harness, "hello"));
+
+	assert.deepEqual(harness.messages, [
+		{ role: "user", content: "hello" },
+		{
+			role: "assistant",
+			content: "",
+			toolCalls: [],
+			reasoning: [],
+			reasoningSummary: "The operation may have changed state.",
+		},
+		{
+			role: "developer",
+			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
+		},
+	]);
+});
+
+test("drops encrypted reasoning without a following tool call when the step is aborted", async () => {
+	const harness = createHarness(createConfig(), {
+		stream: async function* () {
+			yield { type: "reasoning_delta", text: "Check the file." };
+			yield { type: "reasoning", item: { type: "reasoning", encrypted_content: "encrypted" } };
+			yield { type: "aborted" };
+		},
+	});
+
+	await collectEvents(send(harness, "hello"));
+
+	assert.deepEqual(harness.messages, [
+		{ role: "user", content: "hello" },
+		{
+			role: "assistant",
+			content: "",
+			toolCalls: [],
+			reasoning: [],
+			reasoningSummary: "Check the file.",
+		},
+		{
+			role: "developer",
+			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
+		},
+	]);
+});
+
 test("aborts before admission without saving the prompt or interruption marker", async () => {
 	const authStarted = Promise.withResolvers<void>();
 	const controller = new AbortController();
@@ -922,6 +1000,7 @@ test("estimates context from the latest valid assistant usage plus trailing text
 		]),
 		3,
 	);
+	assert.equal(estimateContextTokens([{ role: "assistant", content: "", reasoningSummary: "x".repeat(40_000) }]), 0);
 });
 
 function createConfig(tools: Tool[] = []): EngineConfig {

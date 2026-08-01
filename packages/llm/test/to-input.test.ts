@@ -19,6 +19,7 @@ test("replays an assistant turn as reasoning, then text, then function calls in 
 			role: "assistant",
 			content: "let me look",
 			reasoning: [reasoning],
+			reasoningSummary: "I should inspect a.ts.",
 			toolCalls: [{ callId: "call_1", itemId: "fc_1", name: "read", arguments: '{"path":"a.ts"}' }],
 		},
 	]);

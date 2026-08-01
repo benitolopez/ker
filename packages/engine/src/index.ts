@@ -202,8 +202,9 @@ type StepOutcome =
 	| { kind: "stopped" }
 	| { kind: "done"; toolCalls: Llm.ToolCall[] };
 
-// Stream one model step, recording only a completed assistant response. Retries happen before visible
-// output and use fresh auth after the announced delay; once output is visible, an error stops the turn.
+// Stream one model step, recording completed output or readable reasoning collected before an abort.
+// Encrypted reasoning is retained on abort only with a following tool call because the provider rejects
+// it alone. Retries use fresh auth before visible output; once output is visible, an error stops the turn.
 async function* streamStep(
 	config: EngineConfig,
 	dependencies: Dependencies,
@@ -232,6 +233,7 @@ async function* streamStep(
 			yield { actor: "process", ...scope, type: "auth", mode: auth.kind };
 		}
 		let reply = "";
+		let reasoningSummary = "";
 		const toolCalls: Llm.ToolCall[] = [];
 		const reasoning: unknown[] = [];
 		let sawOutput = false;
@@ -244,7 +246,15 @@ async function* streamStep(
 			signal,
 		})) {
 			if (signal?.aborted || event.type === "aborted") {
-				if (toolCalls.length > 0) messages.push({ role: "assistant", content: "", toolCalls, reasoning });
+				if (toolCalls.length > 0 || reasoningSummary) {
+					messages.push({
+						role: "assistant",
+						content: "",
+						toolCalls,
+						reasoning: toolCalls.length > 0 ? reasoning : [],
+						...(reasoningSummary ? { reasoningSummary } : {}),
+					});
+				}
 				return { kind: "aborted", toolCalls };
 			}
 			if (event.type !== "done" && event.type !== "error") sawOutput = true;
@@ -280,6 +290,7 @@ async function* streamStep(
 				};
 			}
 			if (event.type === "reasoning_delta") {
+				reasoningSummary += event.text;
 				yield {
 					actor: "agent",
 					modelRole: "assistant",
@@ -316,6 +327,7 @@ async function* streamStep(
 					content: reply,
 					toolCalls,
 					reasoning,
+					...(reasoningSummary ? { reasoningSummary } : {}),
 					provider,
 					model: config.model,
 					usage: event.usage,

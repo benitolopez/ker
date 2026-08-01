@@ -621,6 +621,68 @@ test("completed history loads after a daemon restart", async (t) => {
 	await second.close();
 });
 
+test("reasoning summaries survive replay without exposing encrypted reasoning", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-reasoning-summary-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const first = await startServer(
+		t,
+		(initial) => {
+			const state = structuredClone(initial);
+			return {
+				snapshot: () => structuredClone(state),
+				compact: skippedCompaction,
+				async *send(input) {
+					state.messages.push({ role: "user", content: input.text });
+					yield delivered(input);
+					const messageId = randomUUID();
+					yield {
+						actor: "agent",
+						modelRole: "assistant",
+						sessionId: input.sessionId,
+						turnId: input.turnId,
+						type: "reasoning_delta",
+						messageId,
+						offset: 0,
+						text: "Inspect the relevant file.",
+					};
+					state.messages.push({
+						role: "assistant",
+						content: "",
+						toolCalls: [],
+						reasoning: [{ type: "reasoning", encrypted_content: "encrypted" }],
+						reasoningSummary: "Inspect the relevant file.",
+					});
+					yield completed(input, messageId);
+					yield end(input);
+				},
+			};
+		},
+		{ sessionDir },
+		false,
+	);
+	const session = await createSession(first.url);
+	const admitted = await prompt(first.url, session.id, "remember the reasoning");
+	await waitForTerminal(first.url, session.id, admitted.turnId);
+	await first.close();
+
+	const captured: Engine.HarnessState[] = [];
+	const second = await startServer(t, passiveFactory(captured), { sessionDir }, false);
+	const snapshot = await getSnapshot(second.url, session.id);
+	const entry = snapshot.entries.find((candidate) => candidate.role === "assistant");
+	assert.equal(entry?.role, "assistant");
+	if (entry?.role === "assistant") {
+		assert.equal(entry.reasoningSummary, "Inspect the relevant file.");
+		assert.equal("reasoning" in entry, false);
+	}
+	const restored = captured[0]?.messages.find((message) => message.role === "assistant");
+	assert.equal(restored?.role, "assistant");
+	if (restored?.role === "assistant") {
+		assert.equal(restored.reasoningSummary, "Inspect the relevant file.");
+		assert.deepEqual(restored.reasoning, [{ type: "reasoning", encrypted_content: "encrypted" }]);
+	}
+	await second.close();
+});
+
 test("snapshots preserve cumulative usage and current context across restart", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-usage-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));

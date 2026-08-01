@@ -21,6 +21,7 @@ export type Message =
 			content: string;
 			toolCalls?: ToolCall[];
 			reasoning?: unknown[];
+			reasoningSummary?: string;
 			provider?: Provider;
 			model?: string;
 			usage?: Usage;

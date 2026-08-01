@@ -119,6 +119,7 @@ export type ConversationEntry =
 	| (ConversationEntryBase & {
 			role: "assistant";
 			content: string;
+			reasoningSummary?: string;
 			toolCalls: Array<{ id: string; name: string; arguments: string }>;
 	  })
 	| (ConversationEntryBase & { role: "tool"; toolCallId: string; content: string })
@@ -400,7 +401,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "13" as const;
+export const PROTOCOL_VERSION = "14" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;
