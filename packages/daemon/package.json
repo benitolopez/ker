@@ -2,6 +2,8 @@
   "name": "@ker-ai/daemon",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT",
+  "author": "Benito Lopez",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -2,6 +2,8 @@
   "name": "@ker-ai/cli",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT",
+  "author": "Benito Lopez",
   "type": "module",
   "bin": { "ker": "./dist/cli.js" },
   "main": "./dist/index.js",

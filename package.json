@@ -1,6 +1,8 @@
 {
   "name": "ker-monorepo",
   "private": true,
+  "license": "MIT",
+  "author": "Benito Lopez",
   "type": "module",
   "version": "0.0.0",
   "workspaces": ["packages/*"],
