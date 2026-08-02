@@ -15,6 +15,8 @@ import {
 	type ConversationRecord,
 	canonicalDirectory,
 	canonicalProjectRoot,
+	type Definition,
+	type DefinitionRecord,
 	type EventRecord,
 	type IdentityRecord,
 	type Payload,
@@ -44,6 +46,7 @@ export interface Harness {
 
 export interface DaemonOptions {
 	harnessFactory?: (state: Engine.HarnessState, cwd: string) => Harness;
+	definition?: (cwd: string) => Definition;
 	sessionDir?: string;
 	eventTailSize?: number;
 	recoveryWindowMinutes?: number;
@@ -59,6 +62,16 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 		const registry = new Registry({
 			store: new SessionStore({ baseDir: options.sessionDir }),
 			harnessFactory: options.harnessFactory ?? ((state, cwd) => createConfiguredHarness(state, cwd, config)),
+			definition:
+				options.definition ??
+				((cwd) => {
+					const { systemPrompt, tools, compaction } = Agent.createDefinition(cwd);
+					return {
+						systemPrompt,
+						tools: tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
+						compaction,
+					};
+				}),
 			eventTailSize: options.eventTailSize ?? DEFAULT_EVENT_TAIL_SIZE,
 			recoveryWindowMinutes: options.recoveryWindowMinutes ?? config.recoveryWindowMinutes,
 			compaction: options.compaction ?? config.compaction,
@@ -86,6 +99,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 interface RegistryOptions {
 	store: SessionStore;
 	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
+	definition: (cwd: string) => Definition;
 	eventTailSize: number;
 	recoveryWindowMinutes: number;
 	compaction: Config.CompactionSettings;
@@ -131,6 +145,7 @@ class SessionUnreadableError extends Error {}
 class Registry {
 	readonly #store: SessionStore;
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
+	readonly #definition: (cwd: string) => Definition;
 	readonly #eventTailSize: number;
 	readonly #recoveryWindowMinutes: number;
 	readonly #compaction: Config.CompactionSettings;
@@ -141,6 +156,7 @@ class Registry {
 	constructor(options: RegistryOptions) {
 		this.#store = options.store;
 		this.#harnessFactory = options.harnessFactory;
+		this.#definition = options.definition;
 		this.#eventTailSize = options.eventTailSize;
 		this.#recoveryWindowMinutes = options.recoveryWindowMinutes;
 		this.#compaction = options.compaction;
@@ -182,7 +198,7 @@ class Registry {
 	}
 
 	async createSession(cwd: string): Promise<Protocol.SessionDescriptor> {
-		const stored = await this.#store.create(cwd);
+		const stored = await this.#store.create(cwd, this.#definition(cwd));
 		this.#catalog.set(stored.session.id, {
 			session: stored.session,
 			path: stored.log.path,
@@ -463,6 +479,11 @@ class Registry {
 		if (entry.stored) return this.#loadState(entry.stored);
 		try {
 			const stored = await this.#store.loadSession(entry.path);
+			const current = this.#definition(stored.session.cwd);
+			const last = stored.records.findLast((record): record is DefinitionRecord => record.type === "definition");
+			if (!last || definitionKey(last) !== definitionKey(current)) {
+				stored.records.push(...(await stored.log.append([{ type: "definition", ...current }])));
+			}
 			entry.stored = stored;
 			entry.session = stored.session;
 			return this.#loadState(stored);
@@ -771,8 +792,6 @@ class Registry {
 						firstKeptEntryId: firstKept.id,
 						tokensBefore: outcome.tokensBefore,
 						tokensAfter: outcome.tokensAfter,
-						systemPrompt: outcome.systemPrompt,
-						instructions: outcome.instructions,
 						budgetChars: outcome.budgetChars,
 						reasoningEffort: outcome.reasoningEffort,
 					},
@@ -1337,7 +1356,7 @@ function projectMessages(records: readonly StoredRecord[]): Llm.Message[] {
 			{ message: Engine.compactionSummaryMessage(record.summary) },
 			...projected
 				.slice(firstKeptIndex)
-				.map((entry) => ({ ...entry, message: Engine.stripAssistantUsage(entry.message) })),
+				.map((entry) => ({ ...entry, message: Engine.stripAssistantMetadata(entry.message) })),
 		];
 	}
 	return projected.map((entry) => entry.message);
@@ -1556,11 +1575,18 @@ function toCompactionEntry(record: CompactionRecord): Protocol.ConversationEntry
 		tokensBefore: record.tokensBefore,
 		tokensAfter: record.tokensAfter,
 		firstKeptEntryId: record.firstKeptEntryId,
-		...(record.systemPrompt === undefined ? {} : { systemPrompt: record.systemPrompt }),
-		...(record.instructions === undefined ? {} : { instructions: record.instructions }),
-		...(record.budgetChars === undefined ? {} : { budgetChars: record.budgetChars }),
-		...(record.reasoningEffort === undefined ? {} : { reasoningEffort: record.reasoningEffort }),
 	};
+}
+
+// Compares only model-visible definition fields so record ids and timestamps cannot cause a mismatch.
+function definitionKey(definition: Definition): string {
+	return JSON.stringify([
+		definition.systemPrompt,
+		definition.tools.map((tool) => [tool.name, tool.description, tool.parameters]),
+		definition.compaction.systemPrompt,
+		definition.compaction.initialInstructions,
+		definition.compaction.updateInstructions,
+	]);
 }
 
 function createConfiguredHarness(state: Engine.HarnessState, cwd: string, config: Config.Config): Harness {

@@ -9,11 +9,20 @@ import { type TestContext, test } from "node:test";
 import * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
 import { createDaemon, type DaemonOptions, type Harness } from "../src/index.ts";
-import { type Payload, SessionStore, type StoredRecord } from "../src/store.ts";
+import { type Definition, type Payload, SessionStore, type StoredRecord } from "../src/store.ts";
 
 const LOCAL_HOST = "127.0.0.1:5537";
 const PRUNED_OUTPUT_PLACEHOLDER =
 	"[Old tool output removed to free context space. Re-read the file or re-run the command if you still need it.]";
+const DEFINITION: Definition = {
+	systemPrompt: "System prompt",
+	tools: [{ name: "read", description: "Read a file", parameters: { type: "object" } }],
+	compaction: {
+		systemPrompt: "Summary system prompt",
+		initialInstructions: "Initial summary instructions",
+		updateInstructions: "Update summary instructions",
+	},
+};
 
 test("creates and lists explicit durable sessions", async (t) => {
 	const running = await startServer(t, immediateFactory());
@@ -149,8 +158,8 @@ test("keeps healthy sessions available when another session log is unreadable", 
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-malformed-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
-	const malformed = await store.create(process.cwd());
-	const healthy = await store.create(process.cwd());
+	const malformed = await store.create(process.cwd(), DEFINITION);
+	const healthy = await store.create(process.cwd(), DEFINITION);
 	const original = await readFile(malformed.log.path, "utf8");
 	await writeFile(malformed.log.path, `${original}not-json\n{"also":"bad"}`);
 	const running = await startServer(t, immediateFactory(), { sessionDir });
@@ -183,8 +192,8 @@ test("scoped listing hides unreadable sessions from other project buckets", asyn
 		mkdir(join(projectB, ".git"), { recursive: true }),
 	]);
 	const store = new SessionStore({ baseDir: sessionDir });
-	const malformed = await store.create(projectA);
-	const healthy = await store.create(projectB);
+	const malformed = await store.create(projectA, DEFINITION);
+	const healthy = await store.create(projectB, DEFINITION);
 	const original = await readFile(malformed.log.path, "utf8");
 	await writeFile(malformed.log.path, `${original}not-json\n`);
 	const running = await startServer(t, immediateFactory(), { sessionDir });
@@ -621,6 +630,37 @@ test("completed history loads after a daemon restart", async (t) => {
 	await second.close();
 });
 
+test("reloading appends a definition only when model-visible settings change", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-definition-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir: sessionDir });
+	const first = await startServer(t, immediateFactory(), { sessionDir }, false);
+	const session = await createSession(first.url);
+	await first.close();
+	const initial = await store.loadSession((await store.scanCatalog())[0].path);
+
+	const second = await startServer(t, immediateFactory(), { sessionDir }, false);
+	await getSnapshot(second.url, session.id);
+	await second.close();
+	const unchanged = await store.loadSession(initial.log.path);
+	assert.equal(unchanged.records.length, initial.records.length);
+
+	const changedDefinition: Definition = { ...DEFINITION, systemPrompt: "Changed system prompt" };
+	const third = await startServer(
+		t,
+		immediateFactory(),
+		{ sessionDir, definition: () => structuredClone(changedDefinition) },
+		false,
+	);
+	await getSnapshot(third.url, session.id);
+	await third.close();
+	const changed = await store.loadSession(initial.log.path);
+	assert.equal(changed.records.length, initial.records.length + 1);
+	const latest = changed.records.at(-1);
+	assert.equal(latest?.type, "definition");
+	if (latest?.type === "definition") assert.equal(latest.systemPrompt, "Changed system prompt");
+});
+
 test("reasoning summaries survive replay without exposing encrypted reasoning", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-reasoning-summary-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
@@ -680,6 +720,57 @@ test("reasoning summaries survive replay without exposing encrypted reasoning", 
 		assert.equal(restored.reasoningSummary, "Inspect the relevant file.");
 		assert.deepEqual(restored.reasoning, [{ type: "reasoning", encrypted_content: "encrypted" }]);
 	}
+	await second.close();
+});
+
+test("assistant reasoning effort survives persistence and replay without crossing the wire", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-reasoning-effort-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const first = await startServer(
+		t,
+		(initial) => {
+			const state = structuredClone(initial);
+			return {
+				snapshot: () => structuredClone(state),
+				compact: skippedCompaction,
+				async *send(input) {
+					state.messages.push({ role: "user", content: input.text });
+					yield delivered(input);
+					const messageId = randomUUID();
+					state.messages.push({ role: "assistant", content: "answer", reasoningEffort: "high" });
+					yield delta(input, messageId, "answer");
+					yield completed(input, messageId);
+					yield end(input);
+				},
+			};
+		},
+		{ sessionDir },
+		false,
+	);
+	const session = await createSession(first.url);
+	const admitted = await prompt(first.url, session.id, "remember the effort");
+	await waitForTerminal(first.url, session.id, admitted.turnId);
+	await first.close();
+
+	const store = new SessionStore({ baseDir: sessionDir });
+	const stored = await store.loadSession((await store.scanCatalog())[0].path);
+	const recorded = stored.records.find(
+		(record) => record.type === "conversation" && record.message.role === "assistant",
+	);
+	assert.equal(recorded?.type, "conversation");
+	if (recorded?.type === "conversation" && recorded.message.role === "assistant") {
+		assert.equal(recorded.message.reasoningEffort, "high");
+	}
+
+	const captured: Engine.HarnessState[] = [];
+	const second = await startServer(t, passiveFactory(captured), { sessionDir }, false);
+	const snapshot = await getSnapshot(second.url, session.id);
+	const restored = captured[0]?.messages.find((message) => message.role === "assistant");
+	assert.equal(restored?.role, "assistant");
+	if (restored?.role === "assistant") assert.equal(restored.reasoningEffort, "high");
+	const entry = snapshot.entries.find((candidate) => candidate.role === "assistant");
+	assert(entry);
+	assert.equal("reasoningEffort" in entry, false);
 	await second.close();
 });
 
@@ -764,7 +855,7 @@ test("restored sessions configure their harness with the recorded cwd", async (t
 	await mkdir(cwd, { recursive: true });
 	const canonicalCwd = await realpath(cwd);
 	const store = new SessionStore({ baseDir: sessionDir });
-	const session = await store.create(cwd);
+	const session = await store.create(cwd, DEFINITION);
 	const captured: string[] = [];
 	const factory = immediateFactory();
 	const running = await startServer(
@@ -1130,9 +1221,9 @@ test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-hidden-corruption-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const tail = JSON.stringify({
-		version: 3,
+		version: 4,
 		recordId: "tail",
 		previousRecordId: "missing",
 		at: "2026-01-01T00:00:00.000Z",
@@ -1292,7 +1383,7 @@ test("a non-positive automatic trigger skips compaction and pruning while manual
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-nonpositive-trigger-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
-	const seeded = await store.create(process.cwd());
+	const seeded = await store.create(process.cwd(), DEFINITION);
 	const usage: Protocol.Usage = { input: 10, output: 7, cacheRead: 0, cacheWrite: 0, total: 17 };
 	await seeded.log.append([
 		{
@@ -1754,7 +1845,7 @@ test("an over-ceiling idle session compacts before admitting its next prompt", a
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-rescue-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
-	const seeded = await store.create(process.cwd());
+	const seeded = await store.create(process.cwd(), DEFINITION);
 	const usage: Protocol.Usage = { input: 10, output: 7, cacheRead: 0, cacheWrite: 0, total: 17 };
 	await seeded.log.append([
 		{
@@ -1850,10 +1941,10 @@ test(
 		const compacted = snapshot.entries.at(-1);
 		assert.equal(compacted?.role, "compaction");
 		if (compacted?.role === "compaction") {
-			assert.equal(compacted.systemPrompt, "Summary system prompt");
-			assert.equal(compacted.instructions, "Initial summary instructions");
-			assert.equal(compacted.budgetChars, 400_000);
-			assert.equal(compacted.reasoningEffort, "high");
+			assert.equal("systemPrompt" in compacted, false);
+			assert.equal("instructions" in compacted, false);
+			assert.equal("budgetChars" in compacted, false);
+			assert.equal("reasoningEffort" in compacted, false);
 		}
 		assert.equal(requests.length, 1);
 		const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
@@ -1863,10 +1954,22 @@ test(
 		const record = records.records.find((candidate) => candidate.type === "compaction");
 		assert.equal(record?.type, "compaction");
 		if (record?.type === "compaction") {
-			assert.equal(record.systemPrompt, "Summary system prompt");
-			assert.equal(record.instructions, "Initial summary instructions");
+			assert.equal("systemPrompt" in record, false);
+			assert.equal("instructions" in record, false);
 			assert.equal(record.budgetChars, 400_000);
 			assert.equal(record.reasoningEffort, "high");
+		}
+		const definition = records.records[1];
+		assert.equal(definition?.type, "definition");
+		if (definition?.type === "definition") {
+			assert.deepEqual(
+				{
+					systemPrompt: definition.systemPrompt,
+					tools: definition.tools,
+					compaction: definition.compaction,
+				},
+				DEFINITION,
+			);
 		}
 		const event = records.records.find(
 			(candidate) => candidate.type === "event" && candidate.event.type === "compacted",
@@ -1987,11 +2090,11 @@ test("builds the pruned harness before appending the durable record", async (t) 
 	);
 });
 
-test("replay applies prune records and strips stale assistant usage", async (t) => {
+test("replay applies prune records and strips stale assistant metadata", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-prune-replay-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const usage: Protocol.Usage = { input: 80_000, output: 1, cacheRead: 0, cacheWrite: 0, total: 80_001 };
 	await session.log.append([
 		{
@@ -2006,6 +2109,7 @@ test("replay applies prune records and strips stale assistant usage", async (t) 
 				provider: "openai",
 				model: "gpt-5.4-mini",
 				usage,
+				reasoningEffort: "high",
 			},
 		},
 		{
@@ -2032,7 +2136,12 @@ test("replay applies prune records and strips stale assistant usage", async (t) 
 
 	const assistant = captured[0]?.messages[0];
 	assert.equal(assistant?.role, "assistant");
-	if (assistant?.role === "assistant") assert.equal(assistant.usage, undefined);
+	if (assistant?.role === "assistant") {
+		assert.equal(assistant.provider, undefined);
+		assert.equal(assistant.model, undefined);
+		assert.equal(assistant.usage, undefined);
+		assert.equal(assistant.reasoningEffort, undefined);
+	}
 	const tool = captured[0]?.messages[1];
 	assert.equal(tool?.role, "tool");
 	if (tool?.role === "tool") assert.equal(tool.content, PRUNED_OUTPUT_PLACEHOLDER);
@@ -2068,7 +2177,7 @@ test("a log ending on a pruned event replays consistently during recovery", asyn
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-prune-recovery-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	await session.log.append([
 		{
 			type: "conversation",
@@ -2102,21 +2211,23 @@ test("a log ending on a pruned event replays consistently during recovery", asyn
 	assert.equal(catalog.idle, false);
 });
 
-test("replay projects a legacy v3 compaction while preserving every transcript entry", async (t) => {
+test("replay projects a v4 compaction while preserving every transcript entry", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-replay-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const oldUsage: Protocol.Usage = { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, total: 20 };
 	const newUsage: Protocol.Usage = { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, total: 30 };
-	const legacyCompaction = {
+	const compaction: Payload = {
 		type: "compaction",
 		turnId: "turn-compact",
 		summary: "summary",
 		firstKeptEntryId: "entry-kept-user",
 		tokensBefore: 100,
 		tokensAfter: 25,
-	} as Payload;
+		budgetChars: 400_000,
+		reasoningEffort: "low",
+	};
 	await session.log.append([
 		{
 			type: "conversation",
@@ -2156,9 +2267,10 @@ test("replay projects a legacy v3 compaction while preserving every transcript e
 				provider: "openai",
 				model: "gpt-5.4-mini",
 				usage: oldUsage,
+				reasoningEffort: "low",
 			},
 		},
-		legacyCompaction,
+		compaction,
 		{
 			type: "conversation",
 			id: "entry-new-user",
@@ -2177,6 +2289,7 @@ test("replay projects a legacy v3 compaction while preserving every transcript e
 				provider: "openai",
 				model: "gpt-5.4-mini",
 				usage: newUsage,
+				reasoningEffort: "high",
 			},
 		},
 		{
@@ -2197,13 +2310,13 @@ test("replay projects a legacy v3 compaction while preserving every transcript e
 		snapshot.entries.map((entry) => entry.role),
 		["user", "assistant", "user", "assistant", "compaction", "user", "assistant"],
 	);
-	const legacyEntry = snapshot.entries.find((entry) => entry.role === "compaction");
-	assert.equal(legacyEntry?.role, "compaction");
-	if (legacyEntry?.role === "compaction") {
-		assert.equal("systemPrompt" in legacyEntry, false);
-		assert.equal("instructions" in legacyEntry, false);
-		assert.equal("budgetChars" in legacyEntry, false);
-		assert.equal("reasoningEffort" in legacyEntry, false);
+	const compactionEntry = snapshot.entries.find((entry) => entry.role === "compaction");
+	assert.equal(compactionEntry?.role, "compaction");
+	if (compactionEntry?.role === "compaction") {
+		assert.equal("systemPrompt" in compactionEntry, false);
+		assert.equal("instructions" in compactionEntry, false);
+		assert.equal("budgetChars" in compactionEntry, false);
+		assert.equal("reasoningEffort" in compactionEntry, false);
 	}
 	const projected = captured[0]?.messages;
 	assert.deepEqual(
@@ -2212,10 +2325,16 @@ test("replay projects a legacy v3 compaction while preserving every transcript e
 	);
 	const keptAssistant = projected?.[2];
 	assert.equal(keptAssistant?.role, "assistant");
-	if (keptAssistant?.role === "assistant") assert.equal(keptAssistant.usage, undefined);
+	if (keptAssistant?.role === "assistant") {
+		assert.equal(keptAssistant.usage, undefined);
+		assert.equal(keptAssistant.reasoningEffort, undefined);
+	}
 	const newAssistant = projected?.at(-1);
 	assert.equal(newAssistant?.role, "assistant");
-	if (newAssistant?.role === "assistant") assert.deepEqual(newAssistant.usage, newUsage);
+	if (newAssistant?.role === "assistant") {
+		assert.deepEqual(newAssistant.usage, newUsage);
+		assert.equal(newAssistant.reasoningEffort, "high");
+	}
 });
 
 test("a completed turn leaves an empty queue_changed as the final log record", async (t) => {
@@ -2292,16 +2411,14 @@ function backoffFactory(outcome: BackoffOutcome = "gate-fail") {
 					model: "gpt-5.4-mini",
 					usage: { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, total: 5 },
 				};
-				const kept = state.messages.slice(-1).map(Engine.stripAssistantUsage);
-				const before = Engine.estimateContextTokens(state.messages.map(Engine.stripAssistantUsage));
+				const kept = state.messages.slice(-1).map(Engine.stripAssistantMetadata);
+				const before = Engine.estimateContextTokens(state.messages.map(Engine.stripAssistantMetadata));
 				return {
 					kind: "compacted",
 					summary: "summary",
 					keptCount: kept.length,
 					tokensBefore: before,
 					tokensAfter: mode.outcome === "gate-fail" ? before + 1 : 1,
-					systemPrompt: "Summary system prompt",
-					instructions: input.previousSummary ? "Update summary instructions" : "Initial summary instructions",
 					budgetChars: 400_000,
 					reasoningEffort: input.reasoningEffort ?? null,
 					messages: [Engine.compactionSummaryMessage("summary"), ...kept],
@@ -2352,7 +2469,7 @@ function compactionFactory(
 					model: "gpt-5.4-mini",
 					usage,
 				};
-				const kept = state.messages.slice(-1).map(Engine.stripAssistantUsage);
+				const kept = state.messages.slice(-1).map(Engine.stripAssistantMetadata);
 				const messages = [Engine.compactionSummaryMessage(summary), ...kept];
 				return {
 					kind: "compacted",
@@ -2360,8 +2477,6 @@ function compactionFactory(
 					keptCount: kept.length,
 					tokensBefore: typeof outcome === "string" ? 17 : outcome.tokensBefore,
 					tokensAfter: typeof outcome === "string" ? 5 : outcome.tokensAfter,
-					systemPrompt: "Summary system prompt",
-					instructions: input.previousSummary ? "Update summary instructions" : "Initial summary instructions",
 					budgetChars: 400_000,
 					reasoningEffort: input.reasoningEffort ?? null,
 					messages,
@@ -2590,7 +2705,7 @@ function passiveFactory(captured: Engine.HarnessState[]): NonNullable<DaemonOpti
 }
 
 async function seedRunning(store: SessionStore, extra: Payload[], state: "running" | "cancelling" = "running") {
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const item: Protocol.PromptQueueItem = {
 		id: "queue-1",
 		turnId: "turn-1",
@@ -2675,7 +2790,7 @@ async function seedRunning(store: SessionStore, extra: Payload[], state: "runnin
 }
 
 async function seedRunningCompaction(store: SessionStore, compacted: boolean) {
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const item: Protocol.CompactionQueueItem = {
 		id: "queue-compact",
 		turnId: "turn-compact",
@@ -2723,8 +2838,6 @@ async function seedRunningCompaction(store: SessionStore, compacted: boolean) {
 				firstKeptEntryId: "entry-kept",
 				tokensBefore: 100,
 				tokensAfter: 20,
-				systemPrompt: "Summary system prompt",
-				instructions: "Initial summary instructions",
 				budgetChars: 400_000,
 				reasoningEffort: null,
 			},
@@ -2748,7 +2861,7 @@ async function seedRunningCompaction(store: SessionStore, compacted: boolean) {
 }
 
 async function seedPrunableSession(store: SessionStore) {
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const messages = ["a", "b", "c", "previous", "current"].flatMap(prunableToolTurn);
 	const payloads: Payload[] = messages.map((message, index) => ({
 		type: "conversation",
@@ -2798,7 +2911,7 @@ function prunableToolTurn(id: string): Engine.HarnessState["messages"] {
 }
 
 async function seedInterleavedContext(store: SessionStore, order: "prune-first" | "compaction-first") {
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const prune: Payload = {
 		type: "prune",
 		toolCallIds: ["call-old"],
@@ -2812,8 +2925,6 @@ async function seedInterleavedContext(store: SessionStore, order: "prune-first" 
 		firstKeptEntryId: "entry-owner",
 		tokensBefore: 30_000,
 		tokensAfter: 30,
-		systemPrompt: "Summary system prompt",
-		instructions: "Initial summary instructions",
 		budgetChars: 400_000,
 		reasoningEffort: null,
 	};
@@ -2899,7 +3010,7 @@ async function seedCancellingWithWaiting(store: SessionStore) {
 }
 
 async function seedWaitingCompaction(store: SessionStore) {
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const item: Protocol.CompactionQueueItem = {
 		id: "queue-compact",
 		turnId: "turn-compact",
@@ -2935,7 +3046,7 @@ async function seedWaitingCompaction(store: SessionStore) {
 }
 
 async function seedWaiting(store: SessionStore, items: Array<{ text: string; submittedAt: string }>) {
-	const session = await store.create(process.cwd());
+	const session = await store.create(process.cwd(), DEFINITION);
 	const waiting: Protocol.PromptQueueItem[] = items.map((item, index) => ({
 		id: `queue-${index + 1}`,
 		turnId: `turn-${index + 1}`,
@@ -3117,6 +3228,7 @@ async function startServer(
 	const server = createDaemon({
 		sessionDir,
 		harnessFactory,
+		definition: options.definition ?? (() => structuredClone(DEFINITION)),
 		eventTailSize: options.eventTailSize,
 		recoveryWindowMinutes: options.recoveryWindowMinutes ?? Number.MAX_SAFE_INTEGER,
 		compaction: options.compaction ?? {

@@ -130,10 +130,6 @@ export type ConversationEntry =
 			tokensBefore: number;
 			tokensAfter: number;
 			firstKeptEntryId: string;
-			systemPrompt?: string;
-			instructions?: string;
-			budgetChars?: number;
-			reasoningEffort?: ReasoningEffort | null;
 	  });
 
 // The most recent automatic compaction failure that no later compaction has cleared. Clients surface
@@ -406,7 +402,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "15" as const;
+export const PROTOCOL_VERSION = "16" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

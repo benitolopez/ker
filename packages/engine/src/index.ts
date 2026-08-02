@@ -51,8 +51,6 @@ export type CompactionOutcome =
 			keptCount: number;
 			tokensBefore: number;
 			tokensAfter: number;
-			systemPrompt: string;
-			instructions: string;
 			budgetChars: number;
 			reasoningEffort: Llm.ReasoningEffort | null;
 			messages: Llm.Message[];
@@ -335,6 +333,7 @@ async function* streamStep(
 					provider,
 					model: config.model,
 					usage: event.usage,
+					...(config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }),
 				});
 				yield {
 					actor: "agent",
@@ -426,9 +425,9 @@ export function compactionSummaryMessage(summary: string): Llm.Message {
 	return { role: "developer", content: `${COMPACTION_SUMMARY_PREFIX}${summary}\n</summary>` };
 }
 
-export function stripAssistantUsage(message: Llm.Message): Llm.Message {
+export function stripAssistantMetadata(message: Llm.Message): Llm.Message {
 	if (message.role !== "assistant") return structuredClone(message);
-	const { provider: _provider, model: _model, usage: _usage, ...rest } = message;
+	const { provider: _provider, model: _model, usage: _usage, reasoningEffort: _effort, ...rest } = message;
 	return structuredClone(rest);
 }
 
@@ -465,7 +464,7 @@ export function pruneToolOutputs(messages: readonly Llm.Message[]): PruneOutcome
 	}
 	if ([...occurrences.values()].some((count) => count > 1)) return undefined;
 
-	const normalizedBefore = messages.map(stripAssistantUsage);
+	const normalizedBefore = messages.map(stripAssistantMetadata);
 	const after = applyPrune(normalizedBefore, toolCallIds);
 	const tokensBefore = estimateContextTokens(normalizedBefore);
 	const tokensAfter = estimateContextTokens(after);
@@ -476,7 +475,7 @@ export function pruneToolOutputs(messages: readonly Llm.Message[]): PruneOutcome
 export function applyPrune(messages: readonly Llm.Message[], toolCallIds: readonly string[]): Llm.Message[] {
 	const selected = new Set(toolCallIds);
 	return messages.map((message) => {
-		const normalized = stripAssistantUsage(message);
+		const normalized = stripAssistantMetadata(message);
 		if (normalized.role !== "tool" || !selected.has(normalized.toolCallId)) return normalized;
 		return { ...normalized, content: PRUNED_OUTPUT_PLACEHOLDER };
 	});
@@ -601,7 +600,7 @@ async function* compactMessages(
 					return { kind: "stopped" };
 				}
 				if (signal?.aborted) return { kind: "aborted" };
-				const normalizedMessages = messages.map(stripAssistantUsage);
+				const normalizedMessages = messages.map(stripAssistantMetadata);
 				const nextMessages = [compactionSummaryMessage(content), ...normalizedMessages.slice(cut)];
 				return {
 					kind: "compacted",
@@ -609,8 +608,6 @@ async function* compactMessages(
 					keptCount: messages.length - cut,
 					tokensBefore: estimateContextTokens(normalizedMessages),
 					tokensAfter: estimateContextTokens(nextMessages),
-					systemPrompt,
-					instructions,
 					budgetChars,
 					reasoningEffort: reasoningEffort ?? null,
 					messages: nextMessages,

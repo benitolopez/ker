@@ -9,7 +9,7 @@ import {
 	type EngineConfig,
 	estimateContextTokens,
 	pruneToolOutputs,
-	stripAssistantUsage,
+	stripAssistantMetadata,
 } from "../src/index.ts";
 
 const USAGE: Protocol.Usage = { input: 8, output: 2, cacheRead: 0, cacheWrite: 0, total: 10 };
@@ -311,8 +311,6 @@ test("uses the update template, previous summary, and additional focus without s
 	assert.equal(prompt.match(/old summary/g)?.length, 1);
 	assert.equal(result.outcome.kind, "compacted");
 	if (result.outcome.kind !== "compacted") return;
-	assert.equal(result.outcome.systemPrompt, "Summary system prompt");
-	assert.equal(result.outcome.instructions, "Update summary instructions");
 	assert.equal(result.outcome.budgetChars, 400_000);
 	assert.equal(result.outcome.reasoningEffort, "low");
 });
@@ -479,6 +477,7 @@ test("returns a non-mutating replacement with a developer summary and stripped k
 			provider: "openai",
 			model: "test-model",
 			usage: USAGE,
+			reasoningEffort: "high",
 		},
 	];
 	const original = structuredClone(messages);
@@ -496,6 +495,7 @@ test("returns a non-mutating replacement with a developer summary and stripped k
 		assert.equal(kept.provider, undefined);
 		assert.equal(kept.model, undefined);
 		assert.equal(kept.usage, undefined);
+		assert.equal(kept.reasoningEffort, undefined);
 	}
 	assert.deepEqual(result.events, [
 		{
@@ -536,9 +536,23 @@ test("computes the compaction gate pair with comparable normalized estimates", a
 
 	assert.equal(result.outcome.kind, "compacted");
 	if (result.outcome.kind !== "compacted") return;
-	const normalized = messages.map(stripAssistantUsage);
+	const normalized = messages.map(stripAssistantMetadata);
 	assert.equal(result.outcome.tokensBefore, estimateContextTokens(normalized));
 	assert(result.outcome.tokensBefore < estimateContextTokens(messages));
+});
+
+test("strips assistant request metadata without changing content", () => {
+	assert.deepEqual(
+		stripAssistantMetadata({
+			role: "assistant",
+			content: "answer",
+			provider: "openai",
+			model: "test-model",
+			usage: USAGE,
+			reasoningEffort: "high",
+		}),
+		{ role: "assistant", content: "answer" },
+	);
 });
 
 test("prunes only worthwhile old tool output beyond the protected turns and token budget", () => {

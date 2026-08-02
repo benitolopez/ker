@@ -109,6 +109,28 @@ test("reuses preflight auth for the initial provider attempt", async () => {
 	assert.deepEqual(observed, { authCalls: 1, providerKeys: ["key-1"] });
 });
 
+test("stamps completed assistant messages with the configured reasoning effort", async () => {
+	const stream = async function* () {
+		yield {
+			type: "done" as const,
+			reason: "stop" as const,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+		};
+	};
+	const configured = createHarness({ ...createConfig(), reasoningEffort: "high" }, { stream });
+	const unset = createHarness(createConfig(), { stream });
+
+	await collectEvents(send(configured, "configured"));
+	await collectEvents(send(unset, "unset"));
+
+	const configuredReply = configured.messages.at(-1);
+	assert.equal(configuredReply?.role, "assistant");
+	if (configuredReply?.role === "assistant") assert.equal(configuredReply.reasoningEffort, "high");
+	const unsetReply = unset.messages.at(-1);
+	assert.equal(unsetReply?.role, "assistant");
+	if (unsetReply?.role === "assistant") assert.equal("reasoningEffort" in unsetReply, false);
+});
+
 test("rejects a changed oauth account before admitting the prompt", async () => {
 	const observed = { accountId: "acc_old", streamCalls: 0 };
 	const harness = createHarness(

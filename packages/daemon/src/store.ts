@@ -3,9 +3,10 @@ import { appendFile, mkdir, open, opendir, readFile, realpath, stat } from "node
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse } from "node:path";
 import type * as Engine from "@ker-ai/engine";
+import type * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 
-const STORE_VERSION = 3 as const;
+const STORE_VERSION = 4 as const;
 const SESSION_FILE = "session.jsonl";
 const HEADER_SCAN_BYTES = 8_192;
 const TAIL_SCAN_BYTES = 8_192;
@@ -21,6 +22,18 @@ interface RecordBase {
 export interface SessionRecord extends RecordBase {
 	type: "session";
 	session: Protocol.SessionDescriptor;
+}
+
+// The model-visible prompts and tool schemas. Stored definitions preserve what later turns used
+// when the executable definition differs.
+export interface Definition {
+	systemPrompt: string;
+	tools: Llm.Tool[];
+	compaction: Engine.CompactionTemplate;
+}
+
+export interface DefinitionRecord extends RecordBase, Definition {
+	type: "definition";
 }
 
 export interface EventRecord extends RecordBase {
@@ -54,10 +67,8 @@ export interface CompactionRecord extends RecordBase {
 	firstKeptEntryId: string;
 	tokensBefore: number;
 	tokensAfter: number;
-	systemPrompt?: string;
-	instructions?: string;
-	budgetChars?: number;
-	reasoningEffort?: Protocol.ReasoningEffort | null;
+	budgetChars: number;
+	reasoningEffort: Protocol.ReasoningEffort | null;
 }
 
 export interface PruneRecord extends RecordBase {
@@ -69,6 +80,7 @@ export interface PruneRecord extends RecordBase {
 
 export type StoredRecord =
 	| SessionRecord
+	| DefinitionRecord
 	| EventRecord
 	| ConversationRecord
 	| IdentityRecord
@@ -78,6 +90,7 @@ export type StoredRecord =
 
 export type Payload =
 	| { type: "session"; session: Protocol.SessionDescriptor }
+	| ({ type: "definition" } & Definition)
 	| { type: "event"; event: Protocol.Event }
 	| {
 			type: "conversation";
@@ -96,8 +109,6 @@ export type Payload =
 			firstKeptEntryId: string;
 			tokensBefore: number;
 			tokensAfter: number;
-			systemPrompt: string;
-			instructions: string;
 			budgetChars: number;
 			reasoningEffort: Protocol.ReasoningEffort | null;
 	  }
@@ -182,7 +193,7 @@ export class SessionStore {
 		this.baseDir = options.baseDir ?? defaultSessionDir();
 	}
 
-	async create(cwd: string): Promise<StoredSession> {
+	async create(cwd: string, definition: Definition): Promise<StoredSession> {
 		const canonicalCwd = await canonicalDirectory(cwd);
 		const projectRoot = await canonicalProjectRoot(canonicalCwd);
 		const now = new Date().toISOString();
@@ -196,7 +207,10 @@ export class SessionStore {
 		const directory = join(this.baseDir, projectKey(projectRoot), session.id);
 		await mkdir(directory, { recursive: true, mode: 0o700 });
 		const log = new SessionLog(join(directory, SESSION_FILE), null);
-		const records = await log.append([{ type: "session", session }]);
+		const records = await log.append([
+			{ type: "session", session },
+			{ type: "definition", ...definition },
+		]);
 		return { log, records, session };
 	}
 
@@ -311,30 +325,36 @@ async function scanSession(path: string): Promise<{ session: Protocol.SessionDes
 	}
 }
 
-// A session is idle exactly when its final complete record is a queue_changed with an empty
-// queue, or the log holds only the session record. Every ambiguous tail (torn line, truncated
-// view, parse failure) reads as busy, so recovery loads the full log instead of skipping it.
+// Definition records do not change queue state, so idle classification skips them while walking
+// backward to the latest queue record. An ambiguous tail reads as busy so recovery loads the log.
 function isIdleTail(tail: Buffer, tailOffset: number, path: string): boolean {
 	if (tail.length === 0 || tail[tail.length - 1] !== 10) return false;
 	const body = tail.subarray(0, tail.length - 1);
-	const start = body.lastIndexOf(10);
-	if (start === -1 && tailOffset > 0) return false;
-	let record: StoredRecord;
-	try {
-		record = parseRecord(body.subarray(start + 1).toString("utf8"), path);
-	} catch {
-		return false;
+	for (let end = body.length; end > 0; ) {
+		const start = body.lastIndexOf(10, end - 1);
+		if (start === -1 && tailOffset > 0) return false;
+		let record: StoredRecord;
+		try {
+			record = parseRecord(body.subarray(start + 1, end).toString("utf8"), path);
+		} catch {
+			return false;
+		}
+		if (record.type === "definition") {
+			end = start;
+			continue;
+		}
+		if (record.type === "session") return start === -1 && tailOffset === 0;
+		return (
+			record.type === "event" &&
+			record.event.type === "queue_changed" &&
+			!record.event.queue.running &&
+			record.event.queue.waiting.length === 0
+		);
 	}
-	if (record.type === "session") return start === -1 && tailOffset === 0;
-	return (
-		record.type === "event" &&
-		record.event.type === "queue_changed" &&
-		!record.event.queue.running &&
-		record.event.queue.waiting.length === 0
-	);
+	return false;
 }
 
-// A torn final JSON fragment in a v3 log is discarded. Every complete malformed line invalidates the session.
+// A torn final JSON fragment in a v4 log is discarded. Every complete malformed line invalidates the session.
 async function readRecords(path: string): Promise<StoredRecord[]> {
 	const contents = await readFile(path);
 	const records: StoredRecord[] = [];

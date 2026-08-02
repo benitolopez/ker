@@ -25,6 +25,7 @@ export type Message =
 			provider?: Provider;
 			model?: string;
 			usage?: Usage;
+			reasoningEffort?: ReasoningEffort;
 	  }
 	| { role: "tool"; toolCallId: string; content: string };
 

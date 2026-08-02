@@ -4,13 +4,23 @@ import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, write
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defaultSessionDir, SessionStore } from "../src/store.ts";
+import { type Definition, defaultSessionDir, SessionStore } from "../src/store.ts";
+
+const DEFINITION: Definition = {
+	systemPrompt: "System prompt",
+	tools: [{ name: "read", description: "Read a file", parameters: { type: "object" } }],
+	compaction: {
+		systemPrompt: "Summary system prompt",
+		initialInstructions: "Initial summary instructions",
+		updateInstructions: "Update summary instructions",
+	},
+};
 
 test("writes chained versioned records and keeps conversation ancestry explicit", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	const [submitted] = await session.log.append([
 		{
 			type: "event",
@@ -37,18 +47,35 @@ test("writes chained versioned records and keeps conversation ancestry explicit"
 		},
 	]);
 
-	assert.equal(submitted.previousRecordId, session.records[0].recordId);
+	assert.equal(submitted.previousRecordId, session.records[1].recordId);
 	assert.equal(delivered.previousRecordId, submitted.recordId);
 	assert.equal(delivered.type, "conversation");
 	if (delivered.type === "conversation") assert.equal(delivered.parentId, null);
-	assert.equal(session.records[0].version, 3);
+	assert.deepEqual(
+		session.records.map((record) => record.type),
+		["session", "definition"],
+	);
+	assert.equal(session.records[0].version, 4);
+	const definition = session.records[1];
+	assert.equal(definition.type, "definition");
+	if (definition.type === "definition") {
+		assert.deepEqual(
+			{
+				systemPrompt: definition.systemPrompt,
+				tools: definition.tools,
+				compaction: definition.compaction,
+			},
+			DEFINITION,
+		);
+		assert.deepEqual(Object.keys(definition.tools[0]).sort(), ["description", "name", "parameters"]);
+	}
 });
 
 test("serializes concurrent appends within one session", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-serialized-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	await Promise.all([
 		session.log.append([{ type: "identity", identity: { kind: "apikey" } }]),
 		session.log.append([{ type: "identity", identity: { kind: "oauth", accountId: "account-1" } }]),
@@ -56,14 +83,14 @@ test("serializes concurrent appends within one session", async (t) => {
 
 	const [entry] = await store.scanCatalog();
 	const loaded = await store.loadSession(entry.path);
-	assert.equal(loaded.records.length, 3);
+	assert.equal(loaded.records.length, 4);
 });
 
 test("round-trips prune records", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-prune-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	await session.log.append([
 		{
 			type: "prune",
@@ -85,9 +112,9 @@ test("truncates only a malformed final partial line", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-torn-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	const completeSize = (await stat(session.log.path)).size;
-	await appendFile(session.log.path, '{"version":3,"id":"torn"');
+	await appendFile(session.log.path, '{"version":4,"id":"torn"');
 	const tornSize = (await stat(session.log.path)).size;
 
 	const [entry] = await store.scanCatalog();
@@ -97,32 +124,32 @@ test("truncates only a malformed final partial line", async (t) => {
 	assert.equal((await stat(session.log.path)).size, completeSize);
 });
 
-test("keeps v2 sessions unreadable without changing their bytes", async (t) => {
-	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-v2-"));
+test("keeps v3 sessions unreadable without changing their bytes", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-v3-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
-	const v2 = `${JSON.stringify({
-		version: 2,
+	const session = await store.create(baseDir, DEFINITION);
+	const v3 = `${JSON.stringify({
+		version: 3,
 		recordId: "record-1",
 		previousRecordId: null,
 		at: "2026-01-01T00:00:00.000Z",
 		type: "session",
 		session: session.session,
 	})}\n`;
-	await writeFile(session.log.path, v2);
+	await writeFile(session.log.path, v3);
 
 	assert.deepEqual(await store.scanCatalog(), []);
 	assert.equal(store.listUnreadable()[0]?.id, session.session.id);
-	assert.equal(await readFile(session.log.path, "utf8"), v2);
+	assert.equal(await readFile(session.log.path, "utf8"), v3);
 });
 
 test("rejects a malformed complete tail at load without repairing it", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-complete-tail-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
-	await appendFile(session.log.path, '{"version":3,}');
+	const session = await store.create(baseDir, DEFINITION);
+	await appendFile(session.log.path, '{"version":4,}');
 	const before = await readFile(session.log.path);
 
 	const [entry] = await store.scanCatalog();
@@ -136,7 +163,7 @@ test("repairs a valid final record that is missing its newline", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-newline-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	const contents = await readFile(session.log.path, "utf8");
 	await writeFile(session.log.path, contents.trimEnd());
 
@@ -145,15 +172,15 @@ test("repairs a valid final record that is missing its newline", async (t) => {
 	const loaded = await store.loadSession(entry.path);
 	await loaded.log.append([{ type: "identity", identity: { kind: "apikey" } }]);
 	const lines = (await readFile(session.log.path, "utf8")).trimEnd().split("\n");
-	assert.equal(lines.length, 2);
+	assert.equal(lines.length, 3);
 });
 
 test("admits deep corruption at scan and rejects it at load", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-malformed-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const malformed = await store.create(baseDir);
-	const healthy = await store.create(baseDir);
+	const malformed = await store.create(baseDir, DEFINITION);
+	const healthy = await store.create(baseDir, DEFINITION);
 	const original = await readFile(malformed.log.path, "utf8");
 	await writeFile(malformed.log.path, `${original}not-json\n{"also":"bad"}`);
 
@@ -174,7 +201,7 @@ test("persists provider identity without credentials", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-identity-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	await session.log.append([{ type: "identity", identity: { kind: "oauth", accountId: "account-1" } }]);
 
 	const contents = await readFile(session.log.path, "utf8");
@@ -195,8 +222,8 @@ test("creates and reloads sessions from every project bucket", async (t) => {
 		mkdir(projectB, { recursive: true }),
 	]);
 	const store = new SessionStore({ baseDir });
-	const first = await store.create(cwdA);
-	const second = await store.create(projectB);
+	const first = await store.create(cwdA, DEFINITION);
+	const second = await store.create(projectB, DEFINITION);
 	const canonicalRoot = await realpath(root);
 	const canonicalProjectA = join(canonicalRoot, "project-a");
 	const canonicalCwdA = join(canonicalProjectA, "nested");
@@ -227,7 +254,7 @@ test("catalog freshness comes from file mtime until a session is loaded", async 
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-mtime-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	const touched = new Date("2026-02-03T04:05:06Z");
 	await utimes(session.log.path, touched, touched);
 
@@ -245,7 +272,7 @@ test("flags a session with an unreadable header line", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-header-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	await writeFile(session.log.path, "not-json\n");
 
 	assert.deepEqual(await store.scanCatalog(), []);
@@ -258,7 +285,7 @@ test("classifies idle sessions from the final complete record", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-idle-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const idle = await store.create(baseDir);
+	const idle = await store.create(baseDir, DEFINITION);
 	await idle.log.append([
 		{
 			type: "event",
@@ -270,7 +297,7 @@ test("classifies idle sessions from the final complete record", async (t) => {
 			},
 		},
 	]);
-	const busy = await store.create(baseDir);
+	const busy = await store.create(baseDir, DEFINITION);
 	await busy.log.append([
 		{
 			type: "event",
@@ -294,11 +321,11 @@ test("classifies idle sessions from the final complete record", async (t) => {
 			},
 		},
 	]);
-	const midTurn = await store.create(baseDir);
+	const midTurn = await store.create(baseDir, DEFINITION);
 	await midTurn.log.append([{ type: "identity", identity: { kind: "apikey" } }]);
-	const torn = await store.create(baseDir);
-	await appendFile(torn.log.path, '{"version":3');
-	const bare = await store.create(baseDir);
+	const torn = await store.create(baseDir, DEFINITION);
+	await appendFile(torn.log.path, '{"version":4');
+	const bare = await store.create(baseDir, DEFINITION);
 
 	const idleById = new Map((await store.scanCatalog()).map((entry) => [entry.session.id, entry.idle]));
 	assert.equal(idleById.get(idle.session.id), true);
@@ -312,7 +339,7 @@ test("round-trips compaction records and classifies their completed queue as idl
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-compaction-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
-	const session = await store.create(baseDir);
+	const session = await store.create(baseDir, DEFINITION);
 	await session.log.append([
 		{
 			type: "conversation",
@@ -328,8 +355,6 @@ test("round-trips compaction records and classifies their completed queue as idl
 			firstKeptEntryId: "entry-1",
 			tokensBefore: 100,
 			tokensAfter: 20,
-			systemPrompt: "Summary system prompt",
-			instructions: "Initial summary instructions",
 			budgetChars: 400_000,
 			reasoningEffort: "high",
 		},
@@ -352,8 +377,6 @@ test("round-trips compaction records and classifies their completed queue as idl
 	if (compacted?.type === "compaction") {
 		assert.equal(compacted.firstKeptEntryId, "entry-1");
 		assert.equal(compacted.summary, "summary");
-		assert.equal(compacted.systemPrompt, "Summary system prompt");
-		assert.equal(compacted.instructions, "Initial summary instructions");
 		assert.equal(compacted.budgetChars, 400_000);
 		assert.equal(compacted.reasoningEffort, "high");
 	}
