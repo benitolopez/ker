@@ -13,6 +13,8 @@ const KILL_GRACE_MS = 2000;
 const IDLE_GRACE_MS = 100;
 const COMPACTION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
+The newest part of the conversation is kept verbatim outside your summary; the messages you see are the older portion of a session that continues past them.
+
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
 const COMPACTION_INITIAL_INSTRUCTIONS = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
@@ -44,6 +46,9 @@ Use this EXACT format:
 ## Critical Context
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
+
+## Relevant Files
+- [file path: why it matters, or "(none)"]
 
 Keep the entire summary under roughly 2,000 tokens. Prefer dropping resolved or stale detail over exceeding the budget. Preserve exact file paths, function names, and error messages.`;
 const COMPACTION_UPDATE_INSTRUCTIONS = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
@@ -78,6 +83,9 @@ Use this EXACT format:
 ## Critical Context
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
+
+## Relevant Files
+- [file path: why it matters, or "(none)"]
 
 Keep the entire summary under roughly 2,000 tokens. Prefer dropping resolved or stale detail over exceeding the budget. Preserve exact file paths, function names, and error messages.`;
 
