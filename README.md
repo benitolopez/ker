@@ -1,10 +1,16 @@
 # ker
 
-ker is a minimal coding agent.
+ker is an open-source coding agent that runs on your own machines and is meant to be driven from
+any screen (desktop, browser, or phone).
 
 It's very early. Right now ker runs a complete coding-agent loop behind a local daemon: you send
 it a prompt, the model can read and change files or run shell commands, and the loop continues
 until the model returns its final answer.
+
+## Direction
+
+Today ker lives on one machine. The plan is to split it in two: a server that keeps your projects,
+sessions, and notes, and agents that run wherever the code lives, with a web UI on top.
 
 ## Contributions
 
@@ -37,7 +43,7 @@ Thank you for your interest and understanding.
 - Transparent context compaction that summarizes older history near the model ceiling while keeping
   the complete transcript on disk. Compaction can also be requested manually.
 
-Not there yet: a TUI, queue editing, or any provider other than OpenAI.
+Not there yet: the web UI, queue editing, or any provider other than OpenAI.
 
 ## Requirements
 
@@ -179,9 +185,8 @@ npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
 Sessions are stored under `KER_SESSION_DIR` when set, otherwise at `~/.ker/sessions`, grouped by
-canonical Git root and session ID. Protocol v13 uses session-local queue snapshots, and session logs
-use record format v3. Older store versions are reported as unreadable and left byte-for-byte unchanged
-until manually removed.
+canonical Git root and session ID. Older session-log store versions are reported as unreadable and
+left byte-for-byte unchanged until manually removed.
 
 Concurrent sessions intentionally use their recorded working directories without worktree isolation.
 Running two sessions against the same files can therefore conflict. Cooperative cancellation cannot
