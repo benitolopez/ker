@@ -48,14 +48,33 @@ export interface CreateSessionRequest {
 	cwd: string;
 }
 
-export interface UnreadableSession {
+export type CatalogSession = ReadableCatalogSession | UnreadableCatalogSession;
+
+export interface ReadableCatalogSession {
+	status: "idle" | "busy";
+	id: SessionId;
+	cwd: string;
+	projectRoot: string;
+	title: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
+// A session whose log failed to scan or load. Existing catalog metadata survives; a log that never
+// scanned carries only its id and error.
+export interface UnreadableCatalogSession {
+	status: "unreadable";
 	id: SessionId;
 	error: string;
+	cwd?: string;
+	projectRoot?: string;
+	title?: string;
+	createdAt?: string;
+	updatedAt?: string;
 }
 
 export interface ListSessionsResponse {
-	sessions: SessionDescriptor[];
-	unreadable: UnreadableSession[];
+	sessions: CatalogSession[];
 }
 
 export interface QueueItemBase {
@@ -402,7 +421,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "16" as const;
+export const PROTOCOL_VERSION = "17" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

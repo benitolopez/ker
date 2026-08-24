@@ -438,7 +438,7 @@ function controlMonitor(
 		paths.push(path);
 		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION }, 200);
 		if (path === "/sessions") {
-			return jsonResponse({ sessions: [session()], unreadable: [] }, 200);
+			return jsonResponse({ sessions: [{ status: "idle", title: null, ...session() }] }, 200);
 		}
 		if (path === "/sessions/session-1") {
 			snapshotCalls++;

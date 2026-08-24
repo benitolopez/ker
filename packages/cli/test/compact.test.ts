@@ -165,7 +165,7 @@ function controlCompact(
 		paths.push(url.pathname);
 		if (url.pathname === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION }, 200);
 		if (url.pathname === "/sessions") {
-			return jsonResponse({ sessions: [snapshot().session], unreadable: [] }, 200);
+			return jsonResponse({ sessions: [{ status: "idle", title: null, ...snapshot().session }] }, 200);
 		}
 		if (url.pathname === "/sessions/session-1") return jsonResponse(snapshot(), 200);
 		if (url.pathname === "/sessions/session-1/events") {

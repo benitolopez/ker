@@ -68,6 +68,7 @@ test("session FIFO runs beside another session and survives exact cancellation",
 		);
 	const server = createDaemon({
 		sessionDir,
+		catalogPath: join(sessionDir, "catalog.db"),
 		harnessFactory,
 		recoveryWindowMinutes: 0,
 		compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000, prune: true },

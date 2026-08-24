@@ -81,7 +81,7 @@ test("serializes concurrent appends within one session", async (t) => {
 		session.log.append([{ type: "identity", identity: { kind: "oauth", accountId: "account-1" } }]),
 	]);
 
-	const [entry] = await store.scanCatalog();
+	const [entry] = (await store.scanCatalog()).sessions;
 	const loaded = await store.loadSession(entry.path);
 	assert.equal(loaded.records.length, 4);
 });
@@ -117,7 +117,7 @@ test("truncates only a malformed final partial line", async (t) => {
 	await appendFile(session.log.path, '{"version":4,"id":"torn"');
 	const tornSize = (await stat(session.log.path)).size;
 
-	const [entry] = await store.scanCatalog();
+	const [entry] = (await store.scanCatalog()).sessions;
 	assert.equal(entry.idle, false);
 	assert.equal((await stat(session.log.path)).size, tornSize);
 	await store.loadSession(entry.path);
@@ -139,8 +139,9 @@ test("keeps v3 sessions unreadable without changing their bytes", async (t) => {
 	})}\n`;
 	await writeFile(session.log.path, v3);
 
-	assert.deepEqual(await store.scanCatalog(), []);
-	assert.equal(store.listUnreadable()[0]?.id, session.session.id);
+	const scan = await store.scanCatalog();
+	assert.deepEqual(scan.sessions, []);
+	assert.equal(scan.unreadable[0]?.id, session.session.id);
 	assert.equal(await readFile(session.log.path, "utf8"), v3);
 });
 
@@ -152,7 +153,7 @@ test("rejects a malformed complete tail at load without repairing it", async (t)
 	await appendFile(session.log.path, '{"version":4,}');
 	const before = await readFile(session.log.path);
 
-	const [entry] = await store.scanCatalog();
+	const [entry] = (await store.scanCatalog()).sessions;
 	assert.equal(entry.session.id, session.session.id);
 	assert.equal(entry.idle, false);
 	await assert.rejects(store.loadSession(entry.path));
@@ -167,7 +168,7 @@ test("repairs a valid final record that is missing its newline", async (t) => {
 	const contents = await readFile(session.log.path, "utf8");
 	await writeFile(session.log.path, contents.trimEnd());
 
-	const [entry] = await store.scanCatalog();
+	const [entry] = (await store.scanCatalog()).sessions;
 	assert.equal(entry.idle, false);
 	const loaded = await store.loadSession(entry.path);
 	await loaded.log.append([{ type: "identity", identity: { kind: "apikey" } }]);
@@ -186,13 +187,13 @@ test("admits deep corruption at scan and rejects it at load", async (t) => {
 
 	const catalog = await store.scanCatalog();
 	assert.deepEqual(
-		new Set(catalog.map((entry) => entry.session.id)),
+		new Set(catalog.sessions.map((entry) => entry.session.id)),
 		new Set([malformed.session.id, healthy.session.id]),
 	);
-	assert.deepEqual(store.listUnreadable(), []);
-	const malformedEntry = catalog.find((entry) => entry.session.id === malformed.session.id);
+	assert.deepEqual(catalog.unreadable, []);
+	const malformedEntry = catalog.sessions.find((entry) => entry.session.id === malformed.session.id);
 	await assert.rejects(store.loadSession(malformedEntry?.path ?? ""), /Unexpected token|Malformed record/);
-	const healthyEntry = catalog.find((entry) => entry.session.id === healthy.session.id);
+	const healthyEntry = catalog.sessions.find((entry) => entry.session.id === healthy.session.id);
 	const loaded = await store.loadSession(healthyEntry?.path ?? "");
 	assert.equal(loaded.session.id, healthy.session.id);
 });
@@ -239,7 +240,7 @@ test("creates and reloads sessions from every project bucket", async (t) => {
 	);
 
 	const catalog = await new SessionStore({ baseDir }).scanCatalog();
-	const loadedById = new Map(catalog.map((entry) => [entry.session.id, entry.session]));
+	const loadedById = new Map(catalog.sessions.map((entry) => [entry.session.id, entry.session]));
 	assert.deepEqual(
 		{ cwd: loadedById.get(first.session.id)?.cwd, projectRoot: loadedById.get(first.session.id)?.projectRoot },
 		{ cwd: canonicalCwdA, projectRoot: canonicalProjectA },
@@ -258,7 +259,7 @@ test("catalog freshness comes from file mtime until a session is loaded", async 
 	const touched = new Date("2026-02-03T04:05:06Z");
 	await utimes(session.log.path, touched, touched);
 
-	const [entry] = await store.scanCatalog();
+	const [entry] = (await store.scanCatalog()).sessions;
 	assert.equal(entry.session.id, session.session.id);
 	assert.equal(entry.session.updatedAt, touched.toISOString());
 	assert.equal(entry.path, session.log.path);
@@ -275,10 +276,15 @@ test("flags a session with an unreadable header line", async (t) => {
 	const session = await store.create(baseDir, DEFINITION);
 	await writeFile(session.log.path, "not-json\n");
 
-	assert.deepEqual(await store.scanCatalog(), []);
-	assert.equal(store.listUnreadable()[0]?.id, session.session.id);
-	assert.equal(store.listUnreadable(session.session.projectRoot)[0]?.id, session.session.id);
-	assert.deepEqual(store.listUnreadable(join(session.session.projectRoot, "elsewhere")), []);
+	const scan = await store.scanCatalog();
+	assert.deepEqual(scan.sessions, []);
+	assert.deepEqual(scan.unreadable, [
+		{
+			id: session.session.id,
+			projectKey: createHash("sha256").update(session.session.projectRoot).digest("hex"),
+			error: scan.unreadable[0]?.error,
+		},
+	]);
 });
 
 test("classifies idle sessions from the final complete record", async (t) => {
@@ -327,7 +333,7 @@ test("classifies idle sessions from the final complete record", async (t) => {
 	await appendFile(torn.log.path, '{"version":4');
 	const bare = await store.create(baseDir, DEFINITION);
 
-	const idleById = new Map((await store.scanCatalog()).map((entry) => [entry.session.id, entry.idle]));
+	const idleById = new Map((await store.scanCatalog()).sessions.map((entry) => [entry.session.id, entry.idle]));
 	assert.equal(idleById.get(idle.session.id), true);
 	assert.equal(idleById.get(bare.session.id), true);
 	assert.equal(idleById.get(busy.session.id), false);
@@ -369,7 +375,7 @@ test("round-trips compaction records and classifies their completed queue as idl
 		},
 	]);
 
-	const [catalog] = await store.scanCatalog();
+	const [catalog] = (await store.scanCatalog()).sessions;
 	assert.equal(catalog.idle, true);
 	const loaded = await store.loadSession(catalog.path);
 	const compacted = loaded.records.find((record) => record.type === "compaction");

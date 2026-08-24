@@ -7,7 +7,7 @@ import type * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 
 const STORE_VERSION = 4 as const;
-const SESSION_FILE = "session.jsonl";
+export const SESSION_FILE = "session.jsonl";
 const HEADER_SCAN_BYTES = 8_192;
 const TAIL_SCAN_BYTES = 8_192;
 
@@ -134,10 +134,6 @@ export interface CatalogedSession {
 	idle: boolean;
 }
 
-interface BucketedUnreadableSession extends Protocol.UnreadableSession {
-	projectKey: string;
-}
-
 export interface StoreOptions {
 	baseDir?: string;
 }
@@ -187,7 +183,6 @@ export class SessionLog {
 
 export class SessionStore {
 	readonly baseDir: string;
-	readonly #unreadableSessions: BucketedUnreadableSession[] = [];
 
 	constructor(options: StoreOptions = {}) {
 		this.baseDir = options.baseDir ?? defaultSessionDir();
@@ -216,14 +211,17 @@ export class SessionStore {
 
 	// Discovers sessions by reading only each log's header line and a bounded tail, so startup
 	// cost stays flat in history size. Full replay happens in loadSession.
-	async scanCatalog(): Promise<CatalogedSession[]> {
-		this.#unreadableSessions.length = 0;
+	async scanCatalog(): Promise<{
+		sessions: CatalogedSession[];
+		unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }>;
+	}> {
 		await mkdir(this.baseDir, { recursive: true, mode: 0o700 });
 		const projects = [];
 		for await (const entry of await opendir(this.baseDir)) {
 			if (entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)) projects.push(entry);
 		}
 		const sessions: CatalogedSession[] = [];
+		const unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }> = [];
 		for (const project of projects) {
 			const projectDir = join(this.baseDir, project.name);
 			const directories = [];
@@ -237,7 +235,7 @@ export class SessionStore {
 					sessions.push({ ...scanned, path, projectKey: project.name });
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-					this.#unreadableSessions.push({
+					unreadable.push({
 						id: directory.name,
 						error: error instanceof Error ? error.message : String(error),
 						projectKey: project.name,
@@ -245,7 +243,10 @@ export class SessionStore {
 				}
 			}
 		}
-		return sessions.sort((left, right) => left.session.createdAt.localeCompare(right.session.createdAt));
+		return {
+			sessions: sessions.sort((left, right) => left.session.createdAt.localeCompare(right.session.createdAt)),
+			unreadable,
+		};
 	}
 
 	async loadSession(path: string): Promise<StoredSession> {
@@ -255,17 +256,6 @@ export class SessionStore {
 		const updatedAt = records.at(-1)?.at ?? first.session.updatedAt;
 		const session = { ...first.session, updatedAt };
 		return { log: new SessionLog(path, records.at(-1)?.recordId ?? null), records, session };
-	}
-
-	markUnreadable(id: Protocol.SessionId, error: string, projectKey: string): void {
-		this.#unreadableSessions.push({ id, error, projectKey });
-	}
-
-	listUnreadable(projectRoot?: string): Protocol.UnreadableSession[] {
-		const key = projectRoot ? projectKey(projectRoot) : undefined;
-		return this.#unreadableSessions
-			.filter((session) => !key || session.projectKey === key)
-			.map(({ id, error }) => ({ id, error }));
 	}
 }
 

@@ -27,7 +27,7 @@ test("new sends the caller cwd in its JSON request", async (t) => {
 
 test("sessions filters by cwd unless --all is present", async (t) => {
 	await t.test("cwd", async (t) => {
-		const body: Protocol.ListSessionsResponse = { sessions: [descriptor("session-1")], unreadable: [] };
+		const body: Protocol.ListSessionsResponse = { sessions: [catalogSession("session-1")] };
 		const controlled = controlCli(t, ["--json", "sessions"], (url) => {
 			if (url.pathname === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION });
 			if (url.pathname === "/sessions") return jsonResponse(body);
@@ -42,7 +42,7 @@ test("sessions filters by cwd unless --all is present", async (t) => {
 	});
 
 	await t.test("all", async (t) => {
-		const body: Protocol.ListSessionsResponse = { sessions: [], unreadable: [] };
+		const body: Protocol.ListSessionsResponse = { sessions: [] };
 		const controlled = controlCli(t, ["sessions", "--all"], (url) => {
 			if (url.pathname === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION });
 			if (url.pathname === "/sessions") return jsonResponse(body);
@@ -53,6 +53,29 @@ test("sessions filters by cwd unless --all is present", async (t) => {
 
 		assert.deepEqual([...controlled.calls[1].url.searchParams.entries()], [["scope", "all"]]);
 	});
+});
+
+test("sessions prints status, metadata, titles, and unreadable errors inline", async (t) => {
+	const controlled = controlCli(t, ["sessions"], (url) => {
+		if (url.pathname === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION });
+		if (url.pathname === "/sessions") {
+			return jsonResponse({
+				sessions: [
+					catalogSession("session-1", "Saved title"),
+					{ status: "unreadable", id: "session-2", error: "bad header" },
+				],
+			} satisfies Protocol.ListSessionsResponse);
+		}
+		throw new Error(`Unexpected request to ${url}`);
+	});
+
+	await run();
+
+	assert.equal(
+		controlled.stdout.join(""),
+		`session-1\tidle\t2026-01-01T00:00:00.000Z\t${process.cwd()}\tSaved title\nsession-2\tunreadable\t-\t-\tbad header\n`,
+	);
+	assert.equal(controlled.stderr.join(""), "");
 });
 
 test("--all is rejected on unrelated commands", async (t) => {
@@ -132,6 +155,10 @@ function descriptor(id: string): Protocol.SessionDescriptor {
 		createdAt: "2026-01-01T00:00:00.000Z",
 		updatedAt: "2026-01-01T00:00:00.000Z",
 	};
+}
+
+function catalogSession(id: string, title: string | null = null): Protocol.ReadableCatalogSession {
+	return { status: "idle", title, ...descriptor(id) };
 }
 
 function jsonResponse(body: object, status = 200): Response {

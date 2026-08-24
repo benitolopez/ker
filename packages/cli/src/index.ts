@@ -134,10 +134,9 @@ async function runSessions(json: boolean, all: boolean): Promise<void> {
 		return;
 	}
 	for (const session of body.sessions) {
-		process.stdout.write(`${session.id}\t${session.updatedAt}\t${session.cwd}\n`);
-	}
-	for (const session of body.unreadable) {
-		process.stderr.write(`ker: session ${session.id} is unreadable — ${session.error}\n`);
+		process.stdout.write(
+			`${session.id}\t${session.status}\t${session.updatedAt ?? "-"}\t${session.cwd ?? "-"}\t${session.status === "unreadable" ? session.error : (session.title ?? "-")}\n`,
+		);
 	}
 }
 
@@ -152,10 +151,12 @@ async function resolveLatestSession(): Promise<Protocol.SessionId | undefined> {
 	}
 	const body = (await res.json()) as Protocol.ListSessionsResponse;
 	// The daemon lists sessions createdAt-ascending, so >= resolves an updatedAt tie to the later-created one.
-	const latest = body.sessions.reduce<Protocol.SessionDescriptor | undefined>(
-		(current, session) => (!current || session.updatedAt >= current.updatedAt ? session : current),
-		undefined,
-	);
+	const latest = body.sessions
+		.filter((session): session is Protocol.ReadableCatalogSession => session.status !== "unreadable")
+		.reduce<Protocol.ReadableCatalogSession | undefined>(
+			(current, session) => (!current || session.updatedAt >= current.updatedAt ? session : current),
+			undefined,
+		);
 	if (latest) return latest.id;
 	process.stderr.write(`ker: no session for ${process.cwd()} — start one with \`ker <prompt>\` or \`ker new\`\n`);
 	process.exitCode = 1;

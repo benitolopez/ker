@@ -107,8 +107,8 @@ test("a bare prompt stops when session creation fails", async (t) => {
 
 test("-c and --continue select the greatest updatedAt rather than list order", async (t) => {
 	const sessions = [
-		descriptor("session-newer", "2026-01-03T00:00:00.000Z"),
-		descriptor("session-older", "2026-01-02T00:00:00.000Z"),
+		catalogSession("session-newer", "2026-01-03T00:00:00.000Z"),
+		catalogSession("session-older", "2026-01-02T00:00:00.000Z"),
 	];
 	for (const flag of ["-c", "--continue"]) {
 		await t.test(flag, async (t) => {
@@ -129,7 +129,7 @@ test("-c resolves an updatedAt tie to the later-created list entry", async (t) =
 	const updatedAt = "2026-01-03T00:00:00.000Z";
 	const controlled = controlPrompt(t, {
 		args: ["-c", "hello"],
-		sessions: [descriptor("session-first", updatedAt), descriptor("session-second", updatedAt)],
+		sessions: [catalogSession("session-first", updatedAt), catalogSession("session-second", updatedAt)],
 	});
 	const running = run();
 	await controlled.promptStarted.promise;
@@ -137,6 +137,27 @@ test("-c resolves an updatedAt tie to the later-created list entry", async (t) =
 	await running;
 
 	assert.deepEqual(controlled.promptSessionIds, ["session-second"]);
+});
+
+test("-c skips unreadable sessions", async (t) => {
+	const controlled = controlPrompt(t, {
+		args: ["-c", "hello"],
+		sessions: [
+			catalogSession("session-readable", "2026-01-02T00:00:00.000Z"),
+			{
+				status: "unreadable",
+				id: "session-unreadable",
+				error: "broken",
+				updatedAt: "2026-01-03T00:00:00.000Z",
+			},
+		],
+	});
+	const running = run();
+	await controlled.promptStarted.promise;
+	controlled.complete();
+	await running;
+
+	assert.deepEqual(controlled.promptSessionIds, ["session-readable"]);
 });
 
 test("-c reports when the current directory has no sessions", async (t) => {
@@ -169,7 +190,7 @@ function controlPrompt(
 	options: {
 		args: string[];
 		createStatus?: number;
-		sessions?: Protocol.SessionDescriptor[];
+		sessions?: Protocol.CatalogSession[];
 		compactionFailure?: Protocol.CompactionFailure;
 		promptRejection?: { status: number; body: object };
 	},
@@ -219,14 +240,16 @@ function controlPrompt(
 		}
 		if (url.pathname === "/sessions") {
 			listCwds.push(url.searchParams.get("cwd"));
-			return jsonResponse({ sessions: options.sessions ?? [], unreadable: [] }, 200);
+			return jsonResponse({ sessions: options.sessions ?? [] }, 200);
 		}
 		const snapshotMatch = url.pathname.match(/^\/sessions\/([^/]+)$/);
 		if (snapshotMatch) {
 			const sessionId = decodeURIComponent(snapshotMatch[1]);
 			const session =
-				options.sessions?.find((candidate) => candidate.id === sessionId) ??
-				(sessionId === createdSession.id ? createdSession : descriptor(sessionId));
+				options.sessions?.find(
+					(candidate): candidate is Protocol.ReadableCatalogSession =>
+						candidate.id === sessionId && candidate.status !== "unreadable",
+				) ?? (sessionId === createdSession.id ? createdSession : descriptor(sessionId));
 			return jsonResponse({ ...snapshot(session), compactionFailure: options.compactionFailure }, 200);
 		}
 		const eventsMatch = url.pathname.match(/^\/sessions\/([^/]+)\/events$/);
@@ -311,6 +334,13 @@ function descriptor(id: Protocol.SessionId, updatedAt = "2026-01-01T00:00:00.000
 		createdAt: "2026-01-01T00:00:00.000Z",
 		updatedAt,
 	};
+}
+
+function catalogSession(
+	id: Protocol.SessionId,
+	updatedAt = "2026-01-01T00:00:00.000Z",
+): Protocol.ReadableCatalogSession {
+	return { status: "idle", title: null, ...descriptor(id, updatedAt) };
 }
 
 function snapshot(session: Protocol.SessionDescriptor): Protocol.SessionSnapshot {

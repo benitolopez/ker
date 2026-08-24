@@ -5,6 +5,7 @@ import { type IncomingMessage, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { type TestContext, test } from "node:test";
 import * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
@@ -29,7 +30,7 @@ test("creates and lists explicit durable sessions", async (t) => {
 	const first = await createSession(running.url);
 	const second = await createSession(running.url);
 	const response = await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(process.cwd())}`);
-	const listed = await readJson<{ sessions: Protocol.SessionDescriptor[] }>(response.body);
+	const listed = await readJson<Protocol.ListSessionsResponse>(response.body);
 
 	assert.equal(response.status, 200);
 	assert.deepEqual(
@@ -37,7 +38,105 @@ test("creates and lists explicit durable sessions", async (t) => {
 		[first.id, second.id],
 	);
 	assert(listed.sessions.every((session) => session.cwd === process.cwd()));
+	assert(listed.sessions.every((session) => session.status === "idle" && session.title === null));
 	assert.equal((await localFetch(`${running.url}/conversation/new`, { method: "POST" })).status, 404);
+});
+
+test("listing tracks live status and keeps the first prompt as the title", async (t) => {
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory);
+	const session = await createSession(running.url);
+	const initial = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${running.url}/sessions?scope=all`)).body,
+	);
+	assert.deepEqual(initial.sessions[0], { status: "idle", title: null, ...session });
+
+	const text = `  ${"a".repeat(100)}  \nignored`;
+	const first = await prompt(running.url, session.id, text);
+	await controlled.deltaSeen(0);
+	const busy = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${running.url}/sessions?scope=all`)).body,
+	);
+	assert.equal(busy.sessions[0]?.status, "busy");
+	assert.equal(busy.sessions[0]?.title, "a".repeat(80));
+
+	controlled.release(0);
+	await controlled.finished(0);
+	await waitForTerminal(running.url, session.id, first.turnId);
+	const second = await prompt(running.url, session.id, "Replacement title");
+	await controlled.deltaSeen(1);
+	controlled.release(1);
+	await controlled.finished(1);
+	await waitForTerminal(running.url, session.id, second.turnId);
+	const idle = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${running.url}/sessions?scope=all`)).body,
+	);
+	assert.equal(idle.sessions[0]?.status, "idle");
+	assert.equal(idle.sessions[0]?.title, "a".repeat(80));
+});
+
+test("a rebuilt catalog backfills the title when the session is loaded", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-catalog-rebuild-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sessionDir = join(root, "sessions");
+	const catalogPath = join(root, "catalog.db");
+	const first = await startServer(t, immediateFactory(), { sessionDir, catalogPath }, false);
+	const session = await createSession(first.url);
+	const admitted = await prompt(first.url, session.id, "Recovered title\nignored");
+	await waitForTerminal(first.url, session.id, admitted.turnId);
+	await first.close();
+	for (const candidate of [catalogPath, `${catalogPath}-wal`, `${catalogPath}-shm`]) {
+		await rm(candidate, { force: true });
+	}
+
+	const second = await startServer(t, immediateFactory(), { sessionDir, catalogPath }, false);
+	const before = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${second.url}/sessions?scope=all`)).body,
+	);
+	assert.equal(before.sessions[0]?.title, null);
+	await getSnapshot(second.url, session.id);
+	const after = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${second.url}/sessions?scope=all`)).body,
+	);
+	assert.equal(after.sessions[0]?.title, "Recovered title");
+	await second.close();
+});
+
+test("catalog write failures do not fail an active turn", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-catalog-failure-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sessionDir = join(root, "sessions");
+	const catalogPath = join(root, "catalog.db");
+	const errors: unknown[][] = [];
+	t.mock.method(console, "error", (...args: unknown[]) => {
+		errors.push(args);
+	});
+	const controlled = controlledFactory();
+	const running = await startServer(t, controlled.factory, { sessionDir, catalogPath });
+	const session = await createSession(running.url);
+	const admitted = await prompt(running.url, session.id, "keep running");
+	await controlled.deltaSeen(0);
+	const client = new DatabaseSync(catalogPath);
+	client.exec("DROP TABLE session");
+	client.close();
+	controlled.release(0);
+	await controlled.finished(0);
+
+	const store = new SessionStore({ baseDir: sessionDir });
+	const entry = (await store.scanCatalog()).sessions[0];
+	while (true) {
+		const stored = await store.loadSession(entry.path);
+		if (
+			stored.records.some(
+				(record) =>
+					record.type === "event" && record.event.type === "turn_terminal" && record.event.turnId === admitted.turnId,
+			)
+		) {
+			break;
+		}
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	assert(errors.some((args) => String(args[0]).includes("catalog update failed")));
 });
 
 test("creates, filters, and restores sessions from multiple projects", async (t) => {
@@ -167,15 +266,14 @@ test("keeps healthy sessions available when another session log is unreadable", 
 	const health = await localFetch(`${running.url}/health`);
 	assert.equal(health.status, 200);
 	const listedResponse = await localFetch(`${running.url}/sessions?scope=all`);
-	const listed = await readJson<{
-		sessions: Protocol.SessionDescriptor[];
-		unreadable: Protocol.UnreadableSession[];
-	}>(listedResponse.body);
+	const listed = await readJson<Protocol.ListSessionsResponse>(listedResponse.body);
 	assert.deepEqual(
-		listed.sessions.map((session) => session.id),
-		[healthy.session.id],
+		new Set(listed.sessions.map((session) => session.id)),
+		new Set([malformed.session.id, healthy.session.id]),
 	);
-	assert.equal(listed.unreadable[0]?.id, malformed.session.id);
+	const unreadable = listed.sessions.find((session) => session.id === malformed.session.id);
+	assert.equal(unreadable?.status, "unreadable");
+	if (unreadable?.status === "unreadable") assert.match(unreadable.error, /Unexpected token|Malformed record/);
 	const corruptSnapshot = await localFetch(`${running.url}/sessions/${malformed.session.id}`);
 	assert.equal(corruptSnapshot.status, 500);
 	assert.equal((await readJson<{ code: string }>(corruptSnapshot.body)).code, "session_unreadable");
@@ -204,12 +302,15 @@ test("scoped listing hides unreadable sessions from other project buckets", asyn
 		projectBListing.sessions.map((session) => session.id),
 		[healthy.session.id],
 	);
-	assert.deepEqual(projectBListing.unreadable, []);
+	assert.equal(
+		projectBListing.sessions.some((session) => session.status === "unreadable"),
+		false,
+	);
 
 	const projectAResponse = await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(projectA)}`);
 	const projectAListing = await readJson<Protocol.ListSessionsResponse>(projectAResponse.body);
-	assert.deepEqual(projectAListing.sessions, []);
-	assert.equal(projectAListing.unreadable[0]?.id, malformed.session.id);
+	assert.equal(projectAListing.sessions[0]?.id, malformed.session.id);
+	assert.equal(projectAListing.sessions[0]?.status, "unreadable");
 });
 
 test("different sessions run concurrently while each session keeps FIFO order", async (t) => {
@@ -637,7 +738,7 @@ test("reloading appends a definition only when model-visible settings change", a
 	const first = await startServer(t, immediateFactory(), { sessionDir }, false);
 	const session = await createSession(first.url);
 	await first.close();
-	const initial = await store.loadSession((await store.scanCatalog())[0].path);
+	const initial = await store.loadSession((await store.scanCatalog()).sessions[0].path);
 
 	const second = await startServer(t, immediateFactory(), { sessionDir }, false);
 	await getSnapshot(second.url, session.id);
@@ -753,7 +854,7 @@ test("assistant reasoning effort survives persistence and replay without crossin
 	await first.close();
 
 	const store = new SessionStore({ baseDir: sessionDir });
-	const stored = await store.loadSession((await store.scanCatalog())[0].path);
+	const stored = await store.loadSession((await store.scanCatalog()).sessions[0].path);
 	const recorded = stored.records.find(
 		(record) => record.type === "conversation" && record.message.role === "assistant",
 	);
@@ -1213,7 +1314,10 @@ test("listing after restart reads no session bodies", async (t) => {
 		(await localFetch(`${second.url}/sessions?scope=all`)).body,
 	);
 	assert.deepEqual(new Set(listed.sessions.map((session) => session.id)), new Set([completed.id, bare.id]));
-	assert.deepEqual(listed.unreadable, []);
+	assert.equal(
+		listed.sessions.some((session) => session.status === "unreadable"),
+		false,
+	);
 	await second.close();
 });
 
@@ -1245,7 +1349,7 @@ test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
 		before.sessions.map((listed) => listed.id),
 		[session.session.id],
 	);
-	assert.deepEqual(before.unreadable, []);
+	assert.equal(before.sessions[0]?.status, "idle");
 
 	const snapshot = await localFetch(`${running.url}/sessions/${session.session.id}`);
 	assert.equal(snapshot.status, 500);
@@ -1254,8 +1358,8 @@ test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
 	const after = await readJson<Protocol.ListSessionsResponse>(
 		(await localFetch(`${running.url}/sessions?scope=all`)).body,
 	);
-	assert.deepEqual(after.sessions, []);
-	assert.equal(after.unreadable[0]?.id, session.session.id);
+	assert.equal(after.sessions[0]?.id, session.session.id);
+	assert.equal(after.sessions[0]?.status, "unreadable");
 });
 
 test("manual compaction validates instructions and reports a durable skip", async (t) => {
@@ -1313,7 +1417,7 @@ test("rejects a compaction that does not shrink without recording or rebuilding"
 	const snapshot = await getSnapshot(running.url, session.id);
 	assert.equal(snapshot.turns.find((turn) => turn.id === admitted.turnId)?.status, "error");
 	assert.equal(harnessCreations, 1);
-	const [catalog] = await store.scanCatalog();
+	const [catalog] = (await store.scanCatalog()).sessions;
 	const stored = await store.loadSession(catalog.path);
 	assert.equal(
 		stored.records.some((record) => record.type === "compaction"),
@@ -1355,7 +1459,7 @@ test("applies the bounded watermark only to automatic compaction", async (t) => 
 	const autoTurn = afterAuto.turns.find((turn) => turn.id !== promptAdmission.turnId);
 	assert.equal(autoTurn?.status, "error");
 	assert.equal(harnessCreations, 1);
-	const afterAutoStored = await store.loadSession((await store.scanCatalog())[0].path);
+	const afterAutoStored = await store.loadSession((await store.scanCatalog()).sessions[0].path);
 	const autoError = afterAutoStored.records.find(
 		(record) => record.type === "event" && record.event.type === "error" && record.event.turnId === autoTurn?.id,
 	);
@@ -1375,7 +1479,7 @@ test("applies the bounded watermark only to automatic compaction", async (t) => 
 	const afterManual = await getSnapshot(running.url, session.id);
 	assert.equal(afterManual.turns.find((turn) => turn.id === manual.turnId)?.status, "completed");
 	assert.equal(harnessCreations, 2);
-	const afterManualStored = await store.loadSession((await store.scanCatalog())[0].path);
+	const afterManualStored = await store.loadSession((await store.scanCatalog()).sessions[0].path);
 	assert.equal(afterManualStored.records.filter((record) => record.type === "compaction").length, 1);
 });
 
@@ -1606,7 +1710,7 @@ test("cancelling a running compaction leaves history and the harness untouched",
 	assert.equal(snapshot.turns.find((turn) => turn.id === admission.turnId)?.status, "aborted");
 	assert.deepEqual(snapshot.entries, []);
 	assert.equal(initials.length, 1);
-	const [catalog] = await store.scanCatalog();
+	const [catalog] = (await store.scanCatalog()).sessions;
 	const stored = await store.loadSession(catalog.path);
 	assert.equal(
 		stored.records.some((record) => record.type === "compaction"),
@@ -1660,7 +1764,7 @@ test("cancelling a waiting compaction does not emit a prompt delivery failure or
 	const snapshot = await getSnapshot(running.url, session.id);
 	assert.equal(snapshot.turns.find((turn) => turn.id === admission.turnId)?.status, "cancelled");
 	assert.equal(harnessCreations, 1);
-	const [catalog] = await store.scanCatalog();
+	const [catalog] = (await store.scanCatalog()).sessions;
 	const stored = await store.loadSession(catalog.path);
 	assert.equal(
 		stored.records.some((record) => record.type === "compaction"),
@@ -1695,7 +1799,7 @@ test("repeat compaction uses the latest summary and the next prompt persists no 
 
 	const secondPrompt = await prompt(running.url, session.id, "second");
 	await waitForTerminal(running.url, session.id, secondPrompt.turnId);
-	const beforeRepeat = await store.loadSession((await store.scanCatalog())[0].path);
+	const beforeRepeat = await store.loadSession((await store.scanCatalog()).sessions[0].path);
 	assert.deepEqual(
 		beforeRepeat.records.flatMap((record) => (record.type === "conversation" ? [record.message.role] : [])),
 		["user", "assistant", "user", "assistant"],
@@ -1903,7 +2007,7 @@ test("an over-ceiling idle session compacts before admitting its next prompt", a
 	await waitForTerminal(running.url, seeded.session.id, admitted.turnId);
 	assert(requests.length >= 1);
 
-	const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+	const [catalog] = (await new SessionStore({ baseDir: sessionDir }).scanCatalog()).sessions;
 	const records = await new SessionStore({ baseDir: sessionDir }).loadSession(catalog.path);
 	const events = records.records.flatMap((record) => (record.type === "event" ? [record.event] : []));
 	const submittedCompaction = events.findIndex((event) => event.type === "compaction_submitted");
@@ -1947,7 +2051,7 @@ test(
 			assert.equal("reasoningEffort" in compacted, false);
 		}
 		assert.equal(requests.length, 1);
-		const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+		const [catalog] = (await new SessionStore({ baseDir: sessionDir }).scanCatalog()).sessions;
 		const records = await new SessionStore({ baseDir: sessionDir }).loadSession(catalog.path);
 		const eventTypes = records.records.flatMap((record) => (record.type === "event" ? [record.event.type] : []));
 		assert(eventTypes.indexOf("compaction_submitted") > eventTypes.indexOf("end"));
@@ -2018,7 +2122,7 @@ test("prunes old tool output before admission and avoids compaction below the th
 		snapshot.entries.some((entry) => entry.role === "compaction"),
 		false,
 	);
-	const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+	const [catalog] = (await new SessionStore({ baseDir: sessionDir }).scanCatalog()).sessions;
 	assert.equal(catalog.idle, true);
 });
 
@@ -2207,7 +2311,7 @@ test("a log ending on a pruned event replays consistently during recovery", asyn
 	const tool = captured[0]?.messages[0];
 	assert.equal(tool?.role, "tool");
 	if (tool?.role === "tool") assert.equal(tool.content, PRUNED_OUTPUT_PLACEHOLDER);
-	const [catalog] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+	const [catalog] = (await new SessionStore({ baseDir: sessionDir }).scanCatalog()).sessions;
 	assert.equal(catalog.idle, false);
 });
 
@@ -2345,7 +2449,7 @@ test("a completed turn leaves an empty queue_changed as the final log record", a
 	const admitted = await prompt(running.url, session.id, "done");
 	await waitForTerminal(running.url, session.id, admitted.turnId);
 
-	const [entry] = await new SessionStore({ baseDir: sessionDir }).scanCatalog();
+	const [entry] = (await new SessionStore({ baseDir: sessionDir }).scanCatalog()).sessions;
 	assert.equal(entry.idle, true);
 	const lines = (await readFile(entry.path, "utf8")).trimEnd().split("\n");
 	const last = JSON.parse(lines.at(-1) ?? "") as StoredRecord;
@@ -3227,6 +3331,7 @@ async function startServer(
 	if (!options.sessionDir) t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const server = createDaemon({
 		sessionDir,
+		catalogPath: options.catalogPath ?? join(sessionDir, "catalog.db"),
 		harnessFactory,
 		definition: options.definition ?? (() => structuredClone(DEFINITION)),
 		eventTailSize: options.eventTailSize,

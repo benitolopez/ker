@@ -117,7 +117,7 @@ function controlCancel(
 		paths.push(path);
 		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION }, 200);
 		if (path === "/sessions") {
-			return jsonResponse({ sessions: [snapshot(queue()).session], unreadable: [] }, 200);
+			return jsonResponse({ sessions: [{ status: "idle", title: null, ...snapshot(queue()).session }] }, 200);
 		}
 		if (path === "/sessions/session-1") {
 			return sessionSnapshot instanceof Response ? sessionSnapshot : jsonResponse(sessionSnapshot, 200);

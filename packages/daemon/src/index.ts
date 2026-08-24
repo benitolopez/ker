@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
+import { join } from "node:path";
 import * as Agent from "@ker-ai/agent";
 import * as Auth from "@ker-ai/auth";
 import * as Config from "@ker-ai/config";
@@ -8,9 +9,9 @@ import * as Engine from "@ker-ai/engine";
 import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
+import { Catalog, type CatalogRow, defaultCatalogPath } from "./catalog.ts";
 import {
 	type AssistantRecord,
-	type CatalogedSession,
 	type CompactionRecord,
 	type ConversationRecord,
 	canonicalDirectory,
@@ -21,6 +22,7 @@ import {
 	type IdentityRecord,
 	type Payload,
 	projectKey,
+	SESSION_FILE,
 	SessionStore,
 	type StoredRecord,
 	type StoredSession,
@@ -48,6 +50,7 @@ export interface DaemonOptions {
 	harnessFactory?: (state: Engine.HarnessState, cwd: string) => Harness;
 	definition?: (cwd: string) => Definition;
 	sessionDir?: string;
+	catalogPath?: string;
 	eventTailSize?: number;
 	recoveryWindowMinutes?: number;
 	compaction?: Config.CompactionSettings;
@@ -61,6 +64,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 		const config = Config.loadConfig();
 		const registry = new Registry({
 			store: new SessionStore({ baseDir: options.sessionDir }),
+			catalogPath: options.catalogPath ?? defaultCatalogPath(),
 			harnessFactory: options.harnessFactory ?? ((state, cwd) => createConfiguredHarness(state, cwd, config)),
 			definition:
 				options.definition ??
@@ -98,6 +102,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 
 interface RegistryOptions {
 	store: SessionStore;
+	catalogPath: string;
 	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	definition: (cwd: string) => Definition;
 	eventTailSize: number;
@@ -138,23 +143,23 @@ interface SessionState {
 	compactionFailure?: { turnId: Protocol.TurnId; message: string };
 }
 
-type CatalogEntry = CatalogedSession & { stored?: StoredSession };
-
 class SessionUnreadableError extends Error {}
 
 class Registry {
 	readonly #store: SessionStore;
+	readonly #catalogPath: string;
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #definition: (cwd: string) => Definition;
 	readonly #eventTailSize: number;
 	readonly #recoveryWindowMinutes: number;
 	readonly #compaction: Config.CompactionSettings;
-	readonly #catalog = new Map<Protocol.SessionId, CatalogEntry>();
+	#catalog!: Catalog;
 	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
 	#stopping = false;
 
 	constructor(options: RegistryOptions) {
 		this.#store = options.store;
+		this.#catalogPath = options.catalogPath;
 		this.#harnessFactory = options.harnessFactory;
 		this.#definition = options.definition;
 		this.#eventTailSize = options.eventTailSize;
@@ -163,9 +168,12 @@ class Registry {
 	}
 
 	async initialize(): Promise<void> {
-		const entries = await this.#store.scanCatalog();
-		for (const entry of entries) this.#catalog.set(entry.session.id, { ...entry });
-		await Promise.all(entries.filter((entry) => !entry.idle).map((entry) => this.#recoverSession(entry.session.id)));
+		this.#catalog = Catalog.open(this.#catalogPath);
+		const scan = await this.#store.scanCatalog();
+		this.#catalog.reconcile(scan);
+		await Promise.all(
+			scan.sessions.filter((entry) => !entry.idle).map((entry) => this.#recoverSession(entry.session.id)),
+		);
 	}
 
 	// One corrupt session must not fail startup: an unreadable load is already registered, so
@@ -188,36 +196,26 @@ class Registry {
 		});
 	}
 
-	listUnreadableSessions(projectRoot?: string): Protocol.UnreadableSession[] {
-		return this.#store.listUnreadable(projectRoot);
-	}
-
-	unreadableSession(sessionId: Protocol.SessionId): Protocol.UnreadableSession | undefined {
-		const session = this.#store.listUnreadable().find((candidate) => candidate.id === sessionId);
-		return session ? { ...session } : undefined;
+	unreadableSession(sessionId: Protocol.SessionId): CatalogRow | undefined {
+		const row = this.#catalog.get(sessionId);
+		return row?.status === "unreadable" ? row : undefined;
 	}
 
 	async createSession(cwd: string): Promise<Protocol.SessionDescriptor> {
 		const stored = await this.#store.create(cwd, this.#definition(cwd));
-		this.#catalog.set(stored.session.id, {
-			session: stored.session,
-			path: stored.log.path,
-			projectKey: projectKey(stored.session.projectRoot),
-			idle: true,
-			stored,
-		});
+		this.#catalog.upsertCreated(stored.session);
+		this.#states.set(stored.session.id, Promise.resolve(this.#loadState(stored)));
 		return stored.session;
 	}
 
-	listSessions(cwd?: string): Protocol.SessionDescriptor[] {
-		return [...this.#catalog.values()]
-			.filter((entry) => !cwd || entry.session.cwd === cwd)
-			.map((entry) => ({ ...entry.session }))
-			.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+	listSessions(scope?: { cwd: string; projectRoot: string }): Protocol.CatalogSession[] {
+		return this.#catalog
+			.list(scope ? { cwd: scope.cwd, projectKey: projectKey(scope.projectRoot) } : undefined)
+			.map(toCatalogSession);
 	}
 
 	async snapshot(sessionId: Protocol.SessionId): Promise<Protocol.SessionSnapshot | undefined> {
-		if (!this.#catalog.has(sessionId)) return undefined;
+		if (!this.#catalog.get(sessionId)) return undefined;
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			const turns = new Map<Protocol.TurnId, Protocol.TurnSnapshot>();
@@ -256,7 +254,7 @@ class Registry {
 		sessionId: Protocol.SessionId,
 		cursor: Protocol.Cursor,
 	): Promise<{ state: SessionState; replay: Protocol.EventEnvelope[] } | "missing" | "resync"> {
-		if (!this.#catalog.has(sessionId)) return "missing";
+		if (!this.#catalog.get(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		const firstSequence = state.tail[0]?.sequence ?? state.sequence + 1;
 		if (cursor.epoch !== state.epoch || cursor.sequence > state.sequence || cursor.sequence < firstSequence - 1) {
@@ -269,7 +267,7 @@ class Registry {
 		sessionId: Protocol.SessionId,
 		text: string,
 	): Promise<Protocol.PromptAdmission | "missing" | "context_exhausted"> {
-		if (!this.#catalog.has(sessionId)) return "missing";
+		if (!this.#catalog.get(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			await this.#maybePrune(state);
@@ -322,6 +320,11 @@ class Registry {
 				this.#queueChangedPayload(state),
 			);
 			await this.#appendAndPublish(state, payloads);
+			try {
+				this.#catalog.setTitleIfEmpty(sessionId, truncate(text));
+			} catch (error) {
+				console.error(`catalog title update failed for session ${sessionId}:`, error);
+			}
 			if (compaction?.state === "running") this.#start(compaction, state);
 			if (status === "running") this.#start(item, state);
 			return {
@@ -339,7 +342,7 @@ class Registry {
 		sessionId: Protocol.SessionId,
 		instructions?: string,
 	): Promise<Protocol.CompactionAdmission | "missing"> {
-		if (!this.#catalog.has(sessionId)) return "missing";
+		if (!this.#catalog.get(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			const item = this.#createCompactionItem(state, "manual", instructions);
@@ -363,7 +366,7 @@ class Registry {
 		sessionId: Protocol.SessionId,
 		turnId: Protocol.TurnId,
 	): Promise<Protocol.TurnCancellationResult | "missing" | "turn_unavailable"> {
-		if (!this.#catalog.has(sessionId)) return "missing";
+		if (!this.#catalog.get(sessionId)) return "missing";
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			const terminal = state.turns.get(turnId);
@@ -447,51 +450,74 @@ class Registry {
 
 	async shutdown(): Promise<void> {
 		this.#stopping = true;
-		const states = (
-			await Promise.all([...this.#states.values()].map((statePromise) => statePromise.catch(() => undefined)))
-		).filter((state): state is SessionState => state !== undefined);
-		await Promise.all(
-			states.map(async (state) => {
-				const active = await this.#withQueueLock(state, async () => {
-					const active = state.activeTurn;
-					if (!active) return undefined;
-					active.controller.abort();
-					return active;
-				});
-				await active?.done.promise;
-			}),
-		);
+		try {
+			const states = (
+				await Promise.all([...this.#states.values()].map((statePromise) => statePromise.catch(() => undefined)))
+			).filter((state): state is SessionState => state !== undefined);
+			await Promise.all(
+				states.map(async (state) => {
+					const active = await this.#withQueueLock(state, async () => {
+						const active = state.activeTurn;
+						if (!active) return undefined;
+						active.controller.abort();
+						return active;
+					});
+					await active?.done.promise;
+				}),
+			);
+		} finally {
+			this.#catalog.close();
+		}
 	}
 
 	#state(sessionId: Protocol.SessionId): Promise<SessionState> {
 		const existing = this.#states.get(sessionId);
 		if (existing) return existing;
-		const entry = this.#catalog.get(sessionId);
-		if (!entry) throw new Error(`Unknown session ${sessionId}`);
-		const loading = this.#openState(entry);
+		const row = this.#catalog.get(sessionId);
+		if (!row) throw new Error(`Unknown session ${sessionId}`);
+		const loading = this.#openState(row);
 		this.#states.set(sessionId, loading);
 		return loading;
 	}
 
-	// Sessions created this process keep their in-memory records; anything else replays its log
-	// from disk on first attach. A failed load leaves the session listed only as unreadable.
-	async #openState(entry: CatalogEntry): Promise<SessionState> {
-		if (entry.stored) return this.#loadState(entry.stored);
+	// Replays a session on first attach and keeps a failed load in the catalog as unreadable.
+	async #openState(row: CatalogRow): Promise<SessionState> {
 		try {
-			const stored = await this.#store.loadSession(entry.path);
+			const stored = await this.#store.loadSession(join(this.#store.baseDir, row.project_key, row.id, SESSION_FILE));
 			const current = this.#definition(stored.session.cwd);
 			const last = stored.records.findLast((record): record is DefinitionRecord => record.type === "definition");
 			if (!last || definitionKey(last) !== definitionKey(current)) {
-				stored.records.push(...(await stored.log.append([{ type: "definition", ...current }])));
+				const records = await stored.log.append([{ type: "definition", ...current }]);
+				stored.records.push(...records);
+				const updatedAt = records.at(-1)?.at;
+				if (updatedAt) stored.session.updatedAt = updatedAt;
 			}
-			entry.stored = stored;
-			entry.session = stored.session;
-			return this.#loadState(stored);
+			const state = this.#loadState(stored);
+			try {
+				this.#catalog.touch(row.id, {
+					updatedAt: stored.session.updatedAt,
+					status: state.queue.running || state.queue.waiting.length > 0 ? "busy" : "idle",
+				});
+				if (row.title === null) {
+					const submitted = stored.records.find(
+						(record): record is EventRecord => record.type === "event" && record.event.type === "message_submitted",
+					);
+					if (submitted?.event.type === "message_submitted") {
+						this.#catalog.setTitleIfEmpty(row.id, truncate(submitted.event.text));
+					}
+				}
+			} catch (error) {
+				console.error(`catalog update failed for session ${row.id}:`, error);
+			}
+			return state;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			this.#states.delete(entry.session.id);
-			this.#catalog.delete(entry.session.id);
-			this.#store.markUnreadable(entry.session.id, message, entry.projectKey);
+			this.#states.delete(row.id);
+			try {
+				this.#catalog.markUnreadable(row.id, message);
+			} catch (catalogError) {
+				console.error(`catalog update failed for session ${row.id}:`, catalogError);
+			}
 			throw new SessionUnreadableError(message);
 		}
 	}
@@ -916,6 +942,16 @@ class Registry {
 		state.stored.records.push(...records);
 		const updatedAt = records.at(-1)?.at;
 		if (updatedAt) state.stored.session.updatedAt = updatedAt;
+		if (updatedAt) {
+			try {
+				this.#catalog.touch(state.stored.session.id, {
+					updatedAt,
+					status: state.queue.running || state.queue.waiting.length > 0 ? "busy" : "idle",
+				});
+			} catch (error) {
+				console.error(`catalog update failed for session ${state.stored.session.id}:`, error);
+			}
+		}
 		for (const record of records) {
 			if (record.type === "assistant") {
 				state.messages.push({ ...record.message });
@@ -1362,6 +1398,10 @@ function projectMessages(records: readonly StoredRecord[]): Llm.Message[] {
 	return projected.map((entry) => entry.message);
 }
 
+function truncate(text: string): string {
+	return text.trim().split("\n")[0].slice(0, 80).trim();
+}
+
 async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMessage, res: ServerResponse) {
 	if (!isLocalRequest(req)) {
 		res.writeHead(403).end();
@@ -1383,16 +1423,9 @@ async function handleRequest(managerPromise: Promise<Registry>, req: IncomingMes
 		if (req.method === "GET" && url.pathname === "/sessions") {
 			const scope = await readListSessionScope(url, res);
 			if (!scope) return;
-			const body: Protocol.ListSessionsResponse =
-				scope.type === "all"
-					? {
-							sessions: manager.listSessions(),
-							unreadable: manager.listUnreadableSessions(),
-						}
-					: {
-							sessions: manager.listSessions(scope.cwd),
-							unreadable: manager.listUnreadableSessions(scope.projectRoot),
-						};
+			const body: Protocol.ListSessionsResponse = {
+				sessions: scope.type === "all" ? manager.listSessions() : manager.listSessions(scope),
+			};
 			writeJson(res, 200, body);
 			return;
 		}
@@ -1519,6 +1552,33 @@ function writeUnreadableSession(manager: Registry, sessionId: Protocol.SessionId
 	if (!unreadable) return false;
 	writeJson(res, 500, { code: "session_unreadable", error: unreadable.error });
 	return true;
+}
+
+function toCatalogSession(row: CatalogRow): Protocol.CatalogSession {
+	if (row.status === "unreadable") {
+		return {
+			status: "unreadable",
+			id: row.id,
+			error: row.error ?? "Session log is unreadable",
+			...(row.cwd === null ? {} : { cwd: row.cwd }),
+			...(row.project_root === null ? {} : { projectRoot: row.project_root }),
+			...(row.title === null ? {} : { title: row.title }),
+			...(row.created_at === null ? {} : { createdAt: row.created_at }),
+			...(row.updated_at === null ? {} : { updatedAt: row.updated_at }),
+		};
+	}
+	if (row.cwd === null || row.project_root === null || row.created_at === null || row.updated_at === null) {
+		throw new Error(`Readable catalog row ${row.id} is missing session metadata`);
+	}
+	return {
+		status: row.status,
+		id: row.id,
+		cwd: row.cwd,
+		projectRoot: row.project_root,
+		title: row.title,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
 }
 
 function assistantTerminalPayload(

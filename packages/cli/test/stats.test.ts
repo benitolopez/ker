@@ -109,7 +109,7 @@ function controlStats(t: TestContext, args: string[], response: Response): Contr
 		paths.push(path);
 		if (path === "/health") return jsonResponse({ protocol: PROTOCOL_VERSION });
 		if (path === "/sessions") {
-			return jsonResponse({ sessions: [snapshot().session], unreadable: [] });
+			return jsonResponse({ sessions: [{ status: "idle", title: null, ...snapshot().session }] });
 		}
 		if (path.startsWith("/sessions/")) return response;
 		throw new Error(`Unexpected request to ${path}`);
