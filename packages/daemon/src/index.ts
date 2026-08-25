@@ -1,7 +1,8 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import * as Agent from "@ker-ai/agent";
 import * as Auth from "@ker-ai/auth";
 import * as Config from "@ker-ai/config";
@@ -9,7 +10,8 @@ import * as Engine from "@ker-ai/engine";
 import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
-import { Catalog, type CatalogRow, defaultCatalogPath } from "./catalog.ts";
+import { Catalog, type CatalogListRow, type CatalogRow, defaultCatalogPath } from "./catalog.ts";
+import { defaultNodePath, loadNodeIdentity, type NodeIdentity } from "./node.ts";
 import {
 	type AssistantRecord,
 	type CompactionRecord,
@@ -21,7 +23,6 @@ import {
 	type EventRecord,
 	type IdentityRecord,
 	type Payload,
-	projectKey,
 	SESSION_FILE,
 	SessionStore,
 	type StoredRecord,
@@ -51,6 +52,7 @@ export interface DaemonOptions {
 	definition?: (cwd: string) => Definition;
 	sessionDir?: string;
 	catalogPath?: string;
+	nodePath?: string;
 	eventTailSize?: number;
 	recoveryWindowMinutes?: number;
 	compaction?: Config.CompactionSettings;
@@ -65,6 +67,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 		const registry = new Registry({
 			store: new SessionStore({ baseDir: options.sessionDir }),
 			catalogPath: options.catalogPath ?? defaultCatalogPath(),
+			nodePath: options.nodePath ?? defaultNodePath(),
 			harnessFactory: options.harnessFactory ?? ((state, cwd) => createConfiguredHarness(state, cwd, config)),
 			definition:
 				options.definition ??
@@ -103,6 +106,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 interface RegistryOptions {
 	store: SessionStore;
 	catalogPath: string;
+	nodePath: string;
 	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	definition: (cwd: string) => Definition;
 	eventTailSize: number;
@@ -148,18 +152,21 @@ class SessionUnreadableError extends Error {}
 class Registry {
 	readonly #store: SessionStore;
 	readonly #catalogPath: string;
+	readonly #nodePath: string;
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #definition: (cwd: string) => Definition;
 	readonly #eventTailSize: number;
 	readonly #recoveryWindowMinutes: number;
 	readonly #compaction: Config.CompactionSettings;
 	#catalog!: Catalog;
+	#node!: NodeIdentity;
 	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
 	#stopping = false;
 
 	constructor(options: RegistryOptions) {
 		this.#store = options.store;
 		this.#catalogPath = options.catalogPath;
+		this.#nodePath = options.nodePath;
 		this.#harnessFactory = options.harnessFactory;
 		this.#definition = options.definition;
 		this.#eventTailSize = options.eventTailSize;
@@ -168,9 +175,11 @@ class Registry {
 	}
 
 	async initialize(): Promise<void> {
+		this.#node = loadNodeIdentity(this.#nodePath);
 		this.#catalog = Catalog.open(this.#catalogPath);
+		this.#catalog.upsertNode(this.#node);
 		const scan = await this.#store.scanCatalog();
-		this.#catalog.reconcile(scan);
+		this.#catalog.reconcile(scan, this.#node.id);
 		await Promise.all(
 			scan.sessions.filter((entry) => !entry.idle).map((entry) => this.#recoverSession(entry.session.id)),
 		);
@@ -203,14 +212,24 @@ class Registry {
 
 	async createSession(cwd: string): Promise<Protocol.SessionDescriptor> {
 		const stored = await this.#store.create(cwd, this.#definition(cwd));
-		this.#catalog.upsertCreated(stored.session);
+		const root = stored.session.projectRoot;
+		const existing = this.#catalog.findWorkspaceByRoot(this.#node.id, root);
+		const binding =
+			existing ??
+			this.#catalog.createWorkspace({
+				nodeId: this.#node.id,
+				rootPath: root,
+				projectName: basename(root) || root,
+				gitRemote: await observeGitRemote(root),
+			});
+		this.#catalog.upsertCreated(stored.session, binding);
 		this.#states.set(stored.session.id, Promise.resolve(this.#loadState(stored)));
 		return stored.session;
 	}
 
-	listSessions(scope?: { cwd: string; projectRoot: string }): Protocol.CatalogSession[] {
+	listSessions(scope?: { projectRoot: string }): Protocol.CatalogSession[] {
 		return this.#catalog
-			.list(scope ? { cwd: scope.cwd, projectKey: projectKey(scope.projectRoot) } : undefined)
+			.list(scope ? { nodeId: this.#node.id, rootPath: scope.projectRoot } : undefined)
 			.map(toCatalogSession);
 	}
 
@@ -1554,27 +1573,41 @@ function writeUnreadableSession(manager: Registry, sessionId: Protocol.SessionId
 	return true;
 }
 
-function toCatalogSession(row: CatalogRow): Protocol.CatalogSession {
+function toCatalogSession(row: CatalogListRow): Protocol.CatalogSession {
 	if (row.status === "unreadable") {
 		return {
 			status: "unreadable",
 			id: row.id,
 			error: row.error ?? "Session log is unreadable",
 			...(row.cwd === null ? {} : { cwd: row.cwd }),
-			...(row.project_root === null ? {} : { projectRoot: row.project_root }),
+			...(row.project_id === null ? {} : { projectId: row.project_id }),
+			...(row.project_name === null ? {} : { projectName: row.project_name }),
+			...(row.workspace_id === null ? {} : { workspaceId: row.workspace_id }),
+			...(row.node_id === null ? {} : { nodeId: row.node_id }),
 			...(row.title === null ? {} : { title: row.title }),
 			...(row.created_at === null ? {} : { createdAt: row.created_at }),
 			...(row.updated_at === null ? {} : { updatedAt: row.updated_at }),
 		};
 	}
-	if (row.cwd === null || row.project_root === null || row.created_at === null || row.updated_at === null) {
+	if (
+		row.cwd === null ||
+		row.project_id === null ||
+		row.project_name === null ||
+		row.workspace_id === null ||
+		row.node_id === null ||
+		row.created_at === null ||
+		row.updated_at === null
+	) {
 		throw new Error(`Readable catalog row ${row.id} is missing session metadata`);
 	}
 	return {
 		status: row.status,
 		id: row.id,
 		cwd: row.cwd,
-		projectRoot: row.project_root,
+		projectId: row.project_id,
+		projectName: row.project_name,
+		workspaceId: row.workspace_id,
+		nodeId: row.node_id,
 		title: row.title,
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
@@ -1663,6 +1696,24 @@ function createConfiguredHarness(state: Engine.HarnessState, cwd: string, config
 		undefined,
 		state,
 	);
+}
+
+async function observeGitRemote(root: string): Promise<string | null> {
+	return new Promise((resolve) => {
+		execFile(
+			"git",
+			["-C", root, "config", "--local", "--get", "remote.origin.url"],
+			{ encoding: "utf8" },
+			(error, stdout) => {
+				if (error) {
+					resolve(null);
+					return;
+				}
+				const remote = stdout.trim();
+				resolve(remote || null);
+			},
+		);
+	});
 }
 
 interface PromptRequest {

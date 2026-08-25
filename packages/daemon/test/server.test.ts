@@ -49,7 +49,30 @@ test("listing tracks live status and keeps the first prompt as the title", async
 	const initial = await readJson<Protocol.ListSessionsResponse>(
 		(await localFetch(`${running.url}/sessions?scope=all`)).body,
 	);
-	assert.deepEqual(initial.sessions[0], { status: "idle", title: null, ...session });
+	const listedSession = initial.sessions[0];
+	assert.equal(listedSession?.status, "idle");
+	if (listedSession?.status !== "idle") throw new Error("Expected a readable session");
+	assert.deepEqual(
+		{
+			id: listedSession.id,
+			cwd: listedSession.cwd,
+			title: listedSession.title,
+			createdAt: listedSession.createdAt,
+			updatedAt: listedSession.updatedAt,
+		},
+		{
+			id: session.id,
+			cwd: session.cwd,
+			title: null,
+			createdAt: session.createdAt,
+			updatedAt: session.updatedAt,
+		},
+	);
+	assert.equal(listedSession.projectName, "ker");
+	assert(listedSession.projectId.length > 0);
+	assert(listedSession.workspaceId.length > 0);
+	assert(listedSession.nodeId.length > 0);
+	assert.equal("projectRoot" in listedSession, false);
 
 	const text = `  ${"a".repeat(100)}  \nignored`;
 	const first = await prompt(running.url, session.id, text);
@@ -84,6 +107,12 @@ test("a rebuilt catalog backfills the title when the session is loaded", async (
 	const session = await createSession(first.url);
 	const admitted = await prompt(first.url, session.id, "Recovered title\nignored");
 	await waitForTerminal(first.url, session.id, admitted.turnId);
+	const original = await readJson<Protocol.ListSessionsResponse>(
+		(await localFetch(`${first.url}/sessions?scope=all`)).body,
+	);
+	const originalSession = original.sessions[0];
+	assert.equal(originalSession?.status, "idle");
+	if (originalSession?.status !== "idle") throw new Error("Expected a readable session");
 	await first.close();
 	for (const candidate of [catalogPath, `${catalogPath}-wal`, `${catalogPath}-shm`]) {
 		await rm(candidate, { force: true });
@@ -94,6 +123,8 @@ test("a rebuilt catalog backfills the title when the session is loaded", async (
 		(await localFetch(`${second.url}/sessions?scope=all`)).body,
 	);
 	assert.equal(before.sessions[0]?.title, null);
+	assert.notEqual(before.sessions[0]?.projectId, originalSession.projectId);
+	assert.equal(before.sessions[0]?.nodeId, originalSession.nodeId);
 	await getSnapshot(second.url, session.id);
 	const after = await readJson<Protocol.ListSessionsResponse>(
 		(await localFetch(`${second.url}/sessions?scope=all`)).body,
@@ -154,16 +185,15 @@ test("creates, filters, and restores sessions from multiple projects", async (t)
 		mkdir(projectB, { recursive: true }),
 	]);
 	const first = await startServer(t, immediateFactory(), { sessionDir }, false);
-	const sessionA = await createSession(first.url, cwdA);
+	const sessionA = await createSession(first.url, projectA);
 	const otherSessionA = await createSession(first.url, otherCwdA);
 	const sessionB = await createSession(first.url, projectB);
 	const canonicalRoot = await realpath(root);
 	const canonicalProjectA = join(canonicalRoot, "project-a");
-	const canonicalCwdA = join(canonicalProjectA, "nested");
 	const canonicalOtherCwdA = join(canonicalProjectA, "other");
 	const canonicalProjectB = join(canonicalRoot, "project-b");
 
-	assert.equal(sessionA.cwd, canonicalCwdA);
+	assert.equal(sessionA.cwd, canonicalProjectA);
 	assert.equal(sessionA.projectRoot, canonicalProjectA);
 	assert.equal(sessionB.cwd, canonicalProjectB);
 	assert.equal(sessionB.projectRoot, canonicalProjectB);
@@ -171,7 +201,7 @@ test("creates, filters, and restores sessions from multiple projects", async (t)
 	const scoped = await readJson<Protocol.ListSessionsResponse>(scopedResponse.body);
 	assert.deepEqual(
 		scoped.sessions.map((session) => session.id),
-		[sessionA.id],
+		[sessionA.id, otherSessionA.id],
 	);
 	const allResponse = await localFetch(`${first.url}/sessions?scope=all`);
 	const all = await readJson<Protocol.ListSessionsResponse>(allResponse.body);
@@ -179,6 +209,14 @@ test("creates, filters, and restores sessions from multiple projects", async (t)
 		all.sessions.map((session) => session.id),
 		[sessionA.id, otherSessionA.id, sessionB.id],
 	);
+	const listedA = all.sessions.find((session) => session.id === sessionA.id);
+	const listedOtherA = all.sessions.find((session) => session.id === otherSessionA.id);
+	const listedB = all.sessions.find((session) => session.id === sessionB.id);
+	assert.equal(listedA?.projectId, listedOtherA?.projectId);
+	assert.equal(listedA?.workspaceId, listedOtherA?.workspaceId);
+	assert.notEqual(listedA?.projectId, listedB?.projectId);
+	assert.notEqual(listedA?.workspaceId, listedB?.workspaceId);
+	assert.equal(listedA?.nodeId, listedB?.nodeId);
 	await first.close();
 
 	const restoredCwds: string[] = [];
@@ -198,22 +236,58 @@ test("creates, filters, and restores sessions from multiple projects", async (t)
 		new Set(restored.sessions.map((session) => session.id)),
 		new Set([sessionA.id, otherSessionA.id, sessionB.id]),
 	);
+	const restoredA = restored.sessions.find((session) => session.id === sessionA.id);
+	const restoredB = restored.sessions.find((session) => session.id === sessionB.id);
+	assert.equal(restoredA?.projectId, listedA?.projectId);
+	assert.equal(restoredA?.workspaceId, listedA?.workspaceId);
+	assert.equal(restoredB?.projectId, listedB?.projectId);
+	assert.equal(restoredB?.workspaceId, listedB?.workspaceId);
 	assert.deepEqual(restoredCwds, []);
 	await getSnapshot(second.url, sessionA.id);
 	await getSnapshot(second.url, otherSessionA.id);
 	await getSnapshot(second.url, sessionB.id);
-	assert.deepEqual(new Set(restoredCwds), new Set([canonicalCwdA, canonicalOtherCwdA, canonicalProjectB]));
+	assert.deepEqual(new Set(restoredCwds), new Set([canonicalProjectA, canonicalOtherCwdA, canonicalProjectB]));
 	const retargetedResponse = await localFetch(
 		`${second.url}/sessions/${sessionA.id}?cwd=${encodeURIComponent(projectB)}`,
 	);
 	const retargeted = await readJson<Protocol.SessionSnapshot>(retargetedResponse.body);
-	assert.equal(retargeted.session.cwd, canonicalCwdA);
+	assert.equal(retargeted.session.cwd, canonicalProjectA);
 	const rejectedPrompt = await rawPrompt(second.url, sessionA.id, { text: "hello", cwd: projectB });
 	assert.equal(rejectedPrompt.status, 400);
 	assert.deepEqual(await readJson(rejectedPrompt.body), { code: "invalid_prompt" });
 	const admitted = await prompt(second.url, sessionA.id, "hello");
 	await waitForTerminal(second.url, sessionA.id, admitted.turnId);
 	await second.close();
+});
+
+test("captures a git origin once when a live workspace is created", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-git-remote-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sessionDir = join(root, "sessions");
+	const catalogPath = join(root, "catalog.db");
+	const projectRoot = join(root, "project");
+	const configPath = join(projectRoot, ".git", "config");
+	await Promise.all([
+		mkdir(join(projectRoot, ".git", "objects"), { recursive: true }),
+		mkdir(join(projectRoot, ".git", "refs", "heads"), { recursive: true }),
+	]);
+	await Promise.all([
+		writeFile(join(projectRoot, ".git", "HEAD"), "ref: refs/heads/main\n"),
+		writeFile(configPath, '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = first.git\n'),
+	]);
+	const running = await startServer(t, immediateFactory(), { sessionDir, catalogPath });
+
+	await createSession(running.url, projectRoot);
+	await writeFile(configPath, '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = second.git\n');
+	await createSession(running.url, projectRoot);
+
+	const client = new DatabaseSync(catalogPath);
+	const rows = client.prepare("SELECT git_remote FROM workspace").all() as Array<{ git_remote: string | null }>;
+	assert.deepEqual(
+		rows.map((row) => row.git_remote),
+		["first.git"],
+	);
+	client.close();
 });
 
 test("rejects invalid session cwd and listing scopes", async (t) => {
@@ -1923,7 +1997,10 @@ test("a rescuable over-ceiling context is compacted instead of refused", async (
 	await prompt(running.url, session.id, "272000");
 	await waitForIdle(running.url, session.id);
 	assert.equal(controlled.requests.length, 1);
-	assert.equal((await rawPrompt(running.url, session.id, { text: "after the rescue" })).status, 202);
+	const response = await rawPrompt(running.url, session.id, { text: "after the rescue" });
+	assert.equal(response.status, 202);
+	const admitted = await readJson<Protocol.PromptAdmission>(response.body);
+	await waitForTerminal(running.url, session.id, admitted.turnId);
 });
 
 test("a cancelled automatic compaction does not back off", async (t) => {
@@ -3332,6 +3409,7 @@ async function startServer(
 	const server = createDaemon({
 		sessionDir,
 		catalogPath: options.catalogPath ?? join(sessionDir, "catalog.db"),
+		nodePath: options.nodePath ?? join(sessionDir, "node.json"),
 		harnessFactory,
 		definition: options.definition ?? (() => structuredClone(DEFINITION)),
 		eventTailSize: options.eventTailSize,

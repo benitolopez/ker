@@ -245,11 +245,11 @@ function controlPrompt(
 		const snapshotMatch = url.pathname.match(/^\/sessions\/([^/]+)$/);
 		if (snapshotMatch) {
 			const sessionId = decodeURIComponent(snapshotMatch[1]);
-			const session =
-				options.sessions?.find(
-					(candidate): candidate is Protocol.ReadableCatalogSession =>
-						candidate.id === sessionId && candidate.status !== "unreadable",
-				) ?? (sessionId === createdSession.id ? createdSession : descriptor(sessionId));
+			const listed = options.sessions?.find(
+				(candidate): candidate is Protocol.ReadableCatalogSession =>
+					candidate.id === sessionId && candidate.status !== "unreadable",
+			);
+			const session = sessionId === createdSession.id ? createdSession : descriptor(sessionId, listed?.updatedAt);
 			return jsonResponse({ ...snapshot(session), compactionFailure: options.compactionFailure }, 200);
 		}
 		const eventsMatch = url.pathname.match(/^\/sessions\/([^/]+)\/events$/);
@@ -340,7 +340,19 @@ function catalogSession(
 	id: Protocol.SessionId,
 	updatedAt = "2026-01-01T00:00:00.000Z",
 ): Protocol.ReadableCatalogSession {
-	return { status: "idle", title: null, ...descriptor(id, updatedAt) };
+	const session = descriptor(id, updatedAt);
+	return {
+		status: "idle",
+		id: session.id,
+		cwd: session.cwd,
+		projectId: "project-1",
+		projectName: "project",
+		workspaceId: "workspace-1",
+		nodeId: "node-1",
+		title: null,
+		createdAt: session.createdAt,
+		updatedAt: session.updatedAt,
+	};
 }
 
 function snapshot(session: Protocol.SessionDescriptor): Protocol.SessionSnapshot {

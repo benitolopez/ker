@@ -133,13 +133,17 @@ async function runSessions(json: boolean, all: boolean): Promise<void> {
 		process.stdout.write(`${JSON.stringify(body)}\n`);
 		return;
 	}
-	for (const session of body.sessions) {
+	const sessions = [...body.sessions].sort((left, right) =>
+		(left.projectName ?? "-").localeCompare(right.projectName ?? "-"),
+	);
+	for (const session of sessions) {
 		process.stdout.write(
-			`${session.id}\t${session.status}\t${session.updatedAt ?? "-"}\t${session.cwd ?? "-"}\t${session.status === "unreadable" ? session.error : (session.title ?? "-")}\n`,
+			`${session.id}\t${session.status}\t${session.projectName ?? "-"}\t${session.updatedAt ?? "-"}\t${session.cwd ?? "-"}\t${session.status === "unreadable" ? session.error : (session.title ?? "-")}\n`,
 		);
 	}
 }
 
+// The project-anchored listing is createdAt-ascending, so updatedAt ties choose the later-created session.
 async function resolveLatestSession(): Promise<Protocol.SessionId | undefined> {
 	if (!(await checkHealth())) return undefined;
 	const query = new URLSearchParams({ cwd: process.cwd() });
@@ -150,7 +154,6 @@ async function resolveLatestSession(): Promise<Protocol.SessionId | undefined> {
 		return undefined;
 	}
 	const body = (await res.json()) as Protocol.ListSessionsResponse;
-	// The daemon lists sessions createdAt-ascending, so >= resolves an updatedAt tie to the later-created one.
 	const latest = body.sessions
 		.filter((session): session is Protocol.ReadableCatalogSession => session.status !== "unreadable")
 		.reduce<Protocol.ReadableCatalogSession | undefined>(

@@ -6,6 +6,9 @@ export type SessionId = string;
 export type TurnId = string;
 export type MessageId = string;
 export type QueueItemId = string;
+export type ProjectId = string;
+export type WorkspaceId = string;
+export type NodeId = string;
 
 export type AdmissionStatus = "running" | "waiting";
 export type CancellationStatus = "cancelling" | "cancelled" | "aborted";
@@ -54,7 +57,10 @@ export interface ReadableCatalogSession {
 	status: "idle" | "busy";
 	id: SessionId;
 	cwd: string;
-	projectRoot: string;
+	projectId: ProjectId;
+	projectName: string;
+	workspaceId: WorkspaceId;
+	nodeId: NodeId;
 	title: string | null;
 	createdAt: string;
 	updatedAt: string;
@@ -67,7 +73,10 @@ export interface UnreadableCatalogSession {
 	id: SessionId;
 	error: string;
 	cwd?: string;
-	projectRoot?: string;
+	projectId?: ProjectId;
+	projectName?: string;
+	workspaceId?: WorkspaceId;
+	nodeId?: NodeId;
 	title?: string;
 	createdAt?: string;
 	updatedAt?: string;
@@ -421,7 +430,7 @@ export interface TurnCancellationResult {
 	turnId: TurnId;
 }
 
-export const PROTOCOL_VERSION = "17" as const;
+export const PROTOCOL_VERSION = "18" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

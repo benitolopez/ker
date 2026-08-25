@@ -1,11 +1,13 @@
-import { chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type * as Protocol from "@ker-ai/protocol";
-import { and, asc, eq, isNull, or } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, isNull, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-sqlite";
-import { CATALOG_VERSION, DDL, session } from "./schema.ts";
+import type { NodeIdentity } from "./node.ts";
+import { CATALOG_VERSION, DDL, MIGRATIONS, node, project, session, workspace } from "./schema.ts";
 import { type CatalogedSession, projectKey } from "./store.ts";
 
 const SQLITE_CORRUPT = 11;
@@ -14,13 +16,26 @@ const SQLITE_NOTADB = 26;
 export interface CatalogRow {
 	id: Protocol.SessionId;
 	project_key: string;
-	project_root: string | null;
 	cwd: string | null;
 	title: string | null;
 	status: "idle" | "busy" | "unreadable";
 	error: string | null;
 	created_at: string | null;
 	updated_at: string | null;
+	project_id: Protocol.ProjectId | null;
+	workspace_id: Protocol.WorkspaceId | null;
+	node_id: Protocol.NodeId | null;
+}
+
+export type CatalogListRow = CatalogRow & { project_name: string | null };
+
+export interface WorkspaceBinding {
+	projectId: Protocol.ProjectId;
+	projectName: string;
+	workspaceId: Protocol.WorkspaceId;
+	nodeId: Protocol.NodeId;
+	rootPath: string;
+	gitRemote: string | null;
 }
 
 type CatalogScan = {
@@ -37,62 +52,202 @@ export class Catalog {
 		this.#db = drizzle({ client });
 	}
 
-	// An incompatible or corrupt catalog is deleted because every row can be rebuilt from the session logs.
 	static open(path: string): Catalog {
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-		const existed = existsSync(path);
-		if (!existed) {
-			const created = openDatabase(path).client;
-			initializeDatabase(created);
-			return new Catalog(created);
+		if (!existsSync(path)) {
+			const client = openDatabase(path).client;
+			initializeDatabase(client);
+			return new Catalog(client);
 		}
 
 		const opened = openExistingDatabase(path);
-		if (opened?.version === CATALOG_VERSION) return new Catalog(opened.client);
-		opened?.client.close();
-		return new Catalog(recreateDatabase(path));
+		if (!opened) return new Catalog(rebuildDatabase(path, "the catalog database is corrupt"));
+		if (opened.version === CATALOG_VERSION) return new Catalog(opened.client);
+		if (opened.version > CATALOG_VERSION) {
+			opened.client.close();
+			throw new Error(`${path} was created by a newer ker — refusing to open`);
+		}
+		if (opened.version === 0) {
+			opened.client.close();
+			return new Catalog(rebuildDatabase(path, "the existing catalog has no schema version"));
+		}
+
+		try {
+			migrateDatabase(opened.client, opened.version);
+			return new Catalog(opened.client);
+		} catch (error) {
+			opened.client.close();
+			if (isCorruptDatabase(error)) {
+				return new Catalog(rebuildDatabase(path, "the catalog database became corrupt during migration"));
+			}
+			throw error;
+		}
 	}
 
-	// Startup reconciliation preserves titles while refreshing all data derived from the logs.
-	reconcile(scan: CatalogScan): void {
+	upsertNode(identity: NodeIdentity): void {
+		this.#db
+			.insert(node)
+			.values({ id: identity.id, name: identity.name, created_at: identity.createdAt })
+			.onConflictDoUpdate({ target: node.id, set: { name: identity.name } })
+			.run();
+	}
+
+	findWorkspaceByRoot(nodeId: Protocol.NodeId, rootPath: string): WorkspaceBinding | undefined {
+		return this.#db
+			.select({
+				projectId: project.id,
+				projectName: project.name,
+				workspaceId: workspace.id,
+				nodeId: workspace.node_id,
+				rootPath: workspace.root_path,
+				gitRemote: workspace.git_remote,
+			})
+			.from(workspace)
+			.innerJoin(project, eq(workspace.project_id, project.id))
+			.where(and(eq(workspace.node_id, nodeId), eq(workspace.root_path, rootPath)))
+			.get();
+	}
+
+	createWorkspace(input: {
+		nodeId: Protocol.NodeId;
+		rootPath: string;
+		projectName: string;
+		gitRemote: string | null;
+	}): WorkspaceBinding {
+		try {
+			return this.#db.transaction((tx) => {
+				const now = new Date().toISOString();
+				const projectId = randomUUID();
+				const workspaceId = randomUUID();
+				tx.insert(project).values({ id: projectId, name: input.projectName, created_at: now }).run();
+				tx.insert(workspace)
+					.values({
+						id: workspaceId,
+						project_id: projectId,
+						node_id: input.nodeId,
+						root_path: input.rootPath,
+						git_remote: input.gitRemote,
+						created_at: now,
+					})
+					.run();
+				return {
+					projectId,
+					projectName: input.projectName,
+					workspaceId,
+					nodeId: input.nodeId,
+					rootPath: input.rootPath,
+					gitRemote: input.gitRemote,
+				};
+			});
+		} catch (error) {
+			const existing = this.findWorkspaceByRoot(input.nodeId, input.rootPath);
+			if (existing) return existing;
+			throw error;
+		}
+	}
+
+	// Startup reconciliation refreshes log-derived fields without deleting logical entities.
+	reconcile(scan: CatalogScan, nodeId: Protocol.NodeId): void {
 		this.#db.transaction((tx) => {
+			const bindingsByRoot = new Map<string, WorkspaceBinding>();
+			const bindingsByKey = new Map<string, WorkspaceBinding>();
+			const existingBindings = tx
+				.select({
+					projectId: project.id,
+					projectName: project.name,
+					workspaceId: workspace.id,
+					nodeId: workspace.node_id,
+					rootPath: workspace.root_path,
+					gitRemote: workspace.git_remote,
+				})
+				.from(workspace)
+				.innerJoin(project, eq(workspace.project_id, project.id))
+				.where(eq(workspace.node_id, nodeId))
+				.all();
+			for (const binding of existingBindings) {
+				bindingsByRoot.set(binding.rootPath, binding);
+				bindingsByKey.set(projectKey(binding.rootPath), binding);
+			}
+
 			const scannedIds = new Set<Protocol.SessionId>();
 			for (const entry of scan.sessions) {
 				const descriptor = entry.session;
 				scannedIds.add(descriptor.id);
+				const existing = bindingsByRoot.get(descriptor.projectRoot);
+				const binding =
+					existing ??
+					(() => {
+						const now = new Date().toISOString();
+						const projectId = randomUUID();
+						const workspaceId = randomUUID();
+						const projectName = basename(descriptor.projectRoot) || descriptor.projectRoot;
+						tx.insert(project).values({ id: projectId, name: projectName, created_at: now }).run();
+						tx.insert(workspace)
+							.values({
+								id: workspaceId,
+								project_id: projectId,
+								node_id: nodeId,
+								root_path: descriptor.projectRoot,
+								git_remote: null,
+								created_at: now,
+							})
+							.run();
+						return {
+							projectId,
+							projectName,
+							workspaceId,
+							nodeId,
+							rootPath: descriptor.projectRoot,
+							gitRemote: null,
+						};
+					})();
+				bindingsByRoot.set(binding.rootPath, binding);
+				bindingsByKey.set(entry.projectKey, binding);
 				tx.insert(session)
 					.values({
 						id: descriptor.id,
 						project_key: entry.projectKey,
-						project_root: descriptor.projectRoot,
 						cwd: descriptor.cwd,
 						status: entry.idle ? "idle" : "busy",
 						error: null,
 						created_at: descriptor.createdAt,
 						updated_at: descriptor.updatedAt,
+						project_id: binding.projectId,
+						workspace_id: binding.workspaceId,
+						node_id: binding.nodeId,
 					})
 					.onConflictDoUpdate({
 						target: session.id,
 						set: {
 							project_key: entry.projectKey,
-							project_root: descriptor.projectRoot,
 							cwd: descriptor.cwd,
 							status: entry.idle ? "idle" : "busy",
 							error: null,
 							created_at: descriptor.createdAt,
 							updated_at: descriptor.updatedAt,
+							project_id: binding.projectId,
+							workspace_id: binding.workspaceId,
+							node_id: binding.nodeId,
 						},
 					})
 					.run();
 			}
 			for (const entry of scan.unreadable) {
 				scannedIds.add(entry.id);
+				const binding = bindingsByKey.get(entry.projectKey);
 				tx.insert(session)
 					.values({
 						id: entry.id,
 						project_key: entry.projectKey,
 						status: "unreadable",
 						error: entry.error,
+						...(binding
+							? {
+									project_id: binding.projectId,
+									workspace_id: binding.workspaceId,
+									node_id: binding.nodeId,
+								}
+							: {}),
 					})
 					.onConflictDoUpdate({
 						target: session.id,
@@ -100,6 +255,13 @@ export class Catalog {
 							project_key: entry.projectKey,
 							status: "unreadable",
 							error: entry.error,
+							...(binding
+								? {
+										project_id: binding.projectId,
+										workspace_id: binding.workspaceId,
+										node_id: binding.nodeId,
+									}
+								: {}),
 						},
 					})
 					.run();
@@ -110,30 +272,34 @@ export class Catalog {
 		});
 	}
 
-	upsertCreated(descriptor: Protocol.SessionDescriptor): void {
+	upsertCreated(descriptor: Protocol.SessionDescriptor, binding: WorkspaceBinding): void {
 		const key = projectKey(descriptor.projectRoot);
 		this.#db
 			.insert(session)
 			.values({
 				id: descriptor.id,
 				project_key: key,
-				project_root: descriptor.projectRoot,
 				cwd: descriptor.cwd,
 				status: "idle",
 				error: null,
 				created_at: descriptor.createdAt,
 				updated_at: descriptor.updatedAt,
+				project_id: binding.projectId,
+				workspace_id: binding.workspaceId,
+				node_id: binding.nodeId,
 			})
 			.onConflictDoUpdate({
 				target: session.id,
 				set: {
 					project_key: key,
-					project_root: descriptor.projectRoot,
 					cwd: descriptor.cwd,
 					status: "idle",
 					error: null,
 					created_at: descriptor.createdAt,
 					updated_at: descriptor.updatedAt,
+					project_id: binding.projectId,
+					workspace_id: binding.workspaceId,
+					node_id: binding.nodeId,
 				},
 			})
 			.run();
@@ -163,17 +329,23 @@ export class Catalog {
 		return this.#db.select().from(session).where(eq(session.id, id)).get();
 	}
 
-	list(scope?: { cwd: string; projectKey: string }): CatalogRow[] {
-		if (!scope) return this.#db.select().from(session).orderBy(asc(session.created_at)).all();
+	list(scope?: { nodeId: Protocol.NodeId; rootPath: string }): CatalogListRow[] {
+		const selection = { ...getTableColumns(session), project_name: project.name };
+		if (!scope) {
+			return this.#db
+				.select(selection)
+				.from(session)
+				.leftJoin(project, eq(session.project_id, project.id))
+				.orderBy(asc(session.created_at))
+				.all();
+		}
+		const binding = this.findWorkspaceByRoot(scope.nodeId, scope.rootPath);
+		const unreadableMatch = and(eq(session.status, "unreadable"), eq(session.project_key, projectKey(scope.rootPath)));
 		return this.#db
-			.select()
+			.select(selection)
 			.from(session)
-			.where(
-				or(
-					eq(session.cwd, scope.cwd),
-					and(eq(session.status, "unreadable"), eq(session.project_key, scope.projectKey)),
-				),
-			)
+			.leftJoin(project, eq(session.project_id, project.id))
+			.where(binding ? or(eq(session.project_id, binding.projectId), unreadableMatch) : unreadableMatch)
 			.orderBy(asc(session.created_at))
 			.all();
 	}
@@ -193,6 +365,7 @@ function openDatabase(path: string): { client: DatabaseSync; version: number } {
 		chmodSync(path, 0o600);
 		client.exec("PRAGMA journal_mode = WAL");
 		client.exec("PRAGMA synchronous = NORMAL");
+		client.exec("PRAGMA foreign_keys = ON");
 		const version = client.prepare("PRAGMA user_version").get() as { user_version: number };
 		return { client, version: version.user_version };
 	} catch (error) {
@@ -210,8 +383,32 @@ function openExistingDatabase(path: string): ReturnType<typeof openDatabase> | u
 	}
 }
 
-function recreateDatabase(path: string): DatabaseSync {
-	for (const candidate of [path, `${path}-wal`, `${path}-shm`]) rmSync(candidate, { force: true });
+function migrateDatabase(client: DatabaseSync, fromVersion: number): void {
+	client.exec("BEGIN IMMEDIATE");
+	try {
+		for (let version = fromVersion + 1; version <= CATALOG_VERSION; version++) {
+			const migration = MIGRATIONS[version];
+			if (!migration) throw new Error(`Catalog migration ${version - 1}→${version} is missing`);
+			client.exec(migration);
+			client.exec(`PRAGMA user_version = ${version}`);
+		}
+		client.exec("COMMIT");
+	} catch (error) {
+		try {
+			client.exec("ROLLBACK");
+		} catch {}
+		throw error;
+	}
+}
+
+function rebuildDatabase(path: string, reason: string): DatabaseSync {
+	const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+	const preservedPath = `${path}.corrupt-${timestamp}`;
+	for (const suffix of ["", "-wal", "-shm"]) {
+		const candidate = `${path}${suffix}`;
+		if (existsSync(candidate)) renameSync(candidate, `${preservedPath}${suffix}`);
+	}
+	console.error(`ker: ${reason}; preserved it at ${preservedPath} and created a fresh catalog`);
 	const client = openDatabase(path).client;
 	initializeDatabase(client);
 	return client;

@@ -61,8 +61,8 @@ test("sessions prints status, metadata, titles, and unreadable errors inline", a
 		if (url.pathname === "/sessions") {
 			return jsonResponse({
 				sessions: [
-					catalogSession("session-1", "Saved title"),
-					{ status: "unreadable", id: "session-2", error: "bad header" },
+					{ status: "unreadable", id: "session-2", error: "bad header", projectName: "Zulu" },
+					catalogSession("session-1", "Saved title", "Alpha"),
 				],
 			} satisfies Protocol.ListSessionsResponse);
 		}
@@ -73,7 +73,7 @@ test("sessions prints status, metadata, titles, and unreadable errors inline", a
 
 	assert.equal(
 		controlled.stdout.join(""),
-		`session-1\tidle\t2026-01-01T00:00:00.000Z\t${process.cwd()}\tSaved title\nsession-2\tunreadable\t-\t-\tbad header\n`,
+		`session-1\tidle\tAlpha\t2026-01-01T00:00:00.000Z\t${process.cwd()}\tSaved title\nsession-2\tunreadable\tZulu\t-\t-\tbad header\n`,
 	);
 	assert.equal(controlled.stderr.join(""), "");
 });
@@ -157,8 +157,24 @@ function descriptor(id: string): Protocol.SessionDescriptor {
 	};
 }
 
-function catalogSession(id: string, title: string | null = null): Protocol.ReadableCatalogSession {
-	return { status: "idle", title, ...descriptor(id) };
+function catalogSession(
+	id: string,
+	title: string | null = null,
+	projectName = "project",
+): Protocol.ReadableCatalogSession {
+	const session = descriptor(id);
+	return {
+		status: "idle",
+		id: session.id,
+		cwd: session.cwd,
+		projectId: "project-1",
+		projectName,
+		workspaceId: "workspace-1",
+		nodeId: "node-1",
+		title,
+		createdAt: session.createdAt,
+		updatedAt: session.updatedAt,
+	};
 }
 
 function jsonResponse(body: object, status = 200): Response {
