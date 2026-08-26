@@ -1,59 +1,1478 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import * as Agent from "@ker-ai/agent";
+import * as Auth from "@ker-ai/auth";
+import type * as Config from "@ker-ai/config";
+import * as Engine from "@ker-ai/engine";
+import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
+import { loadNodeIdentity, type NodeIdentity } from "./identity.ts";
+import {
+	type AssistantRecord,
+	type CompactionRecord,
+	type ConversationRecord,
+	canonicalDirectory,
+	canonicalProjectRoot,
+	type Definition,
+	type DefinitionRecord,
+	type EventRecord,
+	type IdentityRecord,
+	type Payload,
+	SESSION_FILE,
+	type SessionStore,
+	type StoredRecord,
+	type StoredSession,
+} from "./store.ts";
 
-export interface NodeIdentity {
-	id: Protocol.NodeId;
-	name: string;
-	createdAt: string;
+const INTERRUPTED_HISTORY_MARKER =
+	"The previous turn was interrupted by a daemon restart. Tools may have partially executed.";
+const CANCELLED_DURING_RESTART_HISTORY_MARKER =
+	"The previous turn was cancelled before a daemon restart finished cleanup. Tools may have partially executed.";
+
+export interface Harness {
+	send(input: Engine.UserMessage, signal?: AbortSignal): AsyncIterable<Protocol.TurnEvent>;
+	compact(
+		input: Engine.CompactionRequest,
+		signal?: AbortSignal,
+	): AsyncGenerator<Protocol.TurnEvent, Engine.CompactionOutcome>;
+	snapshot(): Engine.HarnessState;
 }
 
-export function loadNodeIdentity(path: string): NodeIdentity {
-	try {
-		return parseNodeIdentity(readFileSync(path, "utf8"), path);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+export interface SessionChange {
+	sessionId: Protocol.SessionId;
+	updatedAt: string;
+	status: "idle" | "busy";
+	firstUserText?: string;
+}
+
+export interface NodeOptions {
+	store: SessionStore;
+	nodePath: string;
+	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
+	definition: (cwd: string) => Definition;
+	eventTailSize: number;
+	recoveryWindowMinutes: number;
+	compaction: Config.CompactionSettings;
+	onSessionChange: (change: SessionChange) => void;
+}
+
+export interface Scan {
+	sessions: Array<{ session: Protocol.SessionDescriptor; projectKey: string; idle: boolean }>;
+	unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }>;
+}
+
+export class UnknownSessionError extends Error {}
+
+export class InvalidCwdError extends Error {}
+
+export class SessionUnreadableError extends Error {
+	readonly sessionId: Protocol.SessionId;
+
+	constructor(sessionId: Protocol.SessionId, message: string) {
+		super(message);
+		this.sessionId = sessionId;
+	}
+}
+
+export type { NodeIdentity } from "./identity.ts";
+
+interface ActiveTurn {
+	item: Protocol.QueueItem;
+	delivered: boolean;
+	controller: AbortController;
+	done: PromiseWithResolvers<void>;
+	terminal: boolean;
+	cancellationRequested: boolean;
+}
+
+interface SessionState {
+	stored: StoredSession;
+	harness: Harness;
+	persistedMessageCount: number;
+	lastConversationEntryId: string | null;
+	identity?: Protocol.Identity;
+	model?: Protocol.Model;
+	cumulativeUsage: Protocol.Usage;
+	messages: Protocol.AssistantMessage[];
+	active?: Protocol.ActiveAssistantMessage;
+	turns: Map<Protocol.TurnId, Protocol.TurnTerminalReason>;
+	epoch: string;
+	sequence: number;
+	tail: Protocol.EventEnvelope[];
+	subscribers: Set<(envelope: Protocol.EventEnvelope) => void>;
+	items: Map<Protocol.QueueItemId, Protocol.QueueItem>;
+	queue: Protocol.QueueSnapshot;
+	queueLock: Promise<void>;
+	activeTurn?: ActiveTurn;
+	compactionAttempted: boolean;
+	compactionBackoffTokens?: number;
+	compactionFailure?: { turnId: Protocol.TurnId; message: string };
+}
+
+export class Node {
+	readonly #store: SessionStore;
+	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
+	readonly #definition: (cwd: string) => Definition;
+	readonly #eventTailSize: number;
+	readonly #recoveryWindowMinutes: number;
+	readonly #compaction: Config.CompactionSettings;
+	readonly #onSessionChange: (change: SessionChange) => void;
+	readonly identity: NodeIdentity;
+	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
+	readonly #paths = new Map<Protocol.SessionId, string>();
+	#recoverySessionIds: Protocol.SessionId[] = [];
+	#stopping = false;
+
+	constructor(options: NodeOptions) {
+		this.#store = options.store;
+		this.#harnessFactory = options.harnessFactory;
+		this.#definition = options.definition;
+		this.#eventTailSize = options.eventTailSize;
+		this.#recoveryWindowMinutes = options.recoveryWindowMinutes;
+		this.#compaction = options.compaction;
+		this.#onSessionChange = options.onSessionChange;
+		this.identity = loadNodeIdentity(options.nodePath);
 	}
 
-	const identity: NodeIdentity = {
-		id: randomUUID(),
-		name: hostname(),
-		createdAt: new Date().toISOString(),
+	async scan(): Promise<Scan> {
+		const scan = await this.#store.scanCatalog();
+		this.#paths.clear();
+		for (const entry of scan.sessions) this.#paths.set(entry.session.id, entry.path);
+		for (const entry of scan.unreadable) {
+			this.#paths.set(entry.id, join(this.#store.baseDir, entry.projectKey, entry.id, SESSION_FILE));
+		}
+		this.#recoverySessionIds = scan.sessions.filter((entry) => !entry.idle).map((entry) => entry.session.id);
+		return {
+			sessions: scan.sessions.map(({ session, projectKey, idle }) => ({ session, projectKey, idle })),
+			unreadable: scan.unreadable,
+		};
+	}
+
+	// Runs pending sessions independently so one failed load does not prevent the others from recovering.
+	async recover(): Promise<void> {
+		const results = await Promise.allSettled(
+			this.#recoverySessionIds.map((sessionId) => this.#recoverSession(sessionId)),
+		);
+		const failures: unknown[] = results.flatMap((result) =>
+			result.status === "rejected" ? [result.reason as unknown] : [],
+		);
+		if (failures.length > 0) throw new AggregateError(failures, "Session recovery failed");
+	}
+
+	async #recoverSession(sessionId: Protocol.SessionId): Promise<void> {
+		const state = await this.#state(sessionId);
+		await this.#withQueueLock(state, async () => {
+			await this.#drainExpiredWaiting(state);
+			if (state.queue.running) {
+				await this.#recoverRunning(state, state.queue.running);
+				return;
+			}
+			await this.#startNext(state);
+		});
+	}
+
+	async createSession(cwd: string): Promise<Protocol.SessionDescriptor> {
+		const canonicalCwd = await canonicalDirectory(cwd).catch((error: unknown) => {
+			throw new InvalidCwdError(error instanceof Error ? error.message : String(error));
+		});
+		const stored = await this.#store.create(canonicalCwd, this.#definition(canonicalCwd));
+		this.#paths.set(stored.session.id, stored.log.path);
+		this.#states.set(stored.session.id, Promise.resolve(this.#loadState(stored)));
+		return stored.session;
+	}
+
+	async resolveProjectRoot(cwd: string): Promise<string> {
+		return canonicalDirectory(cwd)
+			.then(canonicalProjectRoot)
+			.catch((error: unknown) => {
+				throw new InvalidCwdError(error instanceof Error ? error.message : String(error));
+			});
+	}
+
+	observeGitRemote(root: string): Promise<string | null> {
+		return observeGitRemote(root);
+	}
+
+	async snapshot(sessionId: Protocol.SessionId): Promise<Protocol.SessionSnapshot> {
+		const state = await this.#state(sessionId);
+		return this.#withQueueLock(state, async () => {
+			const turns = new Map<Protocol.TurnId, Protocol.TurnSnapshot>();
+			for (const [id, status] of state.turns) turns.set(id, { id, status });
+			if (state.queue.running) {
+				turns.set(state.queue.running.turnId, {
+					id: state.queue.running.turnId,
+					status: state.queue.running.state === "cancelling" ? "cancelling" : "running",
+				});
+			}
+			for (const item of state.queue.waiting) turns.set(item.turnId, { id: item.turnId, status: "waiting" });
+			return {
+				session: { ...state.stored.session },
+				identity: state.identity,
+				model: state.model ? { ...state.model } : undefined,
+				usage: {
+					contextTokens: Engine.estimateContextTokens(state.harness.snapshot().messages),
+					cumulative: { ...state.cumulativeUsage },
+				},
+				compactionFailure: state.compactionFailure ? { ...state.compactionFailure } : undefined,
+				entries: state.stored.records.flatMap((record) => {
+					if (record.type === "conversation") return [toConversationEntry(record)];
+					if (record.type === "compaction") return [toCompactionEntry(record)];
+					return [];
+				}),
+				messages: state.messages.map((message) => ({ ...message })),
+				active: state.active ? { ...state.active } : undefined,
+				turns: [...turns.values()],
+				queue: cloneQueue(state.queue),
+				cursor: { epoch: state.epoch, sequence: state.sequence },
+			};
+		});
+	}
+
+	async subscribe(
+		sessionId: Protocol.SessionId,
+		cursor: Protocol.Cursor,
+		listener: (envelope: Protocol.EventEnvelope) => void,
+	): Promise<{ replay: Protocol.EventEnvelope[]; unsubscribe: () => void } | "resync"> {
+		const state = await this.#state(sessionId);
+		const firstSequence = state.tail[0]?.sequence ?? state.sequence + 1;
+		if (cursor.epoch !== state.epoch || cursor.sequence > state.sequence || cursor.sequence < firstSequence - 1) {
+			return "resync";
+		}
+		state.subscribers.add(listener);
+		return {
+			replay: state.tail.filter((envelope) => envelope.sequence > cursor.sequence),
+			unsubscribe: () => state.subscribers.delete(listener),
+		};
+	}
+
+	async admit(sessionId: Protocol.SessionId, text: string): Promise<Protocol.PromptAdmission | "context_exhausted"> {
+		const state = await this.#state(sessionId);
+		return this.#withQueueLock(state, async () => {
+			await this.#maybePrune(state);
+			const compaction = this.#maybeCompactionItem(state);
+			// The provider would reject a request this large, and nothing queued can shrink it, so the
+			// refusal names a way out instead of leaving the turn to fail against the model.
+			const rescued =
+				compaction !== undefined || [state.queue.running, ...state.queue.waiting].some((i) => i?.kind === "compaction");
+			const contextWindow = state.model?.contextWindow;
+			if (
+				!rescued &&
+				contextWindow !== undefined &&
+				Engine.estimateContextTokens(state.harness.snapshot().messages) >= contextWindow
+			) {
+				return "context_exhausted";
+			}
+			const messageId = randomUUID();
+			const turnId = randomUUID();
+			const queueItemId = randomUUID();
+			const status: Protocol.AdmissionStatus = state.queue.running || this.#stopping ? "waiting" : "running";
+			const item: Protocol.PromptQueueItem = {
+				id: queueItemId,
+				turnId,
+				kind: "prompt",
+				messageId,
+				text,
+				state: status,
+				submittedAt: new Date().toISOString(),
+			};
+			state.items.set(queueItemId, item);
+			if (status === "running") state.queue.running = item;
+			if (status === "waiting") state.queue.waiting.push(item);
+			state.queue.revision++;
+			const payloads: Payload[] = [];
+			if (compaction) payloads.push(this.#compactionSubmittedPayload(state, compaction, "process"));
+			payloads.push(
+				{
+					type: "event",
+					event: {
+						actor: "human",
+						sessionId,
+						turnId,
+						type: "message_submitted",
+						messageId,
+						queueItemId,
+						text,
+						admission: status,
+					},
+				},
+				this.#queueChangedPayload(state),
+			);
+			await this.#appendAndPublish(state, payloads);
+			if (compaction?.state === "running") this.#start(compaction, state);
+			if (status === "running") this.#start(item, state);
+			return {
+				status,
+				sessionId,
+				turnId,
+				messageId,
+				queueItemId,
+				queue: cloneQueue(state.queue),
+			};
+		});
+	}
+
+	async compact(sessionId: Protocol.SessionId, instructions?: string): Promise<Protocol.CompactionAdmission> {
+		const state = await this.#state(sessionId);
+		return this.#withQueueLock(state, async () => {
+			const item = this.#createCompactionItem(state, "manual", instructions);
+			state.queue.revision++;
+			await this.#appendAndPublish(state, [
+				this.#compactionSubmittedPayload(state, item, "human"),
+				this.#queueChangedPayload(state),
+			]);
+			if (item.state === "running") this.#start(item, state);
+			return {
+				status: item.state,
+				sessionId,
+				turnId: item.turnId,
+				queueItemId: item.id,
+				queue: cloneQueue(state.queue),
+			};
+		});
+	}
+
+	async cancel(
+		sessionId: Protocol.SessionId,
+		turnId: Protocol.TurnId,
+	): Promise<Protocol.TurnCancellationResult | "turn_unavailable"> {
+		const state = await this.#state(sessionId);
+		return this.#withQueueLock(state, async () => {
+			const terminal = state.turns.get(turnId);
+			if (terminal === "aborted" || terminal === "cancelled") {
+				return { status: terminal, sessionId, turnId };
+			}
+			if (terminal) return "turn_unavailable";
+
+			const running = state.queue.running;
+			if (running?.turnId === turnId) {
+				if (running.state === "cancelling") return { status: "cancelling", sessionId, turnId };
+				const active = state.activeTurn;
+				if (!active || active.item.id !== running.id || active.terminal) return "turn_unavailable";
+				active.cancellationRequested = true;
+				const cancelling = { ...running, state: "cancelling" as const };
+				active.item = cancelling;
+				state.items.set(cancelling.id, cancelling);
+				state.queue.running = cancelling;
+				state.queue.revision++;
+				await this.#appendAndPublish(state, [
+					{
+						type: "event",
+						event: { actor: "human", sessionId, turnId, type: "turn_cancel_requested" },
+					},
+					this.#queueChangedPayload(state),
+				]);
+				active.controller.abort();
+				return { status: "cancelling", sessionId, turnId };
+			}
+			const index = state.queue.waiting.findIndex((item) => item.turnId === turnId);
+			if (index === -1) return "turn_unavailable";
+			const [removed] = state.queue.waiting.splice(index, 1);
+			if (!state.items.has(removed.id)) return "turn_unavailable";
+			state.queue.revision++;
+			const payloads: Payload[] = [
+				{
+					type: "event",
+					event: { actor: "human", sessionId, turnId, type: "turn_cancel_requested" },
+				},
+			];
+			if (removed.kind === "prompt") {
+				payloads.push({
+					type: "event",
+					event: {
+						actor: "process",
+						sessionId,
+						turnId,
+						type: "message_undelivered",
+						messageId: removed.messageId,
+						text: removed.text,
+						reason: "cancelled",
+					},
+				});
+			}
+			payloads.push(
+				{ type: "event", event: { actor: "process", sessionId, turnId, type: "cancelled" } },
+				{
+					type: "event",
+					event: { actor: "process", sessionId, turnId, type: "turn_terminal", reason: "cancelled" },
+				},
+				{ type: "event", event: { actor: "process", sessionId, turnId, type: "end" } },
+				this.#queueChangedPayload(state),
+			);
+			await this.#appendAndPublish(state, payloads);
+			return { status: "cancelled", sessionId, turnId };
+		});
+	}
+
+	async shutdown(): Promise<void> {
+		this.#stopping = true;
+		const states = (
+			await Promise.all([...this.#states.values()].map((statePromise) => statePromise.catch(() => undefined)))
+		).filter((state): state is SessionState => state !== undefined);
+		await Promise.all(
+			states.map(async (state) => {
+				const active = await this.#withQueueLock(state, async () => {
+					const active = state.activeTurn;
+					if (!active) return undefined;
+					active.controller.abort();
+					return active;
+				});
+				await active?.done.promise;
+			}),
+		);
+	}
+
+	#state(sessionId: Protocol.SessionId): Promise<SessionState> {
+		const existing = this.#states.get(sessionId);
+		if (existing) return existing;
+		const path = this.#paths.get(sessionId);
+		if (!path) throw new UnknownSessionError(`Unknown session ${sessionId}`);
+		const loading = this.#openState(sessionId, path);
+		this.#states.set(sessionId, loading);
+		return loading;
+	}
+
+	// Replays a session on first attach and leaves failed loads available for later repair.
+	async #openState(sessionId: Protocol.SessionId, path: string): Promise<SessionState> {
+		try {
+			const stored = await this.#store.loadSession(path);
+			const current = this.#definition(stored.session.cwd);
+			const last = stored.records.findLast((record): record is DefinitionRecord => record.type === "definition");
+			if (!last || definitionKey(last) !== definitionKey(current)) {
+				const records = await stored.log.append([{ type: "definition", ...current }]);
+				stored.records.push(...records);
+				const updatedAt = records.at(-1)?.at;
+				if (updatedAt) stored.session.updatedAt = updatedAt;
+			}
+			const state = this.#loadState(stored);
+			const submitted = stored.records.find(
+				(record): record is EventRecord => record.type === "event" && record.event.type === "message_submitted",
+			);
+			this.#onSessionChange({
+				sessionId,
+				updatedAt: stored.session.updatedAt,
+				status: state.queue.running || state.queue.waiting.length > 0 ? "busy" : "idle",
+				...(submitted?.event.type === "message_submitted" ? { firstUserText: submitted.event.text } : {}),
+			});
+			return state;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.#states.delete(sessionId);
+			throw new SessionUnreadableError(sessionId, message);
+		}
+	}
+
+	#loadState(stored: StoredSession): SessionState {
+		const conversation = stored.records.filter(
+			(record): record is ConversationRecord => record.type === "conversation",
+		);
+		const projectedMessages = projectMessages(stored.records);
+		const identity = stored.records.findLast(
+			(record): record is IdentityRecord => record.type === "identity",
+		)?.identity;
+		const messages = stored.records
+			.filter((record): record is AssistantRecord => record.type === "assistant")
+			.map((record) => ({ ...record.message }));
+		const usageEvents = stored.records.flatMap((record) =>
+			record.type === "event" && record.event.type === "usage" ? [record.event] : [],
+		);
+		const latestUsage = usageEvents.at(-1);
+		const cumulativeUsage = usageEvents.reduce((total, event) => addUsage(total, event.usage), {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0,
+		} satisfies Protocol.Usage);
+		const turns = new Map<Protocol.TurnId, Protocol.TurnTerminalReason>();
+		const items = new Map<Protocol.QueueItemId, Protocol.QueueItem>();
+		let queue: Protocol.QueueSnapshot = { revision: 0, waiting: [] };
+		for (const record of stored.records) {
+			if (record.type !== "event") continue;
+			const event = record.event;
+			if (event.type === "turn_terminal") turns.set(event.turnId, event.reason);
+			if (event.type === "message_submitted") {
+				items.set(event.queueItemId, {
+					id: event.queueItemId,
+					turnId: event.turnId,
+					kind: "prompt",
+					messageId: event.messageId,
+					text: event.text,
+					state: event.admission,
+					submittedAt: record.at,
+				});
+			}
+			if (event.type === "compaction_submitted") {
+				items.set(event.queueItemId, {
+					id: event.queueItemId,
+					turnId: event.turnId,
+					kind: "compaction",
+					source: event.source,
+					...(event.instructions === undefined ? {} : { instructions: event.instructions }),
+					state: event.admission,
+					submittedAt: record.at,
+				});
+			}
+			if (event.type === "queue_changed" && event.queue.revision > queue.revision) {
+				queue = normalizeQueue(event.queue);
+			}
+		}
+		// Queue items restore from the queue snapshot, not the submission records: the snapshot
+		// carries each item's original submittedAt, which recovery expiry depends on.
+		const restoredRunning: Protocol.QueueItem | undefined =
+			queue.running && items.has(queue.running.id)
+				? { ...queue.running, state: queue.running.state === "cancelling" ? "cancelling" : "running" }
+				: undefined;
+		if (restoredRunning) items.set(restoredRunning.id, restoredRunning);
+		const waiting = queue.waiting.flatMap((queued) => {
+			if (!items.has(queued.id)) return [];
+			const restored = { ...queued, state: "waiting" as const };
+			items.set(restored.id, restored);
+			return [restored];
+		});
+		const state: Engine.HarnessState = {
+			messages: projectedMessages,
+			identity,
+		};
+		return {
+			stored,
+			harness: this.#harnessFactory(state, stored.session.cwd),
+			persistedMessageCount: state.messages.length,
+			lastConversationEntryId: conversation.at(-1)?.id ?? null,
+			identity,
+			model: latestUsage ? Llm.getModel(latestUsage.provider, latestUsage.model) : undefined,
+			cumulativeUsage,
+			messages,
+			turns,
+			epoch: randomUUID(),
+			sequence: 0,
+			tail: [],
+			subscribers: new Set(),
+			items,
+			queue: { revision: queue.revision, running: restoredRunning, waiting },
+			queueLock: Promise.resolve(),
+			compactionAttempted: false,
+		};
+	}
+
+	#start(item: Protocol.QueueItem, state: SessionState): void {
+		const turn: ActiveTurn = {
+			item,
+			delivered: false,
+			controller: new AbortController(),
+			done: Promise.withResolvers<void>(),
+			terminal: false,
+			cancellationRequested: false,
+		};
+		state.activeTurn = turn;
+		if (item.kind === "compaction") {
+			void this.#runCompaction(state, turn);
+			return;
+		}
+		void this.#runTurn(state, turn);
+	}
+
+	async #runTurn(state: SessionState, turn: ActiveTurn): Promise<void> {
+		if (turn.item.kind !== "prompt") throw new Error(`Queue item ${turn.item.id} is not a prompt`);
+		const message: Engine.UserMessage = {
+			sessionId: state.stored.session.id,
+			turnId: turn.item.turnId,
+			messageId: turn.item.messageId,
+			text: turn.item.text,
+		};
+		let failureReason: "aborted" | "error" | undefined;
+		try {
+			for await (const event of state.harness.send(message, turn.controller.signal)) {
+				if (turn.terminal) continue;
+				if (event.type === "message_delivered" && event.messageId === message.messageId) turn.delivered = true;
+				if (event.type === "aborted") {
+					failureReason = "aborted";
+				}
+				if (event.type === "error") {
+					failureReason = "error";
+				}
+				if (event.type === "end") {
+					await this.#completeTurn(state, turn, failureReason);
+					return;
+				}
+				await this.#recordHarnessEvent(state, event);
+			}
+		} catch (error) {
+			if (!failureReason && turn.controller.signal.aborted) {
+				failureReason = "aborted";
+				await this.#recordHarnessEvent(state, {
+					actor: "process",
+					sessionId: message.sessionId,
+					turnId: message.turnId,
+					type: "aborted",
+				});
+			}
+			if (!failureReason) {
+				failureReason = "error";
+				await this.#recordHarnessEvent(state, {
+					actor: "process",
+					sessionId: message.sessionId,
+					turnId: message.turnId,
+					type: "error",
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
+		} finally {
+			try {
+				if (!turn.terminal) await this.#completeTurn(state, turn, failureReason ?? "error");
+			} finally {
+				turn.done.resolve();
+			}
+		}
+	}
+
+	async #runCompaction(state: SessionState, turn: ActiveTurn): Promise<void> {
+		if (turn.item.kind !== "compaction") throw new Error(`Queue item ${turn.item.id} is not a compaction`);
+		const item = turn.item;
+		const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
+		let outcome: Engine.CompactionOutcome | undefined;
+		let failure: { error: unknown } | undefined;
+		try {
+			const snapshot = state.harness.snapshot();
+			if (snapshot.messages.length !== state.persistedMessageCount) {
+				throw new Error("Cannot compact while conversation messages are awaiting persistence");
+			}
+			const previousSummary = state.stored.records.findLast(
+				(record): record is CompactionRecord => record.type === "compaction",
+			)?.summary;
+			const generator = state.harness.compact(
+				{
+					...scope,
+					keepRecentTokens: this.#compaction.keepRecentTokens,
+					...(state.model?.contextWindow === undefined ? {} : { contextWindow: state.model.contextWindow }),
+					...(this.#compaction.reasoningEffort === undefined
+						? {}
+						: { reasoningEffort: this.#compaction.reasoningEffort }),
+					...(item.instructions === undefined ? {} : { instructions: item.instructions }),
+					...(previousSummary === undefined ? {} : { previousSummary }),
+				},
+				turn.controller.signal,
+			);
+			while (true) {
+				const next = await generator.next();
+				if (next.done) {
+					outcome = next.value;
+					break;
+				}
+				if (!turn.terminal) await this.#recordHarnessEvent(state, next.value);
+			}
+		} catch (error) {
+			failure = { error };
+		}
+
+		try {
+			await this.#withQueueLock(state, async () => {
+				if (state.activeTurn !== turn || turn.terminal) return;
+				const aborted = turn.cancellationRequested || turn.controller.signal.aborted || outcome?.kind === "aborted";
+				if (aborted) {
+					await this.#recordHarnessEvent(state, { actor: "process", ...scope, type: "aborted" });
+					await this.#finishTurn(state, turn, "aborted");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				if (failure !== undefined) {
+					const message = failure.error instanceof Error ? failure.error.message : String(failure.error);
+					await this.#recordHarnessEvent(state, { actor: "process", ...scope, type: "error", message });
+					this.#backOffCompaction(state, item, message);
+					await this.#finishTurn(state, turn, "error");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				if (!outcome || outcome.kind === "stopped" || outcome.kind === "aborted") {
+					if (!(outcome?.kind === "stopped" && outcome.retryable)) this.#backOffCompaction(state, item);
+					await this.#finishTurn(state, turn, "error");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				if (outcome.kind === "skipped") {
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						...scope,
+						type: "compaction_skipped",
+						reason: outcome.reason,
+					});
+					this.#backOffCompaction(state, item);
+					await this.#finishTurn(state, turn);
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+
+				const trigger =
+					state.model?.contextWindow === undefined
+						? undefined
+						: state.model.contextWindow - this.#compaction.reserveTokens;
+				const watermark =
+					item.source === "auto" && trigger !== undefined && trigger > 0
+						? trigger - Math.min(this.#compaction.reserveTokens, Math.floor(trigger / 2))
+						: undefined;
+				const gateError =
+					outcome.tokensAfter >= outcome.tokensBefore
+						? `Compaction did not reduce the context (${outcome.tokensBefore} → ${outcome.tokensAfter} tokens)`
+						: watermark !== undefined && outcome.tokensAfter > watermark
+							? "Compacted context is still too close to the compaction threshold"
+							: undefined;
+				if (gateError) {
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: gateError,
+					});
+					this.#backOffCompaction(state, item, gateError);
+					await this.#finishTurn(state, turn, "error");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+
+				const conversation = state.stored.records.filter(
+					(record): record is ConversationRecord => record.type === "conversation",
+				);
+				const firstKept = conversation.at(-outcome.keptCount);
+				if (!firstKept) {
+					await this.#recordHarnessEvent(state, {
+						actor: "process",
+						...scope,
+						type: "error",
+						message: "Compaction kept messages that do not map to the transcript",
+					});
+					await this.#finishTurn(state, turn, "error");
+					state.activeTurn = undefined;
+					await this.#advanceQueue(state, item.id);
+					return;
+				}
+				await this.#appendAndPublish(state, [
+					{
+						type: "compaction",
+						turnId: item.turnId,
+						summary: outcome.summary,
+						firstKeptEntryId: firstKept.id,
+						tokensBefore: outcome.tokensBefore,
+						tokensAfter: outcome.tokensAfter,
+						budgetChars: outcome.budgetChars,
+						reasoningEffort: outcome.reasoningEffort,
+					},
+					{
+						type: "event",
+						event: {
+							actor: "process",
+							...scope,
+							type: "compacted",
+							summary: outcome.summary,
+							tokensBefore: outcome.tokensBefore,
+							tokensAfter: outcome.tokensAfter,
+							firstKeptEntryId: firstKept.id,
+						},
+					},
+				]);
+				state.harness = this.#harnessFactory(
+					{ messages: outcome.messages, identity: state.identity },
+					state.stored.session.cwd,
+				);
+				state.persistedMessageCount = outcome.messages.length;
+				state.compactionBackoffTokens = undefined;
+				state.compactionFailure = undefined;
+				await this.#finishTurn(state, turn);
+				state.activeTurn = undefined;
+				await this.#advanceQueue(state, item.id);
+			});
+		} finally {
+			turn.done.resolve();
+		}
+	}
+
+	async #completeTurn(state: SessionState, turn: ActiveTurn, failureReason?: "aborted" | "error"): Promise<void> {
+		await this.#withQueueLock(state, async () => {
+			if (state.activeTurn !== turn || turn.terminal) return;
+			const aborted = turn.cancellationRequested || turn.controller.signal.aborted;
+			const finalFailure = aborted ? "aborted" : failureReason;
+			if (aborted && failureReason !== "aborted") {
+				await this.#recordHarnessEvent(state, {
+					actor: "process",
+					sessionId: state.stored.session.id,
+					turnId: turn.item.turnId,
+					type: "aborted",
+				});
+			}
+			await this.#finishTurn(state, turn, finalFailure);
+			state.activeTurn = undefined;
+			await this.#advanceQueue(state, turn.item.id);
+		});
+	}
+
+	async #finishTurn(state: SessionState, turn: ActiveTurn, failureReason?: "aborted" | "error"): Promise<void> {
+		const scope = { sessionId: state.stored.session.id, turnId: turn.item.turnId };
+		const promptIncomplete = turn.item.kind === "prompt" && (!turn.delivered || state.active !== undefined);
+		const reason = failureReason ?? (promptIncomplete ? "error" : "completed");
+		if (!failureReason && reason === "error") {
+			await this.#recordHarnessEvent(state, {
+				actor: "process",
+				...scope,
+				type: "error",
+				message: "The turn ended before all submitted input and model output became terminal",
+			});
+		}
+		if (turn.item.kind === "prompt" && !turn.delivered) {
+			const undeliveredReason = reason === "completed" ? "error" : reason;
+			await this.#recordHarnessEvent(state, {
+				actor: "process",
+				...scope,
+				type: "message_undelivered",
+				messageId: turn.item.messageId,
+				text: turn.item.text,
+				reason: undeliveredReason,
+			});
+		}
+		await this.#appendAndPublish(state, [
+			{ type: "event", event: { actor: "process", ...scope, type: "turn_terminal", reason } },
+			{ type: "event", event: { actor: "process", ...scope, type: "end" } },
+		]);
+		turn.terminal = true;
+	}
+
+	async #recordHarnessEvent(state: SessionState, event: Protocol.TurnEvent): Promise<void> {
+		if (event.type === "message_delta" || event.type === "reasoning_delta") {
+			this.#publishEvent(state, event);
+			return;
+		}
+		const snapshot = state.harness.snapshot();
+		const payloads: Payload[] = [{ type: "event", event }];
+		const identityChanged = snapshot.identity && !sameIdentity(snapshot.identity, state.identity);
+		if (identityChanged && snapshot.identity) payloads.push({ type: "identity", identity: snapshot.identity });
+		const addedMessages = snapshot.messages.slice(state.persistedMessageCount);
+		const entries: Array<Extract<Payload, { type: "conversation" }>> = [];
+		let parent = state.lastConversationEntryId;
+		for (const message of addedMessages) {
+			const entryId = randomUUID();
+			entries.push({
+				type: "conversation",
+				id: entryId,
+				parentId: parent,
+				turnId: event.turnId,
+				messageId:
+					message.role === "user" && event.type === "message_delivered"
+						? event.messageId
+						: message.role === "assistant" && event.type === "assistant_message_completed"
+							? event.messageId
+							: undefined,
+				message,
+			});
+			parent = entryId;
+		}
+		payloads.push(...entries);
+		const assistant = assistantTerminalPayload(state, event);
+		if (assistant) payloads.push(assistant);
+		await this.#appendAndPublish(state, payloads);
+		state.persistedMessageCount = snapshot.messages.length;
+		state.lastConversationEntryId = parent;
+		if (snapshot.identity) state.identity = snapshot.identity;
+	}
+
+	async #appendAndPublish(state: SessionState, payloads: Payload[]): Promise<void> {
+		const records = await state.stored.log.append(payloads);
+		state.stored.records.push(...records);
+		const updatedAt = records.at(-1)?.at;
+		if (updatedAt) state.stored.session.updatedAt = updatedAt;
+		if (updatedAt) {
+			this.#onSessionChange({
+				sessionId: state.stored.session.id,
+				updatedAt,
+				status: state.queue.running || state.queue.waiting.length > 0 ? "busy" : "idle",
+			});
+		}
+		for (const record of records) {
+			if (record.type === "assistant") {
+				state.messages.push({ ...record.message });
+				if (state.active?.id === record.message.id) state.active = undefined;
+			}
+			if (record.type !== "event") continue;
+			this.#publishEvent(state, record.event);
+		}
+	}
+
+	#publishEvent(state: SessionState, event: Protocol.Event): void {
+		this.#applyEvent(state, event);
+		const envelope: Protocol.EventEnvelope = {
+			epoch: state.epoch,
+			sequence: ++state.sequence,
+			event,
+		};
+		state.tail.push(envelope);
+		if (state.tail.length > this.#eventTailSize) state.tail.shift();
+		for (const listener of state.subscribers) listener(envelope);
+	}
+
+	#applyEvent(state: SessionState, event: Protocol.Event): void {
+		if (event.type === "message_delta") {
+			const active = state.active?.id === event.messageId ? state.active : undefined;
+			if (!active) {
+				state.active = { id: event.messageId, turnId: event.turnId, text: event.text };
+				return;
+			}
+			if (event.offset !== active.text.length) throw new Error(`Non-contiguous assistant message ${event.messageId}`);
+			active.text += event.text;
+		}
+		if (event.type === "usage") {
+			state.model = Llm.getModel(event.provider, event.model);
+			state.cumulativeUsage = addUsage(state.cumulativeUsage, event.usage);
+			const compactionPending = [state.queue.running, ...state.queue.waiting].some(
+				(item) => item?.kind === "compaction",
+			);
+			if (!compactionPending) state.compactionAttempted = false;
+		}
+		if (event.type === "turn_terminal") state.turns.set(event.turnId, event.reason);
+	}
+
+	#queueChangedPayload(state: SessionState): Extract<Payload, { type: "event" }> {
+		return {
+			type: "event",
+			event: {
+				actor: "process",
+				sessionId: state.stored.session.id,
+				type: "queue_changed",
+				queue: cloneQueue(state.queue),
+			},
+		};
+	}
+
+	// Runs only during restart recovery, never while the daemon is live: waiting work older
+	// than the recovery window is dropped as expired instead of auto-running unattended.
+	async #drainExpiredWaiting(state: SessionState): Promise<void> {
+		if (state.queue.waiting.length === 0) return;
+		const now = Date.now();
+		const windowMs = this.#recoveryWindowMinutes * 60_000;
+		const isFresh = (item: Protocol.QueueItem) =>
+			this.#recoveryWindowMinutes > 0 && now - Date.parse(item.submittedAt) <= windowMs;
+		const expired = state.queue.waiting.filter((item) => !isFresh(item));
+		if (expired.length === 0) return;
+		state.queue.waiting = state.queue.waiting.filter(isFresh);
+		state.queue.revision++;
+		const payloads: Payload[] = expired.flatMap((item): Payload[] => {
+			const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
+			const terminal: Payload[] = [];
+			if (item.kind === "prompt") {
+				terminal.push({
+					type: "event",
+					event: {
+						actor: "process",
+						...scope,
+						type: "message_undelivered",
+						messageId: item.messageId,
+						text: item.text,
+						reason: "expired",
+					},
+				});
+			}
+			terminal.push(
+				{ type: "event", event: { actor: "process", ...scope, type: "turn_terminal", reason: "expired" } },
+				{ type: "event", event: { actor: "process", ...scope, type: "end" } },
+			);
+			return terminal;
+		});
+		payloads.push(this.#queueChangedPayload(state));
+		await this.#appendAndPublish(state, payloads);
+	}
+
+	async #recoverRunning(state: SessionState, item: Protocol.QueueItem): Promise<void> {
+		const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
+		const cancellation = item.state === "cancelling";
+		if (state.turns.has(item.turnId)) {
+			const hasEnd = state.stored.records.some(
+				(record) => record.type === "event" && record.event.type === "end" && record.event.turnId === item.turnId,
+			);
+			if (!hasEnd) {
+				await this.#appendAndPublish(state, [{ type: "event", event: { actor: "process", ...scope, type: "end" } }]);
+			}
+			await this.#advanceQueue(state, item.id);
+			return;
+		}
+		if (item.kind === "compaction") {
+			const compacted = state.stored.records.some(
+				(record) => record.type === "compaction" && record.turnId === item.turnId,
+			);
+			const reason = compacted ? "completed" : cancellation ? "aborted" : "interrupted";
+			const payloads: Payload[] = [];
+			if (!compacted) {
+				payloads.push({
+					type: "event",
+					event: {
+						actor: "process",
+						...scope,
+						type: cancellation ? "aborted" : "interrupted",
+					},
+				});
+			}
+			payloads.push(
+				{ type: "event", event: { actor: "process", ...scope, type: "turn_terminal", reason } },
+				{ type: "event", event: { actor: "process", ...scope, type: "end" } },
+			);
+			await this.#appendAndPublish(state, payloads);
+			await this.#advanceQueue(state, item.id);
+			return;
+		}
+		const submitted = state.stored.records
+			.filter((record): record is EventRecord => record.type === "event")
+			.map((record) => record.event)
+			.filter(
+				(event): event is Protocol.MessageSubmittedEvent =>
+					event.type === "message_submitted" && event.turnId === item.turnId,
+			);
+		const delivered = new Set(
+			state.stored.records
+				.filter((record): record is EventRecord => record.type === "event")
+				.map((record) => record.event)
+				.flatMap((event) =>
+					event.type === "message_delivered" && event.turnId === item.turnId ? [event.messageId] : [],
+				),
+		);
+		const settled = new Set(
+			state.stored.records
+				.filter((record): record is EventRecord => record.type === "event")
+				.map((record) => record.event)
+				.flatMap((event) =>
+					event.type === "message_delivered" || event.type === "message_undelivered" ? [event.messageId] : [],
+				),
+		);
+		const history = state.harness.snapshot();
+		const toolResults = new Set(
+			history.messages.flatMap((message) => (message.role === "tool" ? [message.toolCallId] : [])),
+		);
+		const outstanding = history.messages.findLast((message) => message.role === "assistant")?.toolCalls ?? [];
+		const repairs = outstanding.filter((call) => !toolResults.has(call.callId));
+		const repairedMessages: Engine.HarnessState["messages"] = repairs.map((call) => ({
+			role: "tool",
+			toolCallId: call.callId,
+			content: "Tool result unavailable because the daemon stopped during the turn.",
+		}));
+		if (delivered.size > 0 || repairs.length > 0) {
+			repairedMessages.push({
+				role: "developer",
+				content: cancellation ? CANCELLED_DURING_RESTART_HISTORY_MARKER : INTERRUPTED_HISTORY_MARKER,
+			});
+		}
+
+		const payloads: Payload[] = [];
+		let parent = state.lastConversationEntryId;
+		for (const [index, message] of repairedMessages.entries()) {
+			const entryId = randomUUID();
+			payloads.push({
+				type: "conversation",
+				id: entryId,
+				parentId: parent,
+				turnId: item.turnId,
+				message,
+			});
+			parent = entryId;
+			const call = repairs[index];
+			if (call) {
+				payloads.push({
+					type: "event",
+					event: {
+						actor: "process",
+						modelRole: "tool",
+						...scope,
+						type: "tool_result",
+						id: call.callId,
+						name: call.name,
+						status: "error",
+						output: "Tool result unavailable because the daemon stopped during the turn.",
+					},
+				});
+			}
+		}
+		for (const event of submitted) {
+			if (settled.has(event.messageId)) continue;
+			payloads.push({
+				type: "event",
+				event: {
+					actor: "process",
+					...scope,
+					type: "message_undelivered",
+					messageId: event.messageId,
+					text: event.text,
+					reason: cancellation ? "aborted" : "interrupted",
+				},
+			});
+		}
+		payloads.push(
+			{
+				type: "event",
+				event: { actor: "process", ...scope, type: cancellation ? "aborted" : "interrupted" },
+			},
+			{
+				type: "event",
+				event: {
+					actor: "process",
+					...scope,
+					type: "turn_terminal",
+					reason: cancellation ? "aborted" : "interrupted",
+				},
+			},
+			{ type: "event", event: { actor: "process", ...scope, type: "end" } },
+		);
+		await this.#appendAndPublish(state, payloads);
+		state.lastConversationEntryId = parent;
+		const nextHistory = [...history.messages, ...repairedMessages];
+		state.harness = this.#harnessFactory(
+			{ messages: nextHistory, identity: history.identity },
+			state.stored.session.cwd,
+		);
+		state.persistedMessageCount = nextHistory.length;
+		await this.#advanceQueue(state, item.id);
+	}
+
+	async #advanceQueue(state: SessionState, finishedItemId: Protocol.QueueItemId): Promise<void> {
+		if (state.queue.running?.id !== finishedItemId) return;
+		state.queue.running = undefined;
+		await this.#maybePrune(state);
+		const compaction = this.#maybeCompactionItem(state);
+		const next = compaction ? undefined : this.#stopping ? undefined : state.queue.waiting.shift();
+		const item = compaction ?? (next ? state.items.get(next.id) : undefined);
+		if (next && !item) throw new Error(`Queue item ${next.id} has no submission event`);
+		const running = item ? { ...item, state: "running" as const } : undefined;
+		if (running) state.items.set(running.id, running);
+		state.queue.running = running;
+		state.queue.revision++;
+		const payloads: Payload[] = [];
+		if (compaction) payloads.push(this.#compactionSubmittedPayload(state, compaction, "process"));
+		payloads.push(this.#queueChangedPayload(state));
+		await this.#appendAndPublish(state, payloads);
+		if (running) this.#start(running, state);
+	}
+
+	async #startNext(state: SessionState): Promise<void> {
+		if (this.#stopping || state.queue.running) return;
+		await this.#maybePrune(state);
+		const compaction = this.#maybeCompactionItem(state);
+		const next = compaction ? undefined : state.queue.waiting.shift();
+		const item = compaction ?? (next ? state.items.get(next.id) : undefined);
+		if (!item) {
+			if (next) throw new Error(`Queue item ${next.id} has no submission event`);
+			return;
+		}
+		const running = { ...item, state: "running" as const };
+		state.items.set(running.id, running);
+		state.queue.running = running;
+		state.queue.revision++;
+		const payloads: Payload[] = [];
+		if (compaction) payloads.push(this.#compactionSubmittedPayload(state, compaction, "process"));
+		payloads.push(this.#queueChangedPayload(state));
+		await this.#appendAndPublish(state, payloads);
+		this.#start(running, state);
+	}
+
+	async #maybePrune(state: SessionState): Promise<void> {
+		const contextWindow = state.model?.contextWindow;
+		if (this.#stopping || !this.#compaction.prune || contextWindow === undefined || state.activeTurn) return;
+		const snapshot = state.harness.snapshot();
+		if (snapshot.messages.length !== state.persistedMessageCount) return;
+		const trigger = contextWindow - this.#compaction.reserveTokens;
+		if (trigger <= 0) return;
+		if (Engine.estimateContextTokens(snapshot.messages) <= trigger) return;
+		const outcome = Engine.pruneToolOutputs(snapshot.messages);
+		if (!outcome) return;
+
+		const replacement = this.#harnessFactory(
+			{ messages: outcome.messages, identity: state.identity },
+			state.stored.session.cwd,
+		);
+		state.queue.revision++;
+		await this.#appendAndPublish(state, [
+			{
+				type: "prune",
+				toolCallIds: outcome.toolCallIds,
+				tokensBefore: outcome.tokensBefore,
+				tokensAfter: outcome.tokensAfter,
+			},
+			{
+				type: "event",
+				event: {
+					actor: "process",
+					sessionId: state.stored.session.id,
+					type: "pruned",
+					toolCallIds: outcome.toolCallIds,
+					tokensBefore: outcome.tokensBefore,
+					tokensAfter: outcome.tokensAfter,
+				},
+			},
+			this.#queueChangedPayload(state),
+		]);
+		state.harness = replacement;
+		state.persistedMessageCount = outcome.messages.length;
+	}
+
+	#maybeCompactionItem(
+		state: SessionState,
+	): (Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus }) | undefined {
+		if (
+			this.#stopping ||
+			!this.#compaction.enabled ||
+			state.compactionAttempted ||
+			[state.queue.running, ...state.queue.waiting].some((item) => item?.kind === "compaction")
+		) {
+			return undefined;
+		}
+		const contextWindow = state.model?.contextWindow;
+		if (contextWindow === undefined) return undefined;
+		const trigger = contextWindow - this.#compaction.reserveTokens;
+		if (trigger <= 0) return undefined;
+		const estimate = Engine.estimateContextTokens(state.harness.snapshot().messages);
+		if (estimate <= trigger) return undefined;
+		const mark = state.compactionBackoffTokens;
+		if (mark !== undefined && estimate <= mark + Math.max(1, Math.floor((contextWindow - mark) / 2))) {
+			return undefined;
+		}
+		return this.#createCompactionItem(state, "auto");
+	}
+
+	// A compaction that failed for a reason the conversation controls repeats identically, so the next
+	// automatic attempt waits until the context has grown halfway to the window. Transient provider
+	// failures skip this and retry on the next turn, paced by compactionAttempted alone.
+	#backOffCompaction(state: SessionState, item: Protocol.CompactionQueueItem, message?: string): void {
+		if (item.source !== "auto") return;
+		state.compactionBackoffTokens = Engine.estimateContextTokens(state.harness.snapshot().messages);
+		if (message !== undefined) state.compactionFailure = { turnId: item.turnId, message };
+	}
+
+	#createCompactionItem(
+		state: SessionState,
+		source: Protocol.CompactionSource,
+		instructions?: string,
+	): Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus } {
+		const status: Protocol.AdmissionStatus = state.queue.running || this.#stopping ? "waiting" : "running";
+		const item: Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus } = {
+			id: randomUUID(),
+			turnId: randomUUID(),
+			kind: "compaction",
+			source,
+			...(instructions === undefined ? {} : { instructions }),
+			state: status,
+			submittedAt: new Date().toISOString(),
+		};
+		state.compactionAttempted = true;
+		state.items.set(item.id, item);
+		if (status === "running") state.queue.running = item;
+		if (status === "waiting") state.queue.waiting.push(item);
+		return item;
+	}
+
+	#compactionSubmittedPayload(
+		state: SessionState,
+		item: Protocol.CompactionQueueItem & { state: Protocol.AdmissionStatus },
+		actor: "human" | "process",
+	): Extract<Payload, { type: "event" }> {
+		return {
+			type: "event",
+			event: {
+				actor,
+				sessionId: state.stored.session.id,
+				turnId: item.turnId,
+				type: "compaction_submitted",
+				queueItemId: item.id,
+				source: item.source,
+				...(item.instructions === undefined ? {} : { instructions: item.instructions }),
+				admission: item.state,
+			},
+		};
+	}
+
+	#withQueueLock<T>(state: SessionState, operation: () => Promise<T>): Promise<T> {
+		const running = state.queueLock.then(operation, operation);
+		state.queueLock = running.then(
+			() => undefined,
+			() => undefined,
+		);
+		return running;
+	}
+}
+
+interface ProjectedMessage {
+	message: Llm.Message;
+	entryId?: string;
+}
+
+// Applies context mutations in log order. Compaction slices the current projection so an earlier
+// prune stays applied when its tool result falls inside the kept tail.
+function projectMessages(records: readonly StoredRecord[]): Llm.Message[] {
+	let projected: ProjectedMessage[] = [];
+	for (const record of records) {
+		if (record.type === "conversation") {
+			projected.push({ message: structuredClone(record.message), entryId: record.id });
+			continue;
+		}
+		if (record.type === "prune") {
+			const messages = Engine.applyPrune(
+				projected.map((entry) => entry.message),
+				record.toolCallIds,
+			);
+			projected = projected.map((entry, index) => ({ ...entry, message: messages[index] }));
+			continue;
+		}
+		if (record.type !== "compaction") continue;
+		const firstKeptIndex = projected.findIndex((entry) => entry.entryId === record.firstKeptEntryId);
+		if (firstKeptIndex === -1) {
+			throw new Error(`Compaction ${record.recordId} refers to missing conversation entry ${record.firstKeptEntryId}`);
+		}
+		projected = [
+			{ message: Engine.compactionSummaryMessage(record.summary) },
+			...projected
+				.slice(firstKeptIndex)
+				.map((entry) => ({ ...entry, message: Engine.stripAssistantMetadata(entry.message) })),
+		];
+	}
+	return projected.map((entry) => entry.message);
+}
+
+function assistantTerminalPayload(
+	state: SessionState,
+	event: Protocol.TurnEvent,
+): Extract<Payload, { type: "assistant" }> | undefined {
+	if (!state.active || state.active.turnId !== event.turnId) return undefined;
+	if (event.type === "assistant_message_completed" && event.messageId === state.active.id) {
+		return { type: "assistant", message: { ...state.active, reason: event.reason } };
+	}
+	if (event.type === "error") return { type: "assistant", message: { ...state.active, reason: "error" } };
+	if (event.type === "aborted") return { type: "assistant", message: { ...state.active, reason: "aborted" } };
+	return undefined;
+}
+
+function toConversationEntry(record: ConversationRecord): Protocol.ConversationEntry {
+	const base = {
+		id: record.id,
+		parentId: record.parentId,
+		turnId: record.turnId,
+		messageId: record.messageId,
 	};
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-	writeFileSync(path, `${JSON.stringify(identity)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-	chmodSync(path, 0o600);
-	return identity;
+	if (record.message.role === "user" || record.message.role === "developer") {
+		return { ...base, role: record.message.role, content: record.message.content };
+	}
+	if (record.message.role === "tool") {
+		return {
+			...base,
+			role: "tool",
+			toolCallId: record.message.toolCallId,
+			content: record.message.content,
+		};
+	}
+	return {
+		...base,
+		role: "assistant",
+		content: record.message.content,
+		...(record.message.reasoningSummary === undefined ? {} : { reasoningSummary: record.message.reasoningSummary }),
+		toolCalls: (record.message.toolCalls ?? []).map((call) => ({
+			id: call.callId,
+			name: call.name,
+			arguments: call.arguments,
+		})),
+	};
 }
 
-export function defaultNodePath(): string {
-	return process.env.KER_NODE_PATH ?? join(homedir(), ".ker", "node.json");
+function toCompactionEntry(record: CompactionRecord): Protocol.ConversationEntry {
+	return {
+		id: record.recordId,
+		parentId: null,
+		turnId: record.turnId,
+		role: "compaction",
+		summary: record.summary,
+		tokensBefore: record.tokensBefore,
+		tokensAfter: record.tokensAfter,
+		firstKeptEntryId: record.firstKeptEntryId,
+	};
 }
 
-function parseNodeIdentity(contents: string, path: string): NodeIdentity {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(contents) as unknown;
-	} catch {
-		throw new Error(`Invalid node identity in ${path}`);
-	}
-	if (
-		typeof parsed !== "object" ||
-		parsed === null ||
-		Array.isArray(parsed) ||
-		!("id" in parsed) ||
-		typeof parsed.id !== "string" ||
-		parsed.id.length === 0 ||
-		!("name" in parsed) ||
-		typeof parsed.name !== "string" ||
-		parsed.name.length === 0 ||
-		!("createdAt" in parsed) ||
-		typeof parsed.createdAt !== "string" ||
-		Number.isNaN(Date.parse(parsed.createdAt))
-	) {
-		throw new Error(`Invalid node identity in ${path}`);
-	}
-	return { id: parsed.id, name: parsed.name, createdAt: parsed.createdAt };
+// Compares only model-visible definition fields so record ids and timestamps cannot cause a mismatch.
+function definitionKey(definition: Definition): string {
+	return JSON.stringify([
+		definition.systemPrompt,
+		definition.tools.map((tool) => [tool.name, tool.description, tool.parameters]),
+		definition.compaction.systemPrompt,
+		definition.compaction.initialInstructions,
+		definition.compaction.updateInstructions,
+	]);
+}
+
+export function createConfiguredHarness(state: Engine.HarnessState, cwd: string, config: Config.Config): Harness {
+	const definition = Agent.createDefinition(cwd);
+	return Engine.createHarness(
+		{
+			model: config.model,
+			getAuth: (signal) => Auth.resolveAuth(config.apiKey, signal),
+			tools: definition.tools,
+			systemPrompt: definition.systemPrompt,
+			compaction: definition.compaction,
+			reasoningEffort: config.reasoningEffort,
+		},
+		undefined,
+		state,
+	);
+}
+
+async function observeGitRemote(root: string): Promise<string | null> {
+	return new Promise((resolve) => {
+		execFile(
+			"git",
+			["-C", root, "config", "--local", "--get", "remote.origin.url"],
+			{ encoding: "utf8" },
+			(error, stdout) => {
+				if (error) {
+					resolve(null);
+					return;
+				}
+				const remote = stdout.trim();
+				resolve(remote || null);
+			},
+		);
+	});
+}
+
+function normalizeQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {
+	return {
+		revision: queue.revision,
+		running: queue.running ? normalizeQueueItem(queue.running) : undefined,
+		waiting: queue.waiting.map(normalizeQueueItem),
+	};
+}
+
+function normalizeQueueItem(item: Protocol.QueueItem): Protocol.QueueItem {
+	if (item.kind === "prompt" || item.kind === "compaction") return { ...item };
+	const legacy = item as Omit<Protocol.PromptQueueItem, "kind">;
+	return { ...legacy, kind: "prompt" };
+}
+
+function cloneQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {
+	return {
+		revision: queue.revision,
+		running: queue.running ? { ...queue.running } : undefined,
+		waiting: queue.waiting.map((item) => ({ ...item })),
+	};
+}
+
+function addUsage(left: Protocol.Usage, right: Protocol.Usage): Protocol.Usage {
+	const reasoning =
+		left.reasoning === undefined && right.reasoning === undefined
+			? undefined
+			: (left.reasoning ?? 0) + (right.reasoning ?? 0);
+	return {
+		input: left.input + right.input,
+		output: left.output + right.output,
+		cacheRead: left.cacheRead + right.cacheRead,
+		cacheWrite: left.cacheWrite + right.cacheWrite,
+		...(reasoning === undefined ? {} : { reasoning }),
+		total: left.total + right.total,
+	};
+}
+
+function sameIdentity(left: Protocol.Identity, right?: Protocol.Identity): boolean {
+	if (!right || left.kind !== right.kind) return false;
+	if (left.kind === "oauth" && right.kind === "oauth") return left.accountId === right.accountId;
+	return true;
 }

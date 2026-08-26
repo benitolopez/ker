@@ -6,9 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import type * as Protocol from "@ker-ai/protocol";
 import { and, asc, eq, getTableColumns, isNull, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-sqlite";
-import type { NodeIdentity } from "./node.ts";
+import type { NodeIdentity } from "./identity.ts";
 import { CATALOG_VERSION, DDL, MIGRATIONS, node, project, session, workspace } from "./schema.ts";
-import { type CatalogedSession, projectKey } from "./store.ts";
+import { projectKey } from "./store.ts";
 
 const SQLITE_CORRUPT = 11;
 const SQLITE_NOTADB = 26;
@@ -39,7 +39,7 @@ export interface WorkspaceBinding {
 }
 
 type CatalogScan = {
-	sessions: CatalogedSession[];
+	sessions: Array<{ session: Protocol.SessionDescriptor; projectKey: string; idle: boolean }>;
 	unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }>;
 };
 
