@@ -1,5 +1,5 @@
 {
-  "name": "@ker-ai/protocol",
+  "name": "@ker-ai/client",
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
@@ -12,25 +12,17 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./openapi": {
-      "types": "./dist/openapi.d.ts",
-      "import": "./dist/openapi.js"
-    },
-    "./routes": {
-      "types": "./dist/routes.d.ts",
-      "import": "./dist/routes.js"
+    "./sse": {
+      "types": "./dist/sse.d.ts",
+      "import": "./dist/sse.js"
     }
   },
-  "engines": {
-    "node": ">=24.0.0"
-  },
+  "engines": { "node": ">=24.0.0" },
+  "dependencies": { "@ker-ai/protocol": "^0.0.0" },
+  "devDependencies": { "@ker-ai/daemon": "^0.0.0" },
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
     "clean": "shx rm -rf dist",
-    "generate": "node scripts/generate.ts",
     "test": "node --test test/*.test.ts"
-  },
-  "dependencies": {
-    "@sinclair/typebox": "0.34.41"
   }
 }

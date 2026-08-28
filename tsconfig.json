@@ -4,6 +4,8 @@
     "noEmit": true,
     "paths": {
       "@ker-ai/protocol": ["./packages/protocol/src/index.ts"],
+      "@ker-ai/protocol/openapi": ["./packages/protocol/src/openapi.ts"],
+      "@ker-ai/protocol/routes": ["./packages/protocol/src/routes.ts"],
       "@ker-ai/protocol/*": ["./packages/protocol/src/*"],
       "@ker-ai/config": ["./packages/config/src/index.ts"],
       "@ker-ai/config/*": ["./packages/config/src/*"],
@@ -15,6 +17,9 @@
       "@ker-ai/engine/*": ["./packages/engine/src/*"],
       "@ker-ai/agent": ["./packages/agent/src/index.ts"],
       "@ker-ai/agent/*": ["./packages/agent/src/*"],
+      "@ker-ai/client": ["./packages/client/src/index.ts"],
+      "@ker-ai/client/sse": ["./packages/client/src/sse.ts"],
+      "@ker-ai/client/*": ["./packages/client/src/*"],
       "@ker-ai/daemon": ["./packages/daemon/src/index.ts"],
       "@ker-ai/daemon/*": ["./packages/daemon/src/*"],
       "@ker-ai/cli": ["./packages/cli/src/index.ts"],

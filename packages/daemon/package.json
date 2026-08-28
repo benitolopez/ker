@@ -23,6 +23,7 @@
     "@ker-ai/engine": "^0.0.0",
     "@ker-ai/llm": "^0.0.0",
     "@ker-ai/protocol": "^0.0.0",
+    "@sinclair/typebox": "0.34.41",
     "drizzle-orm": "1.0.0-rc.4"
   },
   "scripts": {

@@ -1,12 +1,12 @@
 import { setTimeout as sleep } from "node:timers/promises";
+import { createClient, type Result, type Subscription } from "@ker-ai/client";
 import * as Daemon from "@ker-ai/daemon";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
 import { identityChangeRemediation } from "./error.ts";
 import { runLogin, runLogout } from "./login.ts";
-import { sseData } from "./sse.ts";
 
-const BASE = `http://127.0.0.1:${DEFAULT_PORT}`;
+const client = createClient();
 
 interface ResolvedPrompt {
 	json: boolean;
@@ -105,30 +105,24 @@ async function runNewSession(json: boolean): Promise<void> {
 
 async function createSession(): Promise<Protocol.SessionDescriptor | undefined> {
 	if (!(await checkHealth())) return;
-	const request: Protocol.CreateSessionRequest = { cwd: process.cwd() };
-	const res = await fetch(`${BASE}/sessions`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(request),
-	});
-	if (!res.ok) {
-		process.stderr.write(`ker: daemon could not create a session (HTTP ${res.status})\n`);
+	const result = await client.createSession(process.cwd());
+	if (!result.ok) {
+		process.stderr.write(`ker: daemon could not create a session (HTTP ${result.status})\n`);
 		process.exitCode = 1;
 		return;
 	}
-	return (await res.json()) as Protocol.SessionDescriptor;
+	return result.value;
 }
 
 async function runSessions(json: boolean, all: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
-	const query = all ? new URLSearchParams({ scope: "all" }) : new URLSearchParams({ cwd: process.cwd() });
-	const res = await fetch(`${BASE}/sessions?${query}`);
-	if (!res.ok) {
-		process.stderr.write(`ker: daemon could not list sessions (HTTP ${res.status})\n`);
+	const result = await client.listSessions(all ? { all: true } : { cwd: process.cwd() });
+	if (!result.ok) {
+		process.stderr.write(`ker: daemon could not list sessions (HTTP ${result.status})\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const body = (await res.json()) as Protocol.ListSessionsResponse;
+	const body = result.value;
 	if (json) {
 		process.stdout.write(`${JSON.stringify(body)}\n`);
 		return;
@@ -146,14 +140,13 @@ async function runSessions(json: boolean, all: boolean): Promise<void> {
 // The project-anchored listing is createdAt-ascending, so updatedAt ties choose the later-created session.
 async function resolveLatestSession(): Promise<Protocol.SessionId | undefined> {
 	if (!(await checkHealth())) return undefined;
-	const query = new URLSearchParams({ cwd: process.cwd() });
-	const res = await fetch(`${BASE}/sessions?${query}`);
-	if (!res.ok) {
-		process.stderr.write(`ker: daemon could not list sessions (HTTP ${res.status})\n`);
+	const result = await client.listSessions({ cwd: process.cwd() });
+	if (!result.ok) {
+		process.stderr.write(`ker: daemon could not list sessions (HTTP ${result.status})\n`);
 		process.exitCode = 1;
 		return undefined;
 	}
-	const body = (await res.json()) as Protocol.ListSessionsResponse;
+	const body = result.value;
 	const latest = body.sessions
 		.filter((session): session is Protocol.ReadableCatalogSession => session.status !== "unreadable")
 		.reduce<Protocol.ReadableCatalogSession | undefined>(
@@ -168,18 +161,18 @@ async function resolveLatestSession(): Promise<Protocol.SessionId | undefined> {
 
 async function runStats(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
-	const response = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`);
-	if (response.status === 404) {
+	const result = await client.snapshot(sessionId);
+	if (!result.ok && result.status === 404) {
 		process.stderr.write(`ker: session ${sessionId} was not found\n`);
 		process.exitCode = 1;
 		return;
 	}
-	if (!response.ok) {
-		process.stderr.write(`ker: session ${sessionId} is unreadable (HTTP ${response.status})\n`);
+	if (!result.ok) {
+		process.stderr.write(`ker: session ${sessionId} is unreadable (HTTP ${result.status})\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const snapshot = (await response.json()) as Protocol.SessionSnapshot;
+	const snapshot = result.value;
 	if (json) {
 		process.stdout.write(
 			`${JSON.stringify({
@@ -217,47 +210,46 @@ async function runStats(sessionId: Protocol.SessionId, json: boolean): Promise<v
 
 async function runCancel(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
 	if (!(await checkHealth())) return;
-	const snapshotResponse = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`);
-	if (snapshotResponse.status === 404) {
+	const snapshotResult = await client.snapshot(sessionId);
+	if (!snapshotResult.ok && snapshotResult.status === 404) {
 		process.stderr.write(`ker: session ${sessionId} was not found\n`);
 		process.exitCode = 1;
 		return;
 	}
-	if (!snapshotResponse.ok) {
-		process.stderr.write(`ker: session ${sessionId} is unreadable (HTTP ${snapshotResponse.status})\n`);
+	if (!snapshotResult.ok) {
+		process.stderr.write(`ker: session ${sessionId} is unreadable (HTTP ${snapshotResult.status})\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const snapshot = (await snapshotResponse.json()) as Protocol.SessionSnapshot;
+	const snapshot = snapshotResult.value;
 	const running = snapshot.queue.running;
 	if (!running) {
 		process.stderr.write(`ker: session ${sessionId} has no running turn to cancel\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const response = await cancelTurn(sessionId, running.turnId);
-	if (response.status === 409 || response.status === 404) {
+	const result = await cancelTurn(sessionId, running.turnId);
+	if (!result.ok && (result.status === 409 || result.status === 404)) {
 		process.stderr.write(`ker: turn ${running.turnId} is no longer cancellable\n`);
 		process.exitCode = 1;
 		return;
 	}
-	if (!response.ok) {
-		process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${response.status})\n`);
+	if (!result.ok) {
+		process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${result.status})\n`);
 		process.exitCode = 1;
 		return;
 	}
-	const result = (await response.json()) as Protocol.TurnCancellationResult;
 	if (json) {
-		process.stdout.write(`${JSON.stringify(result)}\n`);
+		process.stdout.write(`${JSON.stringify(result.value)}\n`);
 		return;
 	}
-	writeTurnStatus(result.status, result.turnId);
+	writeTurnStatus(result.value.status, result.value.turnId);
 }
 
 async function runCompact(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
 	const controller = new AbortController();
 	let accepted: Protocol.CompactionAdmission | undefined;
-	let cancelRequest: Promise<Response> | undefined;
+	let cancelRequest: Promise<Result<Protocol.TurnCancellationResult>> | undefined;
 	let interrupted = false;
 	const onSigint = () => {
 		if (interrupted) {
@@ -275,30 +267,26 @@ async function runCompact(sessionId: Protocol.SessionId, json: boolean): Promise
 		if (!initial) return;
 		let cursor = initial.cursor;
 		let events = await subscribe(sessionId, cursor, controller.signal);
-		if (events.status === 410) {
+		if (events.kind === "resync") {
 			const replacement = await fetchSnapshot(sessionId, controller.signal);
 			if (!replacement) return;
 			cursor = replacement.cursor;
 			events = await subscribe(sessionId, cursor, controller.signal);
 		}
-		if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
-		const response = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/compact`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({} satisfies Protocol.CompactRequest),
-		});
-		if (response.status !== 202) {
+		if (events.kind !== "stream") throw new Error(`event stream returned HTTP ${subscriptionStatus(events)}`);
+		const result = await client.compact(sessionId);
+		if (!result.ok) {
 			process.stderr.write(
-				response.status === 404
+				result.status === 404
 					? `ker: session ${sessionId} was not found\n`
-					: response.status === 500
-						? `ker: session ${sessionId} is unreadable (HTTP ${response.status})\n`
-						: `ker: daemon rejected compaction (HTTP ${response.status})\n`,
+					: result.status === 500
+						? `ker: session ${sessionId} is unreadable (HTTP ${result.status})\n`
+						: `ker: daemon rejected compaction (HTTP ${result.status})\n`,
 			);
 			process.exitCode = 1;
 			return;
 		}
-		accepted = (await response.json()) as Protocol.CompactionAdmission;
+		accepted = result.value;
 		if (json) process.stdout.write(`${JSON.stringify(accepted)}\n`);
 		if (accepted.status !== "running") {
 			process.stderr.write(`ker: ${accepted.status} (turn ${accepted.turnId})\n`);
@@ -333,11 +321,10 @@ async function runCompact(sessionId: Protocol.SessionId, json: boolean): Promise
 
 		while (!terminal && !controller.signal.aborted) {
 			try {
-				if (!events.body) throw new Error("event stream has no body");
-				for await (const data of sseData(events.body)) {
-					const envelope = JSON.parse(data) as Protocol.EventEnvelope;
+				if (events.kind !== "stream") throw new Error("event stream has no body");
+				for await (const envelope of events.envelopes) {
 					cursor = { epoch: envelope.epoch, sequence: envelope.sequence };
-					if (json) process.stdout.write(`${data}\n`);
+					if (json) process.stdout.write(`${JSON.stringify(envelope)}\n`);
 					if (!("turnId" in envelope.event) || envelope.event.turnId !== accepted.turnId) continue;
 					if (envelope.event.type === "compacted" && !outcomeShown && !json) {
 						writeCompacted(envelope.event.tokensBefore, envelope.event.tokensAfter);
@@ -366,8 +353,10 @@ async function runCompact(sessionId: Protocol.SessionId, json: boolean): Promise
 				applySnapshot(snapshot);
 				if (terminal) break;
 				events = await subscribe(sessionId, cursor, controller.signal);
-				if (events.status === 410) continue;
-				if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
+				if (events.kind === "resync") continue;
+				if (events.kind !== "stream") {
+					throw new Error(`event stream returned HTTP ${subscriptionStatus(events)}`);
+				}
 			} catch (error) {
 				if (controller.signal.aborted) break;
 				process.stderr.write(
@@ -397,9 +386,9 @@ async function runCompact(sessionId: Protocol.SessionId, json: boolean): Promise
 	} finally {
 		if (cancelRequest) {
 			try {
-				const response = await cancelRequest;
-				if (!response.ok && response.status !== 409) {
-					process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${response.status})\n`);
+				const result = await cancelRequest;
+				if (!result.ok && result.status !== 409) {
+					process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${result.status})\n`);
 				}
 			} catch (error) {
 				process.stderr.write(
@@ -421,7 +410,7 @@ function runDaemon(): void {
 		process.exitCode = 1;
 	});
 	server.listen(DEFAULT_PORT, "127.0.0.1", () => {
-		process.stderr.write(`ker daemon listening on ${BASE}\n`);
+		process.stderr.write(`ker daemon listening on http://127.0.0.1:${DEFAULT_PORT}\n`);
 	});
 	let shuttingDown = false;
 	const shutdown = () => {
@@ -454,7 +443,7 @@ async function runMonitor(sessionId: Protocol.SessionId, json: boolean): Promise
 		while (!controller.signal.aborted) {
 			try {
 				const events = await subscribe(sessionId, cursor, controller.signal);
-				if (events.status === 410) {
+				if (events.kind === "resync") {
 					const snapshot = await fetchSnapshot(sessionId, controller.signal);
 					if (!snapshot) return;
 					if (json) process.stdout.write(`${JSON.stringify(snapshot)}\n`);
@@ -465,11 +454,12 @@ async function runMonitor(sessionId: Protocol.SessionId, json: boolean): Promise
 					cursor = snapshot.cursor;
 					continue;
 				}
-				if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
-				for await (const data of sseData(events.body)) {
-					const envelope = JSON.parse(data) as Protocol.EventEnvelope;
+				if (events.kind !== "stream") {
+					throw new Error(`event stream returned HTTP ${subscriptionStatus(events)}`);
+				}
+				for await (const envelope of events.envelopes) {
 					cursor = { epoch: envelope.epoch, sequence: envelope.sequence };
-					if (json) process.stdout.write(`${data}\n`);
+					if (json) process.stdout.write(`${JSON.stringify(envelope)}\n`);
 					if (!json) renderer.event(envelope.event, () => true);
 					if (envelope.event.type === "queue_changed") {
 						const nextIdle = queueIsIdle(envelope.event.queue);
@@ -500,7 +490,7 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 	const controller = new AbortController();
 	const renderer = new Renderer();
 	let accepted: Protocol.PromptAdmission | undefined;
-	let cancelRequest: Promise<Response> | undefined;
+	let cancelRequest: Promise<Result<Protocol.TurnCancellationResult>> | undefined;
 	let interrupted = false;
 	const onSigint = () => {
 		if (interrupted) {
@@ -523,7 +513,7 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 		renderer.snapshot(initial, () => true, false, true);
 		let cursor = initial.cursor;
 		let events = await subscribe(prompt.sessionId, cursor, controller.signal);
-		if (events.status === 410) {
+		if (events.kind === "resync") {
 			const replacement = await fetchSnapshot(prompt.sessionId, controller.signal);
 			if (!replacement) return;
 			if (prompt.json) process.stdout.write(`${JSON.stringify(replacement)}\n`);
@@ -531,19 +521,10 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 			cursor = replacement.cursor;
 			events = await subscribe(prompt.sessionId, cursor, controller.signal);
 		}
-		if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
-		const submitted = await fetch(`${BASE}/sessions/${encodeURIComponent(prompt.sessionId)}/prompts`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				text: prompt.text,
-			}),
-		});
-		if (submitted.status !== 202) {
-			const exhausted =
-				submitted.status === 409 &&
-				((await submitted.json().catch(() => undefined)) as { code?: string } | undefined)?.code ===
-					"context_exhausted";
+		if (events.kind !== "stream") throw new Error(`event stream returned HTTP ${subscriptionStatus(events)}`);
+		const submitted = await client.prompt(prompt.sessionId, prompt.text);
+		if (!submitted.ok) {
+			const exhausted = submitted.status === 409 && submitted.error.code === "context_exhausted";
 			process.stderr.write(
 				exhausted
 					? "ker: this session's context is full and could not be compacted — start a new session with `ker new`, or try `ker compact`\n"
@@ -554,7 +535,7 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
-		accepted = (await submitted.json()) as Protocol.PromptAdmission;
+		accepted = submitted.value;
 		if (interrupted && !cancelRequest) {
 			cancelRequest = cancelTurn(accepted.sessionId, accepted.turnId);
 		}
@@ -567,11 +548,10 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 		let cancelled = false;
 		while (!terminal && !controller.signal.aborted) {
 			try {
-				if (!events.body) throw new Error("event stream has no body");
-				for await (const data of sseData(events.body)) {
-					const envelope = JSON.parse(data) as Protocol.EventEnvelope;
+				if (events.kind !== "stream") throw new Error("event stream has no body");
+				for await (const envelope of events.envelopes) {
 					cursor = { epoch: envelope.epoch, sequence: envelope.sequence };
-					if (prompt.json) process.stdout.write(`${data}\n`);
+					if (prompt.json) process.stdout.write(`${JSON.stringify(envelope)}\n`);
 					if (!prompt.json) renderer.event(envelope.event, matches);
 					if (!("turnId" in envelope.event) || !matches(envelope.event.turnId)) continue;
 					if (envelope.event.type === "turn_cancel_requested") cancelled = true;
@@ -602,8 +582,10 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 					break;
 				}
 				events = await subscribe(prompt.sessionId, cursor, controller.signal);
-				if (events.status === 410) continue;
-				if (!events.ok || !events.body) throw new Error(`event stream returned HTTP ${events.status}`);
+				if (events.kind === "resync") continue;
+				if (events.kind !== "stream") {
+					throw new Error(`event stream returned HTTP ${subscriptionStatus(events)}`);
+				}
 			} catch (error) {
 				if (controller.signal.aborted) break;
 				process.stderr.write(
@@ -637,12 +619,11 @@ async function runPrompt(prompt: ResolvedPrompt): Promise<void> {
 	} finally {
 		if (cancelRequest) {
 			try {
-				const response = await cancelRequest;
-				if (response.ok) {
-					const result = (await response.json()) as Protocol.TurnCancellationResult;
-					writeTurnStatus(result.status, result.turnId);
-				} else if (response.status !== 409) {
-					process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${response.status})\n`);
+				const result = await cancelRequest;
+				if (result.ok) {
+					writeTurnStatus(result.value.status, result.value.turnId);
+				} else if (result.status !== 409) {
+					process.stderr.write(`ker: daemon could not cancel the turn (HTTP ${result.status})\n`);
 				}
 			} catch (error) {
 				process.stderr.write(
@@ -915,15 +896,20 @@ async function subscribe(
 	sessionId: Protocol.SessionId,
 	cursor: Protocol.Cursor,
 	signal: AbortSignal,
-): Promise<Response> {
-	const query = new URLSearchParams({ epoch: cursor.epoch, sequence: String(cursor.sequence) });
-	return fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/events?${query}`, { signal });
+): Promise<Subscription> {
+	return client.subscribe(sessionId, cursor, signal);
 }
 
-function cancelTurn(sessionId: Protocol.SessionId, turnId: Protocol.TurnId): Promise<Response> {
-	return fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/cancel`, {
-		method: "POST",
-	});
+function cancelTurn(
+	sessionId: Protocol.SessionId,
+	turnId: Protocol.TurnId,
+): Promise<Result<Protocol.TurnCancellationResult>> {
+	return client.cancel(sessionId, turnId);
+}
+
+function subscriptionStatus(subscription: Exclude<Subscription, { kind: "stream" }>): number {
+	if (subscription.kind === "resync") return 410;
+	return subscription.status;
 }
 
 function writeTurnStatus(
@@ -937,24 +923,23 @@ async function fetchSnapshot(
 	sessionId: Protocol.SessionId,
 	signal?: AbortSignal,
 ): Promise<Protocol.SessionSnapshot | undefined> {
-	const res = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`, { signal });
-	if (res.status === 404) {
+	const result = await client.snapshot(sessionId, signal);
+	if (!result.ok && result.status === 404) {
 		process.stderr.write(`ker: session ${sessionId} was not found\n`);
 		process.exitCode = 1;
 		return undefined;
 	}
-	if (!res.ok) throw new Error(`snapshot returned HTTP ${res.status}`);
-	return (await res.json()) as Protocol.SessionSnapshot;
+	if (!result.ok) throw new Error(`snapshot returned HTTP ${result.status}`);
+	return result.value;
 }
 
 async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 	try {
-		const res = await fetch(`${BASE}/health`, { signal });
-		const health = (await res.json()) as { protocol?: string };
-		if (health.protocol === PROTOCOL_VERSION) return true;
+		const result = await client.health(signal);
+		if (result.ok && result.value.protocol === PROTOCOL_VERSION) return true;
 		if (signal?.aborted) return false;
 		process.stderr.write(
-			`ker: daemon speaks protocol ${health.protocol}, this client needs ${PROTOCOL_VERSION} — restart the daemon\n`,
+			`ker: daemon speaks protocol ${result.ok ? result.value.protocol : undefined}, this client needs ${PROTOCOL_VERSION} — restart the daemon\n`,
 		);
 	} catch (error) {
 		if (signal?.aborted) return false;

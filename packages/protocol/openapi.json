@@ -1,0 +1,3448 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ker",
+    "version": "19"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Inspect daemon health",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "internal",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "summary": "Read the API description",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "patternProperties": {
+                    "^(.*)$": {}
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "internal",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "post": {
+        "operationId": "createSession",
+        "summary": "Create a session",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDescriptor"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_cwd",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_json",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "payload_too_large",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "unsupported_media_type",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "internal",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "listSessions",
+        "summary": "List sessions",
+        "description": "Supply exactly one scope: cwd lists sessions in that project, while scope=all lists every local session.",
+        "parameters": [
+          {
+            "name": "cwd",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "const": "all",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSessionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_scope",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_cwd",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "internal",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}": {
+      "get": {
+        "operationId": "snapshot",
+        "summary": "Read a session snapshot",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSnapshot"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "session_not_found",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "session_unreadable",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "internal",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/events": {
+      "get": {
+        "operationId": "events",
+        "summary": "Subscribe to session events",
+        "description": "Streams Server-Sent Events after the supplied cursor. Each event uses id: epoch:sequence and a data line containing an EventEnvelope; comment frames are heartbeats. Reconnect with the last received cursor. A 410 response requires fetching a fresh snapshot and reconnecting from its cursor. Subscribe before admitting work to avoid missing an event between the snapshot and admission.",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "name": "epoch",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "name": "sequence",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "invalid_cursor",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "session_not_found",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "resync_required",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "session_unreadable",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "internal",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/prompts": {
+      "post": {
+        "operationId": "prompt",
+        "summary": "Submit a prompt",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromptAdmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_prompt",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_json",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "session_not_found",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "context_exhausted",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "payload_too_large",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "unsupported_media_type",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "session_unreadable",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "internal",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/compact": {
+      "post": {
+        "operationId": "compact",
+        "summary": "Compact a session",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompactRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompactionAdmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_compaction",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "invalid_json",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "session_not_found",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "payload_too_large",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "unsupported_media_type",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "session_unreadable",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "internal",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{sessionId}/turns/{turnId}/cancel": {
+      "post": {
+        "operationId": "cancel",
+        "summary": "Cancel a turn",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "name": "turnId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnCancellationResult"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnCancellationResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "forbidden",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "session_not_found",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "turn_unavailable",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "session_unreadable",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    },
+                    {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "internal",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Actor": {
+        "anyOf": [
+          {
+            "const": "human",
+            "type": "string"
+          },
+          {
+            "const": "agent",
+            "type": "string"
+          },
+          {
+            "const": "process",
+            "type": "string"
+          }
+        ]
+      },
+      "ModelRole": {
+        "anyOf": [
+          {
+            "const": "user",
+            "type": "string"
+          },
+          {
+            "const": "assistant",
+            "type": "string"
+          },
+          {
+            "const": "tool",
+            "type": "string"
+          }
+        ]
+      },
+      "AdmissionStatus": {
+        "anyOf": [
+          {
+            "const": "running",
+            "type": "string"
+          },
+          {
+            "const": "waiting",
+            "type": "string"
+          }
+        ]
+      },
+      "CancellationStatus": {
+        "anyOf": [
+          {
+            "const": "cancelling",
+            "type": "string"
+          },
+          {
+            "const": "cancelled",
+            "type": "string"
+          },
+          {
+            "const": "aborted",
+            "type": "string"
+          }
+        ]
+      },
+      "CompactionSource": {
+        "anyOf": [
+          {
+            "const": "auto",
+            "type": "string"
+          },
+          {
+            "const": "manual",
+            "type": "string"
+          }
+        ]
+      },
+      "TurnTerminalReason": {
+        "anyOf": [
+          {
+            "const": "completed",
+            "type": "string"
+          },
+          {
+            "const": "aborted",
+            "type": "string"
+          },
+          {
+            "const": "error",
+            "type": "string"
+          },
+          {
+            "const": "interrupted",
+            "type": "string"
+          },
+          {
+            "const": "cancelled",
+            "type": "string"
+          },
+          {
+            "const": "expired",
+            "type": "string"
+          }
+        ]
+      },
+      "AssistantTerminalReason": {
+        "anyOf": [
+          {
+            "const": "completed",
+            "type": "string"
+          },
+          {
+            "const": "length",
+            "type": "string"
+          },
+          {
+            "const": "aborted",
+            "type": "string"
+          },
+          {
+            "const": "error",
+            "type": "string"
+          }
+        ]
+      },
+      "Provider": {
+        "anyOf": [
+          {
+            "const": "openai",
+            "type": "string"
+          },
+          {
+            "const": "openai-codex",
+            "type": "string"
+          }
+        ]
+      },
+      "ReasoningEffort": {
+        "anyOf": [
+          {
+            "const": "none",
+            "type": "string"
+          },
+          {
+            "const": "minimal",
+            "type": "string"
+          },
+          {
+            "const": "low",
+            "type": "string"
+          },
+          {
+            "const": "medium",
+            "type": "string"
+          },
+          {
+            "const": "high",
+            "type": "string"
+          },
+          {
+            "const": "xhigh",
+            "type": "string"
+          }
+        ]
+      },
+      "Model": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          },
+          "id": {
+            "type": "string"
+          },
+          "contextWindow": {
+            "type": "number"
+          },
+          "maxOutputTokens": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "provider",
+          "id"
+        ]
+      },
+      "Usage": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "number"
+          },
+          "output": {
+            "type": "number"
+          },
+          "cacheRead": {
+            "type": "number"
+          },
+          "cacheWrite": {
+            "type": "number"
+          },
+          "reasoning": {
+            "type": "number"
+          },
+          "total": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "input",
+          "output",
+          "cacheRead",
+          "cacheWrite",
+          "total"
+        ]
+      },
+      "SessionUsage": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "contextTokens": {
+            "type": "number"
+          },
+          "cumulative": {
+            "$ref": "#/components/schemas/Usage"
+          }
+        },
+        "required": [
+          "contextTokens",
+          "cumulative"
+        ]
+      },
+      "SessionDescriptor": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "projectRoot": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "cwd",
+          "projectRoot",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "CreateSessionRequest": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cwd"
+        ]
+      },
+      "ReadableCatalogSession": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "status": {
+            "anyOf": [
+              {
+                "const": "idle",
+                "type": "string"
+              },
+              {
+                "const": "busy",
+                "type": "string"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "projectId": {
+            "type": "string"
+          },
+          "projectName": {
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          },
+          "nodeId": {
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "id",
+          "cwd",
+          "projectId",
+          "projectName",
+          "workspaceId",
+          "nodeId",
+          "title",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "UnreadableCatalogSession": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "status": {
+            "const": "unreadable",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "projectId": {
+            "type": "string"
+          },
+          "projectName": {
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          },
+          "nodeId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "id",
+          "error"
+        ]
+      },
+      "CatalogSession": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ReadableCatalogSession"
+          },
+          {
+            "$ref": "#/components/schemas/UnreadableCatalogSession"
+          }
+        ]
+      },
+      "ListSessionsResponse": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogSession"
+            }
+          }
+        },
+        "required": [
+          "sessions"
+        ]
+      },
+      "QueueItemBase": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "const": "running",
+                "type": "string"
+              },
+              {
+                "const": "cancelling",
+                "type": "string"
+              },
+              {
+                "const": "waiting",
+                "type": "string"
+              }
+            ]
+          },
+          "submittedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "turnId",
+          "state",
+          "submittedAt"
+        ]
+      },
+      "PromptQueueItem": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "const": "running",
+                "type": "string"
+              },
+              {
+                "const": "cancelling",
+                "type": "string"
+              },
+              {
+                "const": "waiting",
+                "type": "string"
+              }
+            ]
+          },
+          "submittedAt": {
+            "type": "string"
+          },
+          "kind": {
+            "const": "prompt",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "turnId",
+          "state",
+          "submittedAt",
+          "kind",
+          "messageId",
+          "text"
+        ]
+      },
+      "CompactionQueueItem": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "const": "running",
+                "type": "string"
+              },
+              {
+                "const": "cancelling",
+                "type": "string"
+              },
+              {
+                "const": "waiting",
+                "type": "string"
+              }
+            ]
+          },
+          "submittedAt": {
+            "type": "string"
+          },
+          "kind": {
+            "const": "compaction",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CompactionSource"
+          },
+          "instructions": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "turnId",
+          "state",
+          "submittedAt",
+          "kind",
+          "source"
+        ]
+      },
+      "QueueItem": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/PromptQueueItem"
+          },
+          {
+            "$ref": "#/components/schemas/CompactionQueueItem"
+          }
+        ]
+      },
+      "QueueSnapshot": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "revision": {
+            "type": "number"
+          },
+          "running": {
+            "$ref": "#/components/schemas/QueueItem"
+          },
+          "waiting": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueueItem"
+            }
+          }
+        },
+        "required": [
+          "revision",
+          "waiting"
+        ]
+      },
+      "Cursor": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "type": "string"
+          },
+          "sequence": {
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "epoch",
+          "sequence"
+        ]
+      },
+      "AssistantMessage": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/AssistantTerminalReason"
+          }
+        },
+        "required": [
+          "id",
+          "turnId",
+          "text",
+          "reason"
+        ]
+      },
+      "ActiveAssistantMessage": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "turnId",
+          "text"
+        ]
+      },
+      "TurnSnapshot": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "const": "running",
+                "type": "string"
+              },
+              {
+                "const": "cancelling",
+                "type": "string"
+              },
+              {
+                "const": "waiting",
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TurnTerminalReason"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ]
+      },
+      "ConversationEntry": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "parentId": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "turnId": {
+                "type": "string"
+              },
+              "messageId": {
+                "type": "string"
+              },
+              "role": {
+                "anyOf": [
+                  {
+                    "const": "user",
+                    "type": "string"
+                  },
+                  {
+                    "const": "developer",
+                    "type": "string"
+                  }
+                ]
+              },
+              "content": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "parentId",
+              "turnId",
+              "role",
+              "content"
+            ]
+          },
+          {
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "parentId": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "turnId": {
+                "type": "string"
+              },
+              "messageId": {
+                "type": "string"
+              },
+              "role": {
+                "const": "assistant",
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "reasoningSummary": {
+                "type": "string"
+              },
+              "toolCalls": {
+                "type": "array",
+                "items": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "arguments": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "arguments"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "id",
+              "parentId",
+              "turnId",
+              "role",
+              "content",
+              "toolCalls"
+            ]
+          },
+          {
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "parentId": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "turnId": {
+                "type": "string"
+              },
+              "messageId": {
+                "type": "string"
+              },
+              "role": {
+                "const": "tool",
+                "type": "string"
+              },
+              "toolCallId": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "parentId",
+              "turnId",
+              "role",
+              "toolCallId",
+              "content"
+            ]
+          },
+          {
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "parentId": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "turnId": {
+                "type": "string"
+              },
+              "messageId": {
+                "type": "string"
+              },
+              "role": {
+                "const": "compaction",
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "tokensBefore": {
+                "type": "number"
+              },
+              "tokensAfter": {
+                "type": "number"
+              },
+              "firstKeptEntryId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "parentId",
+              "turnId",
+              "role",
+              "summary",
+              "tokensBefore",
+              "tokensAfter",
+              "firstKeptEntryId"
+            ]
+          }
+        ]
+      },
+      "CompactionFailure": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "turnId": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "turnId",
+          "message"
+        ]
+      },
+      "Identity": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "apikey",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          {
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "oauth",
+                "type": "string"
+              },
+              "accountId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "accountId"
+            ]
+          }
+        ]
+      },
+      "SessionSnapshot": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/SessionDescriptor"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/SessionUsage"
+          },
+          "compactionFailure": {
+            "$ref": "#/components/schemas/CompactionFailure"
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConversationEntry"
+            }
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssistantMessage"
+            }
+          },
+          "active": {
+            "$ref": "#/components/schemas/ActiveAssistantMessage"
+          },
+          "turns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TurnSnapshot"
+            }
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueSnapshot"
+          },
+          "cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          }
+        },
+        "required": [
+          "session",
+          "usage",
+          "entries",
+          "messages",
+          "turns",
+          "queue",
+          "cursor"
+        ]
+      },
+      "MessageSubmittedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "human",
+            "type": "string"
+          },
+          "type": {
+            "const": "message_submitted",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "queueItemId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "admission": {
+            "$ref": "#/components/schemas/AdmissionStatus"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "messageId",
+          "queueItemId",
+          "text",
+          "admission"
+        ]
+      },
+      "CompactionSubmittedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "const": "human",
+                "type": "string"
+              },
+              {
+                "const": "process",
+                "type": "string"
+              }
+            ]
+          },
+          "type": {
+            "const": "compaction_submitted",
+            "type": "string"
+          },
+          "queueItemId": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CompactionSource"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "admission": {
+            "$ref": "#/components/schemas/AdmissionStatus"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "queueItemId",
+          "source",
+          "admission"
+        ]
+      },
+      "CompactedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "compacted",
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "tokensBefore": {
+            "type": "number"
+          },
+          "tokensAfter": {
+            "type": "number"
+          },
+          "firstKeptEntryId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "summary",
+          "tokensBefore",
+          "tokensAfter",
+          "firstKeptEntryId"
+        ]
+      },
+      "CompactionSkippedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "compaction_skipped",
+            "type": "string"
+          },
+          "reason": {
+            "const": "nothing_to_compact",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "reason"
+        ]
+      },
+      "PrunedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "pruned",
+            "type": "string"
+          },
+          "toolCallIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tokensBefore": {
+            "type": "number"
+          },
+          "tokensAfter": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "sessionId",
+          "actor",
+          "type",
+          "toolCallIds",
+          "tokensBefore",
+          "tokensAfter"
+        ]
+      },
+      "MessageDeliveredEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "human",
+            "type": "string"
+          },
+          "modelRole": {
+            "const": "user",
+            "type": "string"
+          },
+          "type": {
+            "const": "message_delivered",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "modelRole",
+          "type",
+          "messageId",
+          "text"
+        ]
+      },
+      "MessageUndeliveredEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "message_undelivered",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "const": "aborted",
+                "type": "string"
+              },
+              {
+                "const": "error",
+                "type": "string"
+              },
+              {
+                "const": "interrupted",
+                "type": "string"
+              },
+              {
+                "const": "cancelled",
+                "type": "string"
+              },
+              {
+                "const": "expired",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "messageId",
+          "text",
+          "reason"
+        ]
+      },
+      "TurnCancelRequestedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "human",
+            "type": "string"
+          },
+          "type": {
+            "const": "turn_cancel_requested",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type"
+        ]
+      },
+      "MessageDeltaEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "agent",
+            "type": "string"
+          },
+          "modelRole": {
+            "const": "assistant",
+            "type": "string"
+          },
+          "type": {
+            "const": "message_delta",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "modelRole",
+          "type",
+          "messageId",
+          "offset",
+          "text"
+        ]
+      },
+      "ReasoningDeltaEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "agent",
+            "type": "string"
+          },
+          "modelRole": {
+            "const": "assistant",
+            "type": "string"
+          },
+          "type": {
+            "const": "reasoning_delta",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "modelRole",
+          "type",
+          "messageId",
+          "offset",
+          "text"
+        ]
+      },
+      "AssistantMessageCompletedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "agent",
+            "type": "string"
+          },
+          "modelRole": {
+            "const": "assistant",
+            "type": "string"
+          },
+          "type": {
+            "const": "assistant_message_completed",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "const": "completed",
+                "type": "string"
+              },
+              {
+                "const": "length",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "modelRole",
+          "type",
+          "messageId",
+          "reason"
+        ]
+      },
+      "UsageEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "usage",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          },
+          "model": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "provider",
+          "model",
+          "usage"
+        ]
+      },
+      "ErrorCode": {
+        "const": "identity_changed",
+        "type": "string"
+      },
+      "ErrorEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "error",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "actual": {
+            "$ref": "#/components/schemas/Identity"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "message"
+        ]
+      },
+      "RetryEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "retry",
+            "type": "string"
+          },
+          "attempt": {
+            "type": "number"
+          },
+          "maxAttempts": {
+            "type": "number"
+          },
+          "delayMs": {
+            "type": "number"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "attempt",
+          "maxAttempts",
+          "delayMs",
+          "message"
+        ]
+      },
+      "AuthEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "auth",
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "const": "apikey",
+                "type": "string"
+              },
+              {
+                "const": "oauth",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "mode"
+        ]
+      },
+      "EndEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "end",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type"
+        ]
+      },
+      "AbortedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "aborted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type"
+        ]
+      },
+      "InterruptedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "interrupted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type"
+        ]
+      },
+      "CancelledEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "cancelled",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type"
+        ]
+      },
+      "TurnTerminalEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "turn_terminal",
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/TurnTerminalReason"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "type",
+          "reason"
+        ]
+      },
+      "QueueChangedEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "type": {
+            "const": "queue_changed",
+            "type": "string"
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueSnapshot"
+          }
+        },
+        "required": [
+          "sessionId",
+          "actor",
+          "type",
+          "queue"
+        ]
+      },
+      "ToolCallEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "agent",
+            "type": "string"
+          },
+          "modelRole": {
+            "const": "assistant",
+            "type": "string"
+          },
+          "type": {
+            "const": "tool_call",
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "modelRole",
+          "type",
+          "messageId",
+          "id",
+          "name",
+          "arguments"
+        ]
+      },
+      "ToolResultEvent": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "actor": {
+            "const": "process",
+            "type": "string"
+          },
+          "modelRole": {
+            "const": "tool",
+            "type": "string"
+          },
+          "type": {
+            "const": "tool_result",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "const": "ok",
+                "type": "string"
+              },
+              {
+                "const": "error",
+                "type": "string"
+              }
+            ]
+          },
+          "output": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "turnId",
+          "actor",
+          "modelRole",
+          "type",
+          "id",
+          "name",
+          "status",
+          "output"
+        ]
+      },
+      "Event": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/MessageSubmittedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/CompactionSubmittedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/CompactedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/CompactionSkippedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/PrunedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MessageDeliveredEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MessageUndeliveredEvent"
+          },
+          {
+            "$ref": "#/components/schemas/TurnCancelRequestedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MessageDeltaEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ReasoningDeltaEvent"
+          },
+          {
+            "$ref": "#/components/schemas/AssistantMessageCompletedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/UsageEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ErrorEvent"
+          },
+          {
+            "$ref": "#/components/schemas/RetryEvent"
+          },
+          {
+            "$ref": "#/components/schemas/AuthEvent"
+          },
+          {
+            "$ref": "#/components/schemas/AbortedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/InterruptedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/CancelledEvent"
+          },
+          {
+            "$ref": "#/components/schemas/TurnTerminalEvent"
+          },
+          {
+            "$ref": "#/components/schemas/QueueChangedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/EndEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCallEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultEvent"
+          }
+        ]
+      },
+      "EventEnvelope": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "type": "string"
+          },
+          "sequence": {
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "type": "integer"
+          },
+          "event": {
+            "$ref": "#/components/schemas/Event"
+          }
+        },
+        "required": [
+          "epoch",
+          "sequence",
+          "event"
+        ]
+      },
+      "PromptRequest": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "text": {
+            "pattern": "\\S",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "PromptAdmission": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/AdmissionStatus"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "queueItemId": {
+            "type": "string"
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueSnapshot"
+          }
+        },
+        "required": [
+          "status",
+          "sessionId",
+          "turnId",
+          "messageId",
+          "queueItemId",
+          "queue"
+        ]
+      },
+      "CompactRequest": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "instructions": {
+            "pattern": "\\S",
+            "type": "string"
+          }
+        }
+      },
+      "CompactionAdmission": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/AdmissionStatus"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          },
+          "queueItemId": {
+            "type": "string"
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueSnapshot"
+          }
+        },
+        "required": [
+          "status",
+          "sessionId",
+          "turnId",
+          "queueItemId",
+          "queue"
+        ]
+      },
+      "TurnCancellationResult": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/CancellationStatus"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "sessionId",
+          "turnId"
+        ]
+      },
+      "Health": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "name": {
+            "const": "ker",
+            "type": "string"
+          },
+          "protocol": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "protocol"
+        ]
+      },
+      "ErrorBody": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      }
+    }
+  }
+}
