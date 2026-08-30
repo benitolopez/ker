@@ -27,5 +27,5 @@
     }
   },
   "include": ["packages/*/src/**/*", "packages/*/test/**/*", "packages/*/scripts/**/*"],
-  "exclude": ["reference", "node_modules", "dist"]
+  "exclude": ["reference", "node_modules", "dist", "packages/gui"]
 }

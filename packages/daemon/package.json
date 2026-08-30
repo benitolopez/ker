@@ -21,6 +21,7 @@
     "@ker-ai/auth": "^0.0.0",
     "@ker-ai/config": "^0.0.0",
     "@ker-ai/engine": "^0.0.0",
+    "@ker-ai/gui": "^0.0.0",
     "@ker-ai/llm": "^0.0.0",
     "@ker-ai/protocol": "^0.0.0",
     "@sinclair/typebox": "0.34.41",

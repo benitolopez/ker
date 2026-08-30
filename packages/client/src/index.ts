@@ -14,6 +14,11 @@ export type Subscription =
 export interface Client {
 	health(signal?: AbortSignal): Promise<Result<Protocol.Health>>;
 	openapi(signal?: AbortSignal): Promise<Result<Record<string, unknown>>>;
+	listProjects(signal?: AbortSignal): Promise<Result<Protocol.ListProjectsResponse>>;
+	listProjectSessions(
+		projectId: Protocol.ProjectId,
+		signal?: AbortSignal,
+	): Promise<Result<Protocol.ListSessionsResponse>>;
 	createSession(cwd: string, signal?: AbortSignal): Promise<Result<Protocol.SessionDescriptor>>;
 	listSessions(
 		scope: { cwd: string } | { all: true },
@@ -55,6 +60,8 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 	return {
 		health: (signal) => request(routes.health.path, { signal }),
 		openapi: (signal) => request(routes.openapi.path, { signal }),
+		listProjects: (signal) => request(routes.listProjects.path, { signal }),
+		listProjectSessions: (projectId, signal) => request(routes.listProjectSessions.path, { signal }, { projectId }),
 		createSession: (cwd, signal) =>
 			request(routes.createSession.path, {
 				method: routes.createSession.method,
@@ -116,6 +123,85 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 			return { kind: "stream", envelopes: eventEnvelopes(response.body) };
 		},
 	};
+}
+
+export type AttachItem =
+	| { kind: "snapshot"; snapshot: Protocol.SessionSnapshot }
+	| { kind: "event"; envelope: Protocol.EventEnvelope };
+
+export class AttachError extends Error {
+	readonly status: number;
+	readonly error: Protocol.ErrorBody;
+
+	constructor(status: number, error: Protocol.ErrorBody) {
+		super(error.message ?? `Attach failed with HTTP ${status}`);
+		this.name = "AttachError";
+		this.status = status;
+		this.error = error;
+	}
+}
+
+export async function* attach(
+	client: Client,
+	sessionId: Protocol.SessionId,
+	options: { signal?: AbortSignal; retryDelayMs?: number } = {},
+): AsyncGenerator<AttachItem> {
+	const signal = options.signal;
+	const retryDelayMs = options.retryDelayMs ?? 1_000;
+	let connected = false;
+	let waitBeforeSnapshot = false;
+	while (!signal?.aborted) {
+		if (waitBeforeSnapshot && !(await waitForRetry(retryDelayMs, signal))) return;
+		let snapshotResult: Result<Protocol.SessionSnapshot>;
+		try {
+			snapshotResult = await client.snapshot(sessionId, signal);
+		} catch (error) {
+			if (signal?.aborted) return;
+			if (!connected) throw error;
+			waitBeforeSnapshot = true;
+			continue;
+		}
+		if (!snapshotResult.ok) throw new AttachError(snapshotResult.status, snapshotResult.error);
+		connected = true;
+		waitBeforeSnapshot = false;
+		yield { kind: "snapshot", snapshot: snapshotResult.value };
+		if (signal?.aborted) return;
+
+		let subscription: Subscription;
+		try {
+			subscription = await client.subscribe(sessionId, snapshotResult.value.cursor, signal);
+		} catch {
+			if (signal?.aborted) return;
+			waitBeforeSnapshot = true;
+			continue;
+		}
+		if (subscription.kind === "resync") continue;
+		if (subscription.kind === "error") throw new AttachError(subscription.status, subscription.error);
+		try {
+			for await (const envelope of subscription.envelopes) {
+				if (signal?.aborted) return;
+				yield { kind: "event", envelope };
+			}
+		} catch {
+			if (signal?.aborted) return;
+		}
+		waitBeforeSnapshot = true;
+	}
+}
+
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return Promise.resolve(false);
+	return new Promise((resolve) => {
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", abort);
+			resolve(true);
+		}, delayMs);
+		const abort = () => {
+			clearTimeout(timeout);
+			resolve(false);
+		};
+		signal?.addEventListener("abort", abort, { once: true });
+	});
 }
 
 async function* eventEnvelopes(body: ReadableStream<Uint8Array>): AsyncGenerator<Protocol.EventEnvelope> {

@@ -11,7 +11,7 @@ import { createDaemon, type DaemonOptions } from "@ker-ai/daemon";
 import type * as Engine from "@ker-ai/engine";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
-import { createClient } from "../src/index.ts";
+import { AttachError, attach, type Client, createClient } from "../src/index.ts";
 
 test("the client calls every route and parses a streamed turn", async (t) => {
 	const running = await startServer(t);
@@ -29,6 +29,15 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const created = await client.createSession(process.cwd());
 	assert(created.ok);
 	const session = created.value;
+	const projects = await client.listProjects();
+	assert(projects.ok);
+	assert.equal(projects.value.projects.length, 1);
+	const projectSessions = await client.listProjectSessions(projects.value.projects[0]?.id ?? "missing");
+	assert(projectSessions.ok);
+	assert.deepEqual(
+		projectSessions.value.sessions.map((candidate) => candidate.id),
+		[session.id],
+	);
 
 	const listed = await client.listSessions({ cwd: process.cwd() });
 	assert(listed.ok);
@@ -78,6 +87,92 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 		assert.equal(missingStream.status, 404);
 		assert.equal(missingStream.error.code, "session_not_found");
 	}
+});
+
+test("attach yields a snapshot and a live streamed turn", async (t) => {
+	const running = await startServer(t);
+	t.mock.method(globalThis, "fetch", localFetch);
+	const client = createClient({ baseUrl: running.url });
+	const created = await client.createSession(process.cwd());
+	assert(created.ok);
+	const iterator = attach(client, created.value.id, { retryDelayMs: 0 });
+	const initial = await iterator.next();
+	assert.equal(initial.value?.kind, "snapshot");
+
+	const admitted = await client.prompt(created.value.id, "follow me");
+	assert(admitted.ok);
+	const observed: Protocol.Event["type"][] = [];
+	while (observed.at(-1) !== "end") {
+		const next = await iterator.next();
+		assert.equal(next.done, false);
+		if (next.value.kind !== "event") continue;
+		if (!("turnId" in next.value.envelope.event) || next.value.envelope.event.turnId !== admitted.value.turnId) {
+			continue;
+		}
+		observed.push(next.value.envelope.event.type);
+	}
+	assert(observed.includes("message_delta"));
+	await iterator.return(undefined);
+});
+
+test("attach resnapshots after resync and stream drops", async (t) => {
+	const running = await startServer(t);
+	t.mock.method(globalThis, "fetch", localFetch);
+	const base = createClient({ baseUrl: running.url });
+	const created = await base.createSession(process.cwd());
+	assert(created.ok);
+	let subscriptions = 0;
+	let snapshots = 0;
+	const client: Client = {
+		...base,
+		snapshot: async (id, signal) => {
+			snapshots++;
+			if (snapshots === 3) throw new TypeError("daemon restarting");
+			return base.snapshot(id, signal);
+		},
+		subscribe: async (id, cursor, signal) => {
+			subscriptions++;
+			if (subscriptions === 1) return { kind: "resync" };
+			if (subscriptions === 2) {
+				return {
+					kind: "stream",
+					envelopes: (async function* () {
+						yield* [];
+					})(),
+				};
+			}
+			return base.subscribe(id, cursor, signal);
+		},
+	};
+	const iterator = attach(client, created.value.id, { retryDelayMs: 0 });
+	assert.equal((await iterator.next()).value?.kind, "snapshot");
+	assert.equal((await iterator.next()).value?.kind, "snapshot");
+	assert.equal((await iterator.next()).value?.kind, "snapshot");
+	assert.equal(subscriptions, 2);
+	assert.equal(snapshots, 4);
+	await iterator.return(undefined);
+});
+
+test("attach ends on abort and throws typed HTTP failures", async (t) => {
+	const running = await startServer(t);
+	t.mock.method(globalThis, "fetch", localFetch);
+	const client = createClient({ baseUrl: running.url });
+	const missing = attach(client, "missing", { retryDelayMs: 0 });
+	await assert.rejects(missing.next(), (error) => {
+		assert(error instanceof AttachError);
+		assert.equal(error.status, 404);
+		assert.equal(error.error.code, "session_not_found");
+		return true;
+	});
+
+	const created = await client.createSession(process.cwd());
+	assert(created.ok);
+	const controller = new AbortController();
+	const iterator = attach(client, created.value.id, { signal: controller.signal, retryDelayMs: 0 });
+	assert.equal((await iterator.next()).value?.kind, "snapshot");
+	const waiting = iterator.next();
+	controller.abort();
+	assert.equal((await waiting).done, true);
 });
 
 test("the client passes abort signals through and leaves network errors untouched", async (t) => {
@@ -206,6 +301,9 @@ function localFetch(input: string | URL | globalThis.Request, init?: RequestInit
 			},
 		);
 		req.once("error", reject);
+		const abort = () => req.destroy(new DOMException("This operation was aborted", "AbortError"));
+		if (init?.signal?.aborted) abort();
+		init?.signal?.addEventListener("abort", abort, { once: true });
 		if (typeof init?.body === "string" || init?.body instanceof Uint8Array) {
 			req.end(init.body);
 			return;

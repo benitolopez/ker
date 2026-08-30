@@ -362,6 +362,54 @@ test("catalog queries preserve order and use project-anchored scope", async (t) 
 	assert.equal(catalog.get(first.session.id)?.updated_at, "2026-03-01T00:00:00.000Z");
 });
 
+test("project queries compute session activity and keep empty projects", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-project-list-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const catalog = Catalog.open(join(root, "catalog.db"));
+	t.after(() => catalog.close());
+	catalog.upsertNode(IDENTITY);
+	const first = catalogedSession("session-1", "/project-a", "/project-a/one", true);
+	const second = catalogedSession("session-2", "/project-a", "/project-a/two", true);
+	second.session.updatedAt = "2026-02-01T00:00:00.000Z";
+	catalog.reconcile({ sessions: [first, second], unreadable: [] }, IDENTITY.id);
+	const binding = catalog.findWorkspaceByRoot(IDENTITY.id, "/project-a");
+	assert(binding);
+	catalog.markUnreadable(second.session.id, "broken");
+	const empty = catalog.createWorkspace({
+		nodeId: IDENTITY.id,
+		rootPath: "/project-empty",
+		projectName: "empty",
+		gitRemote: null,
+	});
+
+	assert.equal(catalog.projectExists(binding.projectId), true);
+	assert.equal(catalog.projectExists("missing"), false);
+	assert.deepEqual(
+		catalog.list({ projectId: binding.projectId }).map((row) => row.id),
+		[first.session.id, second.session.id],
+	);
+	assert.deepEqual(
+		catalog.listProjects().find((candidate) => candidate.id === binding.projectId),
+		{
+			id: binding.projectId,
+			name: "project-a",
+			createdAt: catalog.listProjects().find((candidate) => candidate.id === binding.projectId)?.createdAt,
+			sessionCount: 2,
+			lastActivityAt: second.session.updatedAt,
+		},
+	);
+	assert.deepEqual(
+		catalog.listProjects().find((candidate) => candidate.id === empty.projectId),
+		{
+			id: empty.projectId,
+			name: "empty",
+			createdAt: catalog.listProjects().find((candidate) => candidate.id === empty.projectId)?.createdAt,
+			sessionCount: 0,
+			lastActivityAt: null,
+		},
+	);
+});
+
 test("uses KER_CATALOG_PATH before the user-owned default", (t) => {
 	const previous = process.env.KER_CATALOG_PATH;
 	delete process.env.KER_CATALOG_PATH;

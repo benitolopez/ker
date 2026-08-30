@@ -5,6 +5,7 @@ import {
 	CreateSessionRequest,
 	EventEnvelope,
 	Health,
+	ListProjectsResponse,
 	ListSessionsResponse,
 	PromptAdmission,
 	PromptRequest,
@@ -47,6 +48,30 @@ export const routes = {
 		responses: {
 			200: openApiDocument,
 			403: errorBody("forbidden"),
+			500: errorBody("internal"),
+		},
+	},
+	listProjects: {
+		method: "GET",
+		path: "/projects",
+		summary: "List projects",
+		description:
+			"Every project with read-time aggregates: sessionCount counts all catalog sessions, lastActivityAt is the newest session updatedAt and null when the project has none.",
+		responses: {
+			200: ListProjectsResponse,
+			403: errorBody("forbidden"),
+			500: errorBody("internal"),
+		},
+	},
+	listProjectSessions: {
+		method: "GET",
+		path: "/projects/{projectId}/sessions",
+		summary: "List a project's sessions",
+		params: { projectId: Type.String({ minLength: 1 }) },
+		responses: {
+			200: ListSessionsResponse,
+			403: errorBody("forbidden"),
+			404: errorBody("project_not_found"),
 			500: errorBody("internal"),
 		},
 	},

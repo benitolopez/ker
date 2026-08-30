@@ -64,6 +64,15 @@ export class ControlPlane {
 			.map(toCatalogSession);
 	}
 
+	listProjects(): Protocol.Project[] {
+		return this.#catalog.listProjects();
+	}
+
+	listProjectSessions(projectId: Protocol.ProjectId): Protocol.CatalogSession[] | "missing" {
+		if (!this.#catalog.projectExists(projectId)) return "missing";
+		return this.#catalog.list({ projectId }).map(toCatalogSession);
+	}
+
 	resolveProjectRoot(cwd: string): Promise<string> {
 		return this.#node.resolveProjectRoot(cwd);
 	}

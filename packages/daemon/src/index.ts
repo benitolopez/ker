@@ -1,5 +1,8 @@
+import { readFile } from "node:fs/promises";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
+import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
 import * as Agent from "@ker-ai/agent";
 import * as Config from "@ker-ai/config";
 import * as Protocol from "@ker-ai/protocol";
@@ -30,6 +33,7 @@ export interface DaemonOptions {
 	eventTailSize?: number;
 	recoveryWindowMinutes?: number;
 	compaction?: Config.CompactionSettings;
+	guiDir?: string;
 }
 
 export type Daemon = Server & { shutdown(): Promise<void> };
@@ -51,6 +55,7 @@ type HandlerMap = { [Key in RouteKey]: Handler };
 // The HTTP server is synchronous to construct; session discovery and recovery finish before a route responds.
 export function createDaemon(options: DaemonOptions = {}): Daemon {
 	const subscribers = new Set<ServerResponse>();
+	const guiDir = options.guiDir ?? defaultGuiDir();
 	let plane: ControlPlane;
 	const manager = (async () => {
 		const config = Config.loadConfig();
@@ -79,7 +84,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 	})();
 
 	const server = createServer((req, res) => {
-		void handleRequest(manager, subscribers, req, res);
+		void handleRequest(manager, subscribers, guiDir, req, res);
 	}) as Daemon;
 	server.shutdown = async () => {
 		const manager_ = await manager;
@@ -99,6 +104,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 async function handleRequest(
 	managerPromise: Promise<ControlPlane>,
 	subscribers: Set<ServerResponse>,
+	guiDir: string | undefined,
 	req: IncomingMessage,
 	res: ServerResponse,
 ) {
@@ -111,6 +117,10 @@ async function handleRequest(
 		const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 		const match = matchRoute(req.method, url.pathname);
 		if (!match) {
+			if (req.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/assets/"))) {
+				await serveGui(guiDir, url.pathname, res);
+				return;
+			}
 			writeJson(res, 404, { code: "not_found" });
 			return;
 		}
@@ -157,6 +167,19 @@ const handlers = {
 	openapi: ({ res }) => {
 		res.writeHead(200, { "content-type": "application/json" });
 		res.end(OPENAPI_JSON);
+	},
+	listProjects: ({ manager, res }) => {
+		const body: Protocol.ListProjectsResponse = { projects: manager.listProjects() };
+		writeJson(res, 200, body);
+	},
+	listProjectSessions: ({ manager, res, params }) => {
+		const sessions = manager.listProjectSessions(params.projectId);
+		if (sessions === "missing") {
+			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		const body: Protocol.ListSessionsResponse = { sessions };
+		writeJson(res, 200, body);
 	},
 	createSession: async ({ manager, res, body }) => {
 		const request = body as Protocol.CreateSessionRequest;
@@ -321,6 +344,94 @@ function isLocalRequest(req: IncomingMessage): boolean {
 	if (!ALLOWED_HOSTS.has(req.headers.host ?? "")) return false;
 	const origin = req.headers.origin;
 	return origin === undefined || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+}
+
+function defaultGuiDir(): string | undefined {
+	try {
+		const packagePath = createRequire(import.meta.url).resolve("@ker-ai/gui/package.json");
+		return resolve(dirname(packagePath), "dist");
+	} catch {
+		return undefined;
+	}
+}
+
+async function serveGui(guiDir: string | undefined, pathname: string, res: ServerResponse): Promise<void> {
+	if (pathname === "/" && !guiDir) {
+		writeGuiHint(res);
+		return;
+	}
+	if (!guiDir) {
+		writeJson(res, 404, { code: "not_found" });
+		return;
+	}
+	const decoded = decodeGuiPath(pathname);
+	if (!decoded) {
+		writeJson(res, 404, { code: "not_found" });
+		return;
+	}
+	const filePath = resolve(guiDir, decoded === "/" ? "index.html" : decoded.slice(1));
+	const pathFromGui = relative(guiDir, filePath);
+	if (pathFromGui.startsWith("..") || isAbsolute(pathFromGui)) {
+		writeJson(res, 404, { code: "not_found" });
+		return;
+	}
+	try {
+		const body = await readFile(filePath);
+		res.writeHead(200, {
+			"content-type": contentType(filePath),
+			"cache-control": pathname === "/" ? "no-cache" : "public, max-age=31536000, immutable",
+		});
+		res.end(body);
+	} catch (error) {
+		if (pathname === "/") {
+			writeGuiHint(res);
+			return;
+		}
+		if (isMissingFile(error)) {
+			writeJson(res, 404, { code: "not_found" });
+			return;
+		}
+		throw error;
+	}
+}
+
+function decodeGuiPath(pathname: string): string | undefined {
+	try {
+		const decoded = decodeURIComponent(pathname);
+		return decoded.includes("\0") ? undefined : decoded;
+	} catch {
+		return undefined;
+	}
+}
+
+function contentType(path: string): string {
+	return (
+		{
+			".html": "text/html; charset=utf-8",
+			".js": "text/javascript; charset=utf-8",
+			".css": "text/css; charset=utf-8",
+			".svg": "image/svg+xml",
+			".ico": "image/x-icon",
+			".map": "application/json",
+			".woff2": "font/woff2",
+		}[extname(path)] ?? "application/octet-stream"
+	);
+}
+
+function writeGuiHint(res: ServerResponse): void {
+	res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
+	res.end(
+		'<!doctype html><html><head><meta charset="utf-8"><title>ker</title></head><body><main><h1>ker GUI is not built</h1><p>Run <code>npm run build -w @ker-ai/gui</code>.</p></main></body></html>',
+	);
+}
+
+function isMissingFile(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error.code === "ENOENT" || error.code === "EISDIR" || error.code === "ENOTDIR")
+	);
 }
 
 async function readJsonBody(req: IncomingMessage, res: ServerResponse): Promise<unknown | typeof BODY_REJECTED> {

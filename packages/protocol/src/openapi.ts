@@ -21,6 +21,8 @@ export const components = {
 	UnreadableCatalogSession: Protocol.UnreadableCatalogSession,
 	CatalogSession: Protocol.CatalogSession,
 	ListSessionsResponse: Protocol.ListSessionsResponse,
+	Project: Protocol.Project,
+	ListProjectsResponse: Protocol.ListProjectsResponse,
 	QueueItemBase: Protocol.QueueItemBase,
 	PromptQueueItem: Protocol.PromptQueueItem,
 	CompactionQueueItem: Protocol.CompactionQueueItem,

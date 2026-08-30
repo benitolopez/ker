@@ -27,6 +27,15 @@ test("daemon responses conform to the route table", async (t) => {
 		}),
 		201,
 	);
+	const projects = await assertJson<Protocol.ListProjectsResponse>(
+		"listProjects",
+		await localFetch(`${running.url}/projects`),
+		200,
+	);
+	const project = projects.projects[0];
+	assert(project);
+	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/${project.id}/sessions`), 200);
+	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/missing/sessions`), 404);
 	await assertJson(
 		"listSessions",
 		await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(process.cwd())}`),

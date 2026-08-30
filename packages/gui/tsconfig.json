@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "declaration": false,
+    "declarationMap": false,
+    "jsx": "react-jsx",
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "paths": {
+      "@ker-ai/client": ["../client/src/index.ts"],
+      "@ker-ai/protocol": ["../protocol/src/index.ts"],
+      "@ker-ai/protocol/routes": ["../protocol/src/routes.ts"]
+    },
+    "types": ["node", "vite/client"]
+  },
+  "include": ["src/**/*", "test/**/*", "vite.config.ts"]
+}

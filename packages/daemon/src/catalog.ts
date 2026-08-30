@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type * as Protocol from "@ker-ai/protocol";
-import { and, asc, eq, getTableColumns, isNull, or } from "drizzle-orm";
+import { and, asc, count, eq, getTableColumns, isNull, max, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-sqlite";
 import type { NodeIdentity } from "./identity.ts";
 import { CATALOG_VERSION, DDL, MIGRATIONS, node, project, session, workspace } from "./schema.ts";
@@ -329,13 +329,22 @@ export class Catalog {
 		return this.#db.select().from(session).where(eq(session.id, id)).get();
 	}
 
-	list(scope?: { nodeId: Protocol.NodeId; rootPath: string }): CatalogListRow[] {
+	list(scope?: { nodeId: Protocol.NodeId; rootPath: string } | { projectId: Protocol.ProjectId }): CatalogListRow[] {
 		const selection = { ...getTableColumns(session), project_name: project.name };
 		if (!scope) {
 			return this.#db
 				.select(selection)
 				.from(session)
 				.leftJoin(project, eq(session.project_id, project.id))
+				.orderBy(asc(session.created_at))
+				.all();
+		}
+		if ("projectId" in scope) {
+			return this.#db
+				.select(selection)
+				.from(session)
+				.leftJoin(project, eq(session.project_id, project.id))
+				.where(eq(session.project_id, scope.projectId))
 				.orderBy(asc(session.created_at))
 				.all();
 		}
@@ -348,6 +357,33 @@ export class Catalog {
 			.where(binding ? or(eq(session.project_id, binding.projectId), unreadableMatch) : unreadableMatch)
 			.orderBy(asc(session.created_at))
 			.all();
+	}
+
+	listProjects(): Protocol.Project[] {
+		return this.#db
+			.select({
+				id: project.id,
+				name: project.name,
+				created_at: project.created_at,
+				session_count: count(session.id),
+				last_activity_at: max(session.updated_at),
+			})
+			.from(project)
+			.leftJoin(session, eq(session.project_id, project.id))
+			.groupBy(project.id)
+			.orderBy(asc(project.created_at))
+			.all()
+			.map((row) => ({
+				id: row.id,
+				name: row.name,
+				createdAt: row.created_at,
+				sessionCount: row.session_count,
+				lastActivityAt: row.last_activity_at,
+			}));
+	}
+
+	projectExists(id: Protocol.ProjectId): boolean {
+		return this.#db.select({ id: project.id }).from(project).where(eq(project.id, id)).get() !== undefined;
 	}
 
 	close(): void {

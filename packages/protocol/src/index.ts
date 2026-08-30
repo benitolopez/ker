@@ -153,6 +153,21 @@ export const ListSessionsResponse = Type.Object(
 );
 export type ListSessionsResponse = Static<typeof ListSessionsResponse>;
 
+export const Project = Type.Object(
+	{
+		id: Type.String(),
+		name: Type.String(),
+		createdAt: Type.String(),
+		sessionCount: Type.Number(),
+		lastActivityAt: Type.Union([Type.String(), Type.Null()]),
+	},
+	{ additionalProperties: false },
+);
+export type Project = Static<typeof Project>;
+
+export const ListProjectsResponse = Type.Object({ projects: Type.Array(Project) }, { additionalProperties: false });
+export type ListProjectsResponse = Static<typeof ListProjectsResponse>;
+
 const queueItemFields = {
 	id: Type.String(),
 	turnId: Type.String(),
@@ -733,7 +748,7 @@ export const ErrorBody = Type.Object(
 );
 export type ErrorBody = Static<typeof ErrorBody>;
 
-export const PROTOCOL_VERSION = "19" as const;
+export const PROTOCOL_VERSION = "20" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

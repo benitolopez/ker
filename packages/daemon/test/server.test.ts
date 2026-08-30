@@ -42,6 +42,105 @@ test("creates and lists explicit durable sessions", async (t) => {
 	assert.equal((await localFetch(`${running.url}/conversation/new`, { method: "POST" })).status, 404);
 });
 
+test("lists projects with aggregates and project-scoped sessions", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-project-routes-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const catalogPath = join(root, "catalog.db");
+	const running = await startServer(t, immediateFactory(), { sessionDir: join(root, "sessions"), catalogPath });
+	const first = await createSession(running.url);
+	const second = await createSession(running.url);
+	const client = new DatabaseSync(catalogPath);
+	const projectId = (
+		client.prepare("SELECT project_id FROM session WHERE id = ?").get(first.id) as {
+			project_id: string;
+		}
+	).project_id;
+	client.prepare("UPDATE session SET status = 'unreadable', error = 'broken' WHERE id = ?").run(second.id);
+	client
+		.prepare("INSERT INTO project (id, name, created_at) VALUES (?, ?, ?)")
+		.run("project-empty", "empty", "2026-01-01T00:00:00.000Z");
+	const expectedActivity = (
+		client.prepare("SELECT MAX(updated_at) AS updated_at FROM session WHERE project_id = ?").get(projectId) as {
+			updated_at: string;
+		}
+	).updated_at;
+	client.close();
+
+	const projectsResponse = await localFetch(`${running.url}/projects`);
+	const projects = await readJson<Protocol.ListProjectsResponse>(projectsResponse.body);
+	assert.equal(projectsResponse.status, 200);
+	assert.deepEqual(
+		projects.projects.find((project) => project.id === projectId),
+		{
+			id: projectId,
+			name: "ker",
+			createdAt: projects.projects.find((project) => project.id === projectId)?.createdAt,
+			sessionCount: 2,
+			lastActivityAt: expectedActivity,
+		},
+	);
+	assert.deepEqual(
+		projects.projects.find((project) => project.id === "project-empty"),
+		{
+			id: "project-empty",
+			name: "empty",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			sessionCount: 0,
+			lastActivityAt: null,
+		},
+	);
+
+	const sessionsResponse = await localFetch(`${running.url}/projects/${projectId}/sessions`);
+	const sessions = await readJson<Protocol.ListSessionsResponse>(sessionsResponse.body);
+	assert.equal(sessionsResponse.status, 200);
+	assert.deepEqual(
+		sessions.sessions.map((session) => session.id),
+		[first.id, second.id],
+	);
+	assert.equal(sessions.sessions.find((session) => session.id === second.id)?.status, "unreadable");
+	const missing = await localFetch(`${running.url}/projects/missing/sessions`);
+	assert.equal(missing.status, 404);
+	assert.deepEqual(await readJson(missing.body), { code: "project_not_found" });
+});
+
+test("serves injected GUI files with cache headers and guards the asset directory", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-gui-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const guiDir = join(root, "gui");
+	await mkdir(join(guiDir, "assets"), { recursive: true });
+	await Promise.all([
+		writeFile(join(guiDir, "index.html"), "<!doctype html><title>ker test</title>"),
+		writeFile(join(guiDir, "assets", "app-123.js"), "globalThis.ker = true"),
+		writeFile(join(root, "secret.txt"), "secret"),
+	]);
+	const running = await startServer(t, immediateFactory(), { guiDir });
+
+	const index = await localFetch(`${running.url}/`);
+	assert.equal(index.status, 200);
+	assert.equal(index.body.headers["content-type"], "text/html; charset=utf-8");
+	assert.equal(index.body.headers["cache-control"], "no-cache");
+	assert.equal(await readText(index.body), "<!doctype html><title>ker test</title>");
+	const asset = await localFetch(`${running.url}/assets/app-123.js`);
+	assert.equal(asset.status, 200);
+	assert.equal(asset.body.headers["content-type"], "text/javascript; charset=utf-8");
+	assert.equal(asset.body.headers["cache-control"], "public, max-age=31536000, immutable");
+	assert.equal(await readText(asset.body), "globalThis.ker = true");
+	assert.equal((await localFetch(`${running.url}/assets/%2e%2e%2fsecret.txt`)).status, 404);
+	assert.equal((await localFetch(`${running.url}/assets/%ZZ`)).status, 404);
+	assert.equal((await localFetch(`${running.url}/health`)).status, 200);
+});
+
+test("serves a build hint when the GUI directory is missing", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-gui-missing-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const running = await startServer(t, immediateFactory(), { guiDir: join(root, "missing") });
+
+	const response = await localFetch(`${running.url}/`);
+	assert.equal(response.status, 200);
+	assert.match(await readText(response.body), /npm run build -w @ker-ai\/gui/);
+	assert.equal((await localFetch(`${running.url}/assets/missing.js`)).status, 404);
+});
+
 test("listing tracks live status and keeps the first prompt as the title", async (t) => {
 	const controlled = controlledFactory();
 	const running = await startServer(t, controlled.factory);
@@ -3420,6 +3519,7 @@ async function startServer(
 			keepRecentTokens: 20_000,
 			prune: true,
 		},
+		guiDir: options.guiDir,
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
@@ -3545,6 +3645,12 @@ async function readJson<T>(body: AsyncIterable<Uint8Array>): Promise<T> {
 	const chunks: Buffer[] = [];
 	for await (const chunk of body) chunks.push(Buffer.from(chunk));
 	return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+}
+
+async function readText(body: AsyncIterable<Uint8Array>): Promise<string> {
+	const chunks: Buffer[] = [];
+	for await (const chunk of body) chunks.push(Buffer.from(chunk));
+	return Buffer.concat(chunks).toString("utf8");
 }
 
 async function* readEnvelopes(body: AsyncIterable<Uint8Array>): AsyncGenerator<Protocol.EventEnvelope> {
