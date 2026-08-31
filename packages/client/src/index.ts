@@ -19,6 +19,10 @@ export interface Client {
 		projectId: Protocol.ProjectId,
 		signal?: AbortSignal,
 	): Promise<Result<Protocol.ListSessionsResponse>>;
+	createProjectSession(
+		projectId: Protocol.ProjectId,
+		signal?: AbortSignal,
+	): Promise<Result<Protocol.ReadableCatalogSession>>;
 	createSession(cwd: string, signal?: AbortSignal): Promise<Result<Protocol.SessionDescriptor>>;
 	listSessions(
 		scope: { cwd: string } | { all: true },
@@ -62,6 +66,8 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 		openapi: (signal) => request(routes.openapi.path, { signal }),
 		listProjects: (signal) => request(routes.listProjects.path, { signal }),
 		listProjectSessions: (projectId, signal) => request(routes.listProjectSessions.path, { signal }, { projectId }),
+		createProjectSession: (projectId, signal) =>
+			request(routes.createProjectSession.path, { method: routes.createProjectSession.method, signal }, { projectId }),
 		createSession: (cwd, signal) =>
 			request(routes.createSession.path, {
 				method: routes.createSession.method,

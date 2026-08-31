@@ -748,7 +748,7 @@ export const ErrorBody = Type.Object(
 );
 export type ErrorBody = Static<typeof ErrorBody>;
 
-export const PROTOCOL_VERSION = "20" as const;
+export const PROTOCOL_VERSION = "21" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

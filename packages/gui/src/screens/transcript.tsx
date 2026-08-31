@@ -1,6 +1,6 @@
-import { AttachError } from "@ker-ai/client";
+import { AttachError, type Result } from "@ker-ai/client";
 import type * as Protocol from "@ker-ai/protocol";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { type KeyboardEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import ReactMarkdown from "react-markdown";
 import { api, attach } from "../api.ts";
 import { formatTokens } from "../format.ts";
@@ -61,7 +61,11 @@ export function TranscriptScreen({ projectId, sessionId }: { projectId: string; 
 						</a>
 						<h1 className="mt-1 truncate font-mono text-sm font-semibold text-[var(--text)]">{sessionId}</h1>
 					</div>
-					{header ? <SessionHeader header={header} /> : <span className="status-pill">Connecting…</span>}
+					{header ? (
+						<SessionHeader header={header} queue={view.queue} onCompact={() => api.compact(sessionId)} />
+					) : (
+						<span className="status-pill">Connecting…</span>
+					)}
 				</div>
 			</header>
 
@@ -86,17 +90,49 @@ export function TranscriptScreen({ projectId, sessionId }: { projectId: string; 
 					<div className="h-12" />
 				</main>
 			</div>
-			<QueueStrip queue={view.queue} />
+			<footer className="border-t border-[var(--line)] bg-[var(--surface)] px-5 py-4 shadow-[0_-12px_35px_rgb(20_35_27_/_5%)] sm:px-8">
+				<div className="mx-auto w-full max-w-3xl">
+					<QueueStack queue={view.queue} onRemove={(turnId) => api.cancel(sessionId, turnId)} />
+					<Composer
+						queue={view.queue}
+						onSend={(text) => api.prompt(sessionId, text)}
+						onStop={(turnId) => api.cancel(sessionId, turnId)}
+					/>
+				</div>
+			</footer>
 		</div>
 	);
 }
 
-function SessionHeader({ header }: { header: NonNullable<ReturnType<TranscriptStore["getSnapshot"]>["header"]> }) {
+export function SessionHeader({
+	header,
+	queue,
+	onCompact,
+}: {
+	header: NonNullable<ReturnType<TranscriptStore["getSnapshot"]>["header"]>;
+	queue: Protocol.QueueSnapshot;
+	onCompact: () => Promise<Result<Protocol.CompactionAdmission>>;
+}) {
+	const [compacting, setCompacting] = useState(false);
+	const [error, setError] = useState<string>();
 	const window = header.model?.contextWindow;
 	const percentage = window ? Math.min(100, (header.usage.contextTokens / window) * 100) : undefined;
+	const compactionQueued = [queue.running, ...queue.waiting].some((item) => item?.kind === "compaction");
+	const compact = async () => {
+		setCompacting(true);
+		setError(undefined);
+		try {
+			const result = await onCompact();
+			if (!result.ok) setError(result.error.message ?? result.error.code);
+		} catch (failure) {
+			setError(failureMessage(failure));
+		} finally {
+			setCompacting(false);
+		}
+	};
 	return (
-		<div className="hidden items-center gap-5 text-right sm:flex">
-			<div>
+		<div className="flex items-center gap-3 text-right sm:gap-5">
+			<div className="hidden sm:block">
 				<p className="text-xs font-medium text-[var(--text)]">
 					{header.model ? `${header.model.provider}/${header.model.id}` : "Model unknown"}
 				</p>
@@ -108,6 +144,21 @@ function SessionHeader({ header }: { header: NonNullable<ReturnType<TranscriptSt
 					<div className="mt-2 h-1 w-48 overflow-hidden rounded-full bg-[var(--line)]">
 						<div className="h-full rounded-full bg-[var(--accent)]" style={{ width: `${percentage}%` }} />
 					</div>
+				) : null}
+			</div>
+			<div>
+				<button
+					className="rounded-full border border-[var(--line)] px-3 py-2 text-xs font-semibold text-[var(--muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-45"
+					disabled={compactionQueued || compacting}
+					onClick={() => void compact()}
+					type="button"
+				>
+					{compacting ? "Compacting…" : "Compact"}
+				</button>
+				{error ? (
+					<p className="mt-1 max-w-48 text-xs text-red-700 dark:text-red-300" role="alert">
+						{error}
+					</p>
 				) : null}
 			</div>
 			<span className="status-pill capitalize">{header.status}</span>
@@ -194,25 +245,171 @@ function Markdown({ text }: { text: string }) {
 	);
 }
 
-function QueueStrip({ queue }: { queue: Protocol.QueueSnapshot }) {
-	const items = [queue.running, ...queue.waiting].filter((item) => item !== undefined);
-	if (items.length === 0) return null;
+export function QueueStack({
+	queue,
+	onRemove,
+}: {
+	queue: Protocol.QueueSnapshot;
+	onRemove: (turnId: Protocol.TurnId) => Promise<Result<Protocol.TurnCancellationResult>>;
+}) {
+	const [removing, setRemoving] = useState<Protocol.TurnId>();
+	const [error, setError] = useState<string>();
+	if (queue.waiting.length === 0) return null;
+	const remove = async (turnId: Protocol.TurnId) => {
+		setRemoving(turnId);
+		setError(undefined);
+		try {
+			const result = await onRemove(turnId);
+			if (!result.ok && !(result.status === 409 && result.error.code === "turn_unavailable")) {
+				setError(result.error.message ?? result.error.code);
+			}
+		} catch (failure) {
+			setError(failureMessage(failure));
+		} finally {
+			setRemoving(undefined);
+		}
+	};
 	return (
-		<aside className="border-t border-[var(--line)] bg-[var(--surface)] px-5 py-3 sm:px-8">
-			<div className="mx-auto flex max-w-5xl items-center gap-3 overflow-x-auto">
-				<span className="shrink-0 font-mono text-[10px] font-semibold tracking-[0.16em] text-[var(--muted)] uppercase">
-					Queue
-				</span>
-				{items.map((item) => (
-					<div
-						className="shrink-0 rounded-full border border-[var(--line)] px-3 py-1.5 text-xs text-[var(--muted)]"
-						key={item.id}
-					>
-						<span className="mr-2 capitalize text-[var(--text)]">{item.state}</span>
-						{item.kind === "prompt" ? item.text : `${item.source} compaction`}
-					</div>
-				))}
-			</div>
+		<aside className="mb-3 space-y-2" aria-label="Waiting queue">
+			{queue.waiting.map((item) => (
+				<div
+					className="flex items-center gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm"
+					key={item.id}
+				>
+					<span className="min-w-0 flex-1 truncate text-left text-[var(--muted)]">
+						{item.kind === "prompt" ? item.text : `${item.source === "auto" ? "Automatic" : "Manual"} compaction`}
+					</span>
+					{item.kind === "prompt" ? (
+						<button
+							aria-label={`Remove queued prompt: ${item.text}`}
+							className="grid size-7 shrink-0 place-items-center rounded-full text-lg text-[var(--faint)] hover:bg-red-500/10 hover:text-red-600 disabled:opacity-45"
+							disabled={removing === item.turnId}
+							onClick={() => void remove(item.turnId)}
+							type="button"
+						>
+							<span aria-hidden="true">×</span>
+						</button>
+					) : null}
+				</div>
+			))}
+			{error ? (
+				<p className="text-xs text-red-700 dark:text-red-300" role="alert">
+					{error}
+				</p>
+			) : null}
 		</aside>
 	);
+}
+
+export function Composer({
+	queue,
+	onSend,
+	onStop,
+}: {
+	queue: Protocol.QueueSnapshot;
+	onSend: (text: string) => Promise<Result<Protocol.PromptAdmission>>;
+	onStop: (turnId: Protocol.TurnId) => Promise<Result<Protocol.TurnCancellationResult>>;
+}) {
+	const [text, setText] = useState("");
+	const [pending, setPending] = useState<"send" | "stop">();
+	const [error, setError] = useState<string>();
+	const textareaRef = useRef<HTMLTextAreaElement>(null);
+	useEffect(() => textareaRef.current?.focus(), []);
+	const hasText = text.trim().length > 0;
+	const stopMode = queue.running !== undefined && !hasText;
+	const cancelling = stopMode && queue.running?.state === "cancelling";
+	const disabled = pending !== undefined || (stopMode ? cancelling : !hasText);
+	const label = stopMode
+		? cancelling || pending === "stop"
+			? "Cancelling…"
+			: "Stop"
+		: pending === "send"
+			? "Sending…"
+			: "Send";
+	const submit = async () => {
+		setError(undefined);
+		if (stopMode) {
+			const running = queue.running;
+			if (!running || running.state === "cancelling" || pending !== undefined) return;
+			setPending("stop");
+			try {
+				const result = await onStop(running.turnId);
+				if (!result.ok && !(result.status === 409 && result.error.code === "turn_unavailable")) {
+					setError(result.error.message ?? result.error.code);
+				}
+			} catch (failure) {
+				setError(failureMessage(failure));
+			} finally {
+				setPending(undefined);
+			}
+			return;
+		}
+		if (!hasText || pending !== undefined) return;
+		const submitted = text;
+		setPending("send");
+		try {
+			const result = await onSend(submitted);
+			if (result.ok && result.status === 202) {
+				setText("");
+				return;
+			}
+			if (!result.ok && result.status === 409 && result.error.code === "context_exhausted") {
+				setError("Context is exhausted. Compact the session, then try again.");
+				return;
+			}
+			if (!result.ok) {
+				setError(result.error.message ?? result.error.code);
+				return;
+			}
+			setError(`Prompt admission returned HTTP ${result.status}`);
+		} catch (failure) {
+			setError(failureMessage(failure));
+		} finally {
+			setPending(undefined);
+		}
+	};
+	const keyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+		if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+		event.preventDefault();
+		if (stopMode) return;
+		void submit();
+	};
+	return (
+		<form
+			className="rounded-2xl border border-[var(--line)] bg-[var(--background)] p-2 shadow-[var(--shadow)] focus-within:border-[color-mix(in_srgb,var(--accent)_45%,var(--line))]"
+			onSubmit={(event) => {
+				event.preventDefault();
+				void submit();
+			}}
+		>
+			<div className="flex items-end gap-2">
+				<textarea
+					aria-label="Prompt"
+					className="field-sizing-content max-h-48 min-h-12 flex-1 resize-none bg-transparent px-3 py-3 text-sm leading-6 text-[var(--text)] outline-none placeholder:text-[var(--faint)]"
+					onChange={(event) => setText(event.target.value)}
+					onKeyDown={keyDown}
+					placeholder="Ask ker to do something…"
+					ref={textareaRef}
+					rows={1}
+					value={text}
+				/>
+				<button
+					className={`grid min-w-20 place-items-center rounded-xl px-4 py-3 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${stopMode ? "bg-red-600 text-white" : "bg-[var(--accent)] text-white"}`}
+					disabled={disabled}
+					type="submit"
+				>
+					{label}
+				</button>
+			</div>
+			{error ? (
+				<p className="px-3 pb-2 pt-1 text-xs text-red-700 dark:text-red-300" role="alert">
+					{error}
+				</p>
+			) : null}
+		</form>
+	);
+}
+
+function failureMessage(failure: unknown): string {
+	return failure instanceof Error ? failure.message : String(failure);
 }

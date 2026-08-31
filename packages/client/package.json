@@ -8,14 +8,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./sse": {
-      "types": "./dist/sse.d.ts",
-      "import": "./dist/sse.js"
-    }
+    ".": "./src/index.ts",
+    "./sse": "./src/sse.ts"
   },
   "engines": { "node": ">=24.0.0" },
   "dependencies": { "@ker-ai/protocol": "^0.0.0" },

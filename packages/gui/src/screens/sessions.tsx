@@ -11,11 +11,22 @@ interface SessionsState {
 	error?: string;
 }
 
-export function SessionsScreen({ projectId }: { projectId: string }) {
+export function SessionsScreen({
+	projectId,
+	listProjectSessions = api.listProjectSessions,
+	createProjectSession = api.createProjectSession,
+	navigate,
+}: {
+	projectId: string;
+	listProjectSessions?: typeof api.listProjectSessions;
+	createProjectSession?: typeof api.createProjectSession;
+	navigate?: (route: string) => void;
+}) {
 	const [state, setState] = useState<SessionsState>({ sessions: [], loaded: false });
+	const [creating, setCreating] = useState(false);
 	const refetch = useCallback(async () => {
 		try {
-			const result = await api.listProjectSessions(projectId);
+			const result = await listProjectSessions(projectId);
 			if (!result.ok) {
 				setState((current) => ({ ...current, loaded: true, error: result.error.message ?? result.error.code }));
 				return;
@@ -28,8 +39,33 @@ export function SessionsScreen({ projectId }: { projectId: string }) {
 				error: error instanceof Error ? error.message : String(error),
 			}));
 		}
-	}, [projectId]);
+	}, [listProjectSessions, projectId]);
 	useVisiblePoll(refetch);
+	const createSession = async () => {
+		setCreating(true);
+		setState((current) => ({ ...current, error: undefined }));
+		try {
+			const result = await createProjectSession(projectId);
+			if (!result.ok) {
+				setState((current) => ({ ...current, error: result.error.message ?? result.error.code }));
+				setCreating(false);
+				return;
+			}
+			const route = formatRoute({ screen: "transcript", projectId, sessionId: result.value.id });
+			setCreating(false);
+			if (navigate) {
+				navigate(route);
+				return;
+			}
+			window.location.hash = route;
+		} catch (error) {
+			setState((current) => ({
+				...current,
+				error: error instanceof Error ? error.message : String(error),
+			}));
+			setCreating(false);
+		}
+	};
 	const sessions = [...state.sessions].sort((left, right) =>
 		(right.updatedAt ?? "").localeCompare(left.updatedAt ?? ""),
 	);
@@ -40,10 +76,20 @@ export function SessionsScreen({ projectId }: { projectId: string }) {
 			<a className="back-link" href={formatRoute({ screen: "projects" })}>
 				← Projects
 			</a>
-			<header className="mb-8 mt-6">
-				<p className="mb-2 font-mono text-xs tracking-[0.18em] text-[var(--muted)] uppercase">Project</p>
-				<h1 className="text-4xl font-semibold tracking-[-0.04em] text-[var(--text)]">{projectName}</h1>
-				<p className="mt-3 font-mono text-xs text-[var(--faint)]">{projectId}</p>
+			<header className="mb-8 mt-6 flex items-end justify-between gap-5">
+				<div className="min-w-0">
+					<p className="mb-2 font-mono text-xs tracking-[0.18em] text-[var(--muted)] uppercase">Project</p>
+					<h1 className="truncate text-4xl font-semibold tracking-[-0.04em] text-[var(--text)]">{projectName}</h1>
+					<p className="mt-3 truncate font-mono text-xs text-[var(--faint)]">{projectId}</p>
+				</div>
+				<button
+					className="shrink-0 rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
+					disabled={creating}
+					onClick={() => void createSession()}
+					type="button"
+				>
+					{creating ? "Creating…" : "New session"}
+				</button>
 			</header>
 
 			{state.error ? (

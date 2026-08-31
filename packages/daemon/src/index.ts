@@ -181,6 +181,18 @@ const handlers = {
 		const body: Protocol.ListSessionsResponse = { sessions };
 		writeJson(res, 200, body);
 	},
+	createProjectSession: async ({ manager, res, params }) => {
+		const created = await manager.createProjectSession(params.projectId);
+		if (created === "missing") {
+			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		if (created === "ambiguous") {
+			writeJson(res, 409, { code: "workspace_ambiguous" });
+			return;
+		}
+		writeJson(res, 201, created);
+	},
 	createSession: async ({ manager, res, body }) => {
 		const request = body as Protocol.CreateSessionRequest;
 		writeJson(res, 201, await manager.createSession(request.cwd));

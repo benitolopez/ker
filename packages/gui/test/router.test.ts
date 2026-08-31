@@ -1,5 +1,4 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
+import { assert, test } from "vitest";
 import { formatRoute, parseHash } from "../src/router.ts";
 
 test("parses every GUI hash route and falls back to projects", () => {

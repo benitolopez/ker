@@ -58,6 +58,29 @@ export class ControlPlane {
 		return descriptor;
 	}
 
+	async createProjectSession(
+		projectId: Protocol.ProjectId,
+	): Promise<Protocol.ReadableCatalogSession | "missing" | "ambiguous"> {
+		if (!this.#catalog.projectExists(projectId)) return "missing";
+		const workspaces = this.#catalog.projectWorkspaces(projectId);
+		if (workspaces.length !== 1) return "ambiguous";
+		const binding = workspaces[0];
+		const descriptor = await this.#node.createSession(binding.rootPath);
+		this.#catalog.upsertCreated(descriptor, binding);
+		return {
+			status: "idle",
+			id: descriptor.id,
+			cwd: descriptor.cwd,
+			projectId: binding.projectId,
+			projectName: binding.projectName,
+			workspaceId: binding.workspaceId,
+			nodeId: binding.nodeId,
+			title: null,
+			createdAt: descriptor.createdAt,
+			updatedAt: descriptor.updatedAt,
+		};
+	}
+
 	listSessions(scope?: { projectRoot: string }): Protocol.CatalogSession[] {
 		return this.#catalog
 			.list(scope ? { nodeId: this.#node.identity.id, rootPath: scope.projectRoot } : undefined)

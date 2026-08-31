@@ -37,6 +37,16 @@ test("daemon responses conform to the route table", async (t) => {
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/${project.id}/sessions`), 200);
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/missing/sessions`), 404);
 	await assertJson(
+		"createProjectSession",
+		await localFetch(`${running.url}/projects/${project.id}/sessions`, { method: "POST" }),
+		201,
+	);
+	await assertJson(
+		"createProjectSession",
+		await localFetch(`${running.url}/projects/missing/sessions`, { method: "POST" }),
+		404,
+	);
+	await assertJson(
 		"listSessions",
 		await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(process.cwd())}`),
 		200,

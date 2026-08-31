@@ -45,14 +45,23 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 		listed.value.sessions.map((candidate) => candidate.id),
 		[session.id],
 	);
+	const createdForProject = await client.createProjectSession(projects.value.projects[0]?.id ?? "missing");
+	assert(createdForProject.ok);
+	assert.equal(createdForProject.value.projectId, projects.value.projects[0]?.id);
+	const missingProject = await client.createProjectSession("missing");
+	assert.equal(missingProject.ok, false);
+	if (!missingProject.ok) {
+		assert.equal(missingProject.status, 404);
+		assert.equal(missingProject.error.code, "project_not_found");
+	}
 
-	const snapshot = await client.snapshot(session.id);
+	const snapshot = await client.snapshot(createdForProject.value.id);
 	assert(snapshot.ok);
-	const subscription = await client.subscribe(session.id, snapshot.value.cursor);
+	const subscription = await client.subscribe(createdForProject.value.id, snapshot.value.cursor);
 	assert.equal(subscription.kind, "stream");
 	if (subscription.kind !== "stream") throw new Error("Expected an event stream");
 
-	const admitted = await client.prompt(session.id, "hello");
+	const admitted = await client.prompt(createdForProject.value.id, "hello");
 	assert(admitted.ok);
 	const observed: Protocol.Event["type"][] = [];
 	for await (const envelope of subscription.envelopes) {
@@ -63,11 +72,11 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	assert(observed.includes("message_delta"));
 	assert.equal(observed.at(-1), "end");
 
-	const compacted = await client.compact(session.id, "preserve decisions");
+	const compacted = await client.compact(createdForProject.value.id, "preserve decisions");
 	assert(compacted.ok);
 	assert.equal(compacted.status, 202);
 
-	const unavailable = await client.cancel(session.id, "missing-turn");
+	const unavailable = await client.cancel(createdForProject.value.id, "missing-turn");
 	assert.equal(unavailable.ok, false);
 	if (!unavailable.ok) {
 		assert.equal(unavailable.status, 409);
@@ -183,6 +192,18 @@ test("the client passes abort signals through and leaves network errors untouche
 		throw failure;
 	});
 	await assert.rejects(createClient().health(controller.signal), (error) => error === failure);
+});
+
+test("project session creation posts without a body or content type", async (t) => {
+	t.mock.method(globalThis, "fetch", async (input: string | URL | globalThis.Request, init?: RequestInit) => {
+		assert.equal(String(input), "http://127.0.0.1:5537/projects/project%2Fone/sessions");
+		assert.equal(init?.method, "POST");
+		assert.equal(init?.body, undefined);
+		assert.equal(init?.headers, undefined);
+		return Response.json({});
+	});
+	const result = await createClient().createProjectSession("project/one");
+	assert.equal(result.ok, true);
 });
 
 async function startServer(t: TestContext): Promise<{ url: string }> {

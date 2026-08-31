@@ -1,5 +1,4 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
+import { assert, test } from "vitest";
 import { type PollEnvironment, startVisiblePoll } from "../src/store/poll.ts";
 
 test("polls while visible and refetches on focus and visibility changes", async () => {

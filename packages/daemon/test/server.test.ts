@@ -103,6 +103,93 @@ test("lists projects with aggregates and project-scoped sessions", async (t) => 
 	assert.deepEqual(await readJson(missing.body), { code: "project_not_found" });
 });
 
+test("creates a project session at its workspace root", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-project-create-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const projectRoot = join(root, "project");
+	await mkdir(projectRoot);
+	const catalogPath = join(root, "catalog.db");
+	const running = await startServer(t, immediateFactory(), { sessionDir: join(root, "sessions"), catalogPath });
+	await createSession(running.url, projectRoot);
+	const projects = await readJson<Protocol.ListProjectsResponse>((await localFetch(`${running.url}/projects`)).body);
+	const project = projects.projects[0];
+	assert(project);
+
+	const response = await rawCreateProjectSession(running.url, project.id);
+	assert.equal(response.status, 201);
+	const created = await readJson<Protocol.ReadableCatalogSession>(response.body);
+	assert.deepEqual(created, {
+		status: "idle",
+		id: created.id,
+		cwd: await realpath(projectRoot),
+		projectId: project.id,
+		projectName: project.name,
+		workspaceId: created.workspaceId,
+		nodeId: created.nodeId,
+		title: null,
+		createdAt: created.createdAt,
+		updatedAt: created.updatedAt,
+	});
+	const client = new DatabaseSync(catalogPath);
+	const stored = client
+		.prepare("SELECT project_id, workspace_id, node_id FROM session WHERE id = ?")
+		.get(created.id) as { project_id: string; workspace_id: string; node_id: string };
+	assert.equal(stored.project_id, project.id);
+	assert.equal(stored.workspace_id, created.workspaceId);
+	assert.equal(stored.node_id, created.nodeId);
+	client.close();
+	assert.equal((await getSnapshot(running.url, created.id)).session.cwd, created.cwd);
+	const admitted = await prompt(running.url, created.id, "created from the project");
+	await waitForTerminal(running.url, created.id, admitted.turnId);
+});
+
+test("project session creation rejects unknown and ambiguous projects", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-project-create-errors-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const projectRoot = join(root, "project");
+	await mkdir(projectRoot);
+	const catalogPath = join(root, "catalog.db");
+	const running = await startServer(t, immediateFactory(), { sessionDir: join(root, "sessions"), catalogPath });
+
+	const missing = await rawCreateProjectSession(running.url, "missing");
+	assert.equal(missing.status, 404);
+	assert.deepEqual(await readJson(missing.body), { code: "project_not_found" });
+
+	const seeded = await createSession(running.url, projectRoot);
+	const client = new DatabaseSync(catalogPath);
+	const binding = client.prepare("SELECT project_id, node_id FROM session WHERE id = ?").get(seeded.id) as {
+		project_id: string;
+		node_id: string;
+	};
+	client
+		.prepare(
+			"INSERT INTO workspace (id, project_id, node_id, root_path, git_remote, created_at) VALUES (?, ?, ?, ?, NULL, ?)",
+		)
+		.run("workspace-second", binding.project_id, binding.node_id, join(root, "other"), new Date().toISOString());
+	client.close();
+
+	const ambiguous = await rawCreateProjectSession(running.url, binding.project_id);
+	assert.equal(ambiguous.status, 409);
+	assert.deepEqual(await readJson(ambiguous.body), { code: "workspace_ambiguous" });
+});
+
+test("project session creation rejects a workspace root that vanished", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-project-create-vanished-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const projectRoot = join(root, "project");
+	await mkdir(projectRoot);
+	const running = await startServer(t, immediateFactory(), { sessionDir: join(root, "sessions") });
+	await createSession(running.url, projectRoot);
+	const projects = await readJson<Protocol.ListProjectsResponse>((await localFetch(`${running.url}/projects`)).body);
+	const project = projects.projects[0];
+	assert(project);
+	await rm(projectRoot, { recursive: true });
+
+	const response = await rawCreateProjectSession(running.url, project.id);
+	assert.equal(response.status, 400);
+	assert.deepEqual(await readJson(response.body), { code: "invalid_cwd" });
+});
+
 test("serves injected GUI files with cache headers and guards the asset directory", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "ker-daemon-gui-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
@@ -3545,6 +3632,10 @@ async function createSession(url: string, cwd = process.cwd()): Promise<Protocol
 	});
 	assert.equal(response.status, 201);
 	return readJson(response.body);
+}
+
+function rawCreateProjectSession(url: string, projectId: string): Promise<TestResponse> {
+	return localFetch(`${url}/projects/${encodeURIComponent(projectId)}/sessions`, { method: "POST" });
 }
 
 async function getSnapshot(url: string, sessionId: string): Promise<Protocol.SessionSnapshot> {

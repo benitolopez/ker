@@ -108,6 +108,22 @@ export class Catalog {
 			.get();
 	}
 
+	projectWorkspaces(projectId: Protocol.ProjectId): WorkspaceBinding[] {
+		return this.#db
+			.select({
+				projectId: project.id,
+				projectName: project.name,
+				workspaceId: workspace.id,
+				nodeId: workspace.node_id,
+				rootPath: workspace.root_path,
+				gitRemote: workspace.git_remote,
+			})
+			.from(workspace)
+			.innerJoin(project, eq(workspace.project_id, project.id))
+			.where(eq(workspace.project_id, projectId))
+			.all();
+	}
+
 	createWorkspace(input: {
 		nodeId: Protocol.NodeId;
 		rootPath: string;

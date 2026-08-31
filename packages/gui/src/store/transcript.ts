@@ -46,7 +46,9 @@ export class TranscriptStore {
 	readonly #toolCallIds = new Set<string>();
 	readonly #toolKeysByCallId = new Map<string, string>();
 	readonly #compactionTurnIds = new Set<Protocol.TurnId>();
+	readonly #waitingCancellationTurnIds = new Set<Protocol.TurnId>();
 	readonly #eventIds = new Set<string>();
+	#authMode?: Protocol.AuthEvent["mode"];
 
 	getSnapshot = (): TranscriptView => this.#view;
 
@@ -81,7 +83,9 @@ export class TranscriptStore {
 		this.#toolCallIds.clear();
 		this.#toolKeysByCallId.clear();
 		this.#compactionTurnIds.clear();
+		this.#waitingCancellationTurnIds.clear();
 		this.#eventIds.clear();
+		this.#authMode = undefined;
 		this.#view = {
 			blockKeys: [],
 			header: {
@@ -167,7 +171,11 @@ export class TranscriptStore {
 			this.#prompt(event.messageId, event.text);
 		}
 		if (event.type === "message_undelivered") {
-			this.#notice(`notice:${eventId}`, `Prompt was not delivered: ${event.reason}\n${event.text}`, "error");
+			this.#notice(
+				`notice:${eventId}`,
+				`Prompt was not delivered: ${event.reason}\n${event.text}`,
+				event.reason === "cancelled" ? "info" : "error",
+			);
 		}
 		if (event.type === "message_delta") this.#appendAnswer(event.messageId, event.offset, event.text);
 		if (event.type === "reasoning_delta") this.#appendReasoning(event.messageId, event.offset, event.text);
@@ -184,6 +192,7 @@ export class TranscriptStore {
 			for (const item of [event.queue.running, ...event.queue.waiting]) {
 				if (item?.kind === "prompt") this.#prompt(item.messageId, item.text);
 			}
+			this.#waitingCancellationTurnIds.clear();
 			this.#notifyView();
 		}
 		if (event.type === "compaction_submitted") {
@@ -218,8 +227,17 @@ export class TranscriptStore {
 				"info",
 			);
 		}
-		if (event.type === "auth") this.#notice(`notice:${eventId}`, `Authenticated with ${event.mode}.`, "info");
-		if (event.type === "turn_cancel_requested") {
+		if (event.type === "auth" && this.#authMode !== event.mode) {
+			this.#authMode = event.mode;
+			this.#notice(`notice:${eventId}`, `Authenticated with ${event.mode}.`, "info");
+		}
+		if (
+			event.type === "turn_cancel_requested" &&
+			this.#view.queue.waiting.some((item) => item.turnId === event.turnId)
+		) {
+			this.#waitingCancellationTurnIds.add(event.turnId);
+		}
+		if (event.type === "turn_cancel_requested" && !this.#waitingCancellationTurnIds.has(event.turnId)) {
 			this.#setStatus("cancelling");
 			this.#notice(`notice:${eventId}`, "Cancellation requested.", "info");
 		}
@@ -228,17 +246,23 @@ export class TranscriptStore {
 			this.#notice(`notice:${eventId}`, event.message, "error");
 		}
 		if (event.type === "aborted" || event.type === "interrupted" || event.type === "cancelled") {
-			this.#setStatus(event.type);
-			this.#notice(`notice:${eventId}`, `Turn ${event.type}.`, event.type === "interrupted" ? "error" : "info");
+			const waitingCancellation = event.type === "cancelled" && this.#waitingCancellationTurnIds.has(event.turnId);
+			if (!waitingCancellation) {
+				this.#setStatus(event.type);
+				this.#notice(`notice:${eventId}`, `Turn ${event.type}.`, event.type === "interrupted" ? "error" : "info");
+			}
 		}
 		if (event.type === "turn_terminal") {
-			this.#setStatus(event.reason);
-			if (event.reason !== "completed") {
-				this.#notice(
-					`notice:${eventId}`,
-					`Turn ended: ${event.reason}.`,
-					event.reason === "error" || event.reason === "interrupted" ? "error" : "info",
-				);
+			const waitingCancellation = event.reason === "cancelled" && this.#waitingCancellationTurnIds.has(event.turnId);
+			if (!waitingCancellation) {
+				this.#setStatus(event.reason);
+				if (event.reason !== "completed") {
+					this.#notice(
+						`notice:${eventId}`,
+						`Turn ended: ${event.reason}.`,
+						event.reason === "error" || event.reason === "interrupted" ? "error" : "info",
+					);
+				}
 			}
 		}
 		this.#notifyActivity();

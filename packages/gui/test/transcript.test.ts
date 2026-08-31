@@ -1,6 +1,5 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
 import type * as Protocol from "@ker-ai/protocol";
+import { assert, test } from "vitest";
 import { TranscriptStore } from "../src/store/transcript.ts";
 
 test("rebuilds a structurally faithful transcript from a snapshot", () => {
@@ -162,6 +161,17 @@ test("pairs live tools and applies queue, usage, notices, and full resets", () =
 			message: "model failed",
 		}),
 	);
+	store.apply(
+		envelope(6, {
+			actor: "process",
+			sessionId: "session-1",
+			turnId: "turn-queued",
+			type: "message_undelivered",
+			messageId: "prompt-queued",
+			text: "removed prompt",
+			reason: "cancelled",
+		}),
+	);
 
 	const tool = store.getBlockSnapshot("tool:call-live").block;
 	assert.equal(tool?.kind, "tool");
@@ -170,12 +180,124 @@ test("pairs live tools and applies queue, usage, notices, and full resets", () =
 	assert.equal(store.getSnapshot().header?.usage.cumulative.total, 16);
 	assert.equal(store.getSnapshot().header?.status, "error");
 	assert.equal(store.getSnapshot().queue.revision, 2);
+	assert.equal(store.getBlockSnapshot("notice:epoch-1:6").block?.kind, "notice");
+	const cancelled = store.getBlockSnapshot("notice:epoch-1:6").block;
+	if (cancelled?.kind === "notice") assert.equal(cancelled.tone, "info");
 
 	const replacement = snapshot();
 	replacement.session.id = "session-2";
 	store.reset(replacement);
 	assert.deepEqual(store.getSnapshot().blockKeys, []);
 	assert.equal(store.getSnapshot().header?.session.id, "session-2");
+});
+
+test("shows only the undelivered notice when a waiting prompt is cancelled", () => {
+	const store = new TranscriptStore();
+	const value = snapshot();
+	value.queue = {
+		revision: 1,
+		running: {
+			id: "queue-running",
+			turnId: "turn-running",
+			kind: "prompt",
+			messageId: "prompt-running",
+			text: "Running",
+			state: "running",
+			submittedAt: "2026-01-01T00:00:00.000Z",
+		},
+		waiting: [
+			{
+				id: "queue-waiting",
+				turnId: "turn-waiting",
+				kind: "prompt",
+				messageId: "prompt-waiting",
+				text: "Waiting",
+				state: "waiting",
+				submittedAt: "2026-01-01T00:00:01.000Z",
+			},
+		],
+	};
+	store.reset(value);
+	store.apply(
+		envelope(1, {
+			actor: "human",
+			sessionId: "session-1",
+			turnId: "turn-waiting",
+			type: "turn_cancel_requested",
+		}),
+	);
+	store.apply(
+		envelope(2, {
+			actor: "process",
+			sessionId: "session-1",
+			turnId: "turn-waiting",
+			type: "message_undelivered",
+			messageId: "prompt-waiting",
+			text: "Waiting",
+			reason: "cancelled",
+		}),
+	);
+	store.apply(
+		envelope(3, {
+			actor: "process",
+			sessionId: "session-1",
+			turnId: "turn-waiting",
+			type: "cancelled",
+		}),
+	);
+	store.apply(
+		envelope(4, {
+			actor: "process",
+			sessionId: "session-1",
+			turnId: "turn-waiting",
+			type: "turn_terminal",
+			reason: "cancelled",
+		}),
+	);
+	store.apply(
+		envelope(5, {
+			actor: "process",
+			sessionId: "session-1",
+			type: "queue_changed",
+			queue: { revision: 2, running: value.queue.running, waiting: [] },
+		}),
+	);
+
+	const notices = store
+		.getSnapshot()
+		.blockKeys.map((key) => store.getBlockSnapshot(key).block)
+		.filter((block): block is Extract<NonNullable<typeof block>, { kind: "notice" }> => block?.kind === "notice");
+	assert.deepEqual(
+		notices.map((notice) => notice.text),
+		["Prompt was not delivered: cancelled\nWaiting"],
+	);
+	assert.equal(store.getSnapshot().header?.status, "running");
+});
+
+test("shows authentication notices only when the mode changes", () => {
+	const store = new TranscriptStore();
+	store.reset(snapshot());
+	const modes: Protocol.AuthEvent["mode"][] = ["oauth", "oauth", "apikey", "apikey"];
+	for (const [sequence, mode] of modes.entries()) {
+		store.apply(
+			envelope(sequence + 1, {
+				actor: "process",
+				sessionId: "session-1",
+				turnId: `turn-${sequence + 1}`,
+				type: "auth",
+				mode,
+			}),
+		);
+	}
+
+	const notices = store
+		.getSnapshot()
+		.blockKeys.map((key) => store.getBlockSnapshot(key).block)
+		.filter((block): block is Extract<NonNullable<typeof block>, { kind: "notice" }> => block?.kind === "notice");
+	assert.deepEqual(
+		notices.map((notice) => notice.text),
+		["Authenticated with oauth.", "Authenticated with apikey."],
+	);
 });
 
 function snapshot(): Protocol.SessionSnapshot {
