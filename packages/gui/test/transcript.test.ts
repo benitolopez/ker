@@ -50,15 +50,24 @@ test("rebuilds a structurally faithful transcript from a snapshot", () => {
 	value.active = { id: "answer-3", turnId: "turn-3", text: "Streaming" };
 	value.queue = {
 		revision: 2,
+		running: {
+			id: "queue-running",
+			turnId: "turn-4",
+			kind: "prompt",
+			messageId: "prompt-2",
+			text: "Running",
+			state: "running",
+			submittedAt: "2026-01-01T00:00:00.000Z",
+		},
 		waiting: [
 			{
-				id: "queue-1",
-				turnId: "turn-4",
+				id: "queue-waiting",
+				turnId: "turn-5",
 				kind: "prompt",
-				messageId: "prompt-2",
+				messageId: "prompt-3",
 				text: "Queued",
 				state: "waiting",
-				submittedAt: "2026-01-01T00:00:00.000Z",
+				submittedAt: "2026-01-01T00:00:01.000Z",
 			},
 		],
 	};
@@ -77,7 +86,9 @@ test("rebuilds a structurally faithful transcript from a snapshot", () => {
 	assert.equal(tool?.kind, "tool");
 	if (tool?.kind === "tool") assert.deepEqual(tool.result, { status: "ok", output: "file contents" });
 	assert.equal(store.getBlockSnapshot("answer:answer-3").block?.kind, "answer");
-	assert.equal(store.getSnapshot().header?.status, "waiting");
+	assert.equal(store.getBlockSnapshot("prompt:prompt-2").block?.kind, "prompt");
+	assert.equal(store.getBlockSnapshot("prompt:prompt-3").block, undefined);
+	assert.equal(store.getSnapshot().header?.status, "running");
 });
 
 test("checks delta offsets, deduplicates envelopes, and wakes only the changed block", () => {
@@ -169,7 +180,7 @@ test("pairs live tools and applies queue, usage, notices, and full resets", () =
 			type: "message_undelivered",
 			messageId: "prompt-queued",
 			text: "removed prompt",
-			reason: "cancelled",
+			reason: "expired",
 		}),
 	);
 
@@ -180,9 +191,12 @@ test("pairs live tools and applies queue, usage, notices, and full resets", () =
 	assert.equal(store.getSnapshot().header?.usage.cumulative.total, 16);
 	assert.equal(store.getSnapshot().header?.status, "error");
 	assert.equal(store.getSnapshot().queue.revision, 2);
-	assert.equal(store.getBlockSnapshot("notice:epoch-1:6").block?.kind, "notice");
-	const cancelled = store.getBlockSnapshot("notice:epoch-1:6").block;
-	if (cancelled?.kind === "notice") assert.equal(cancelled.tone, "info");
+	assert.deepEqual(store.getBlockSnapshot("notice:epoch-1:6").block, {
+		kind: "notice",
+		key: "notice:epoch-1:6",
+		text: "Prompt was not delivered: expired\nremoved prompt",
+		tone: "error",
+	});
 
 	const replacement = snapshot();
 	replacement.session.id = "session-2";
@@ -191,7 +205,7 @@ test("pairs live tools and applies queue, usage, notices, and full resets", () =
 	assert.equal(store.getSnapshot().header?.session.id, "session-2");
 });
 
-test("shows only the undelivered notice when a waiting prompt is cancelled", () => {
+test("leaves no transcript trace when a waiting prompt is cancelled", () => {
 	const store = new TranscriptStore();
 	const value = snapshot();
 	value.queue = {
@@ -267,11 +281,93 @@ test("shows only the undelivered notice when a waiting prompt is cancelled", () 
 		.getSnapshot()
 		.blockKeys.map((key) => store.getBlockSnapshot(key).block)
 		.filter((block): block is Extract<NonNullable<typeof block>, { kind: "notice" }> => block?.kind === "notice");
-	assert.deepEqual(
-		notices.map((notice) => notice.text),
-		["Prompt was not delivered: cancelled\nWaiting"],
-	);
+	assert.deepEqual(notices, []);
+	assert.equal(store.getBlockSnapshot("prompt:prompt-running").block?.kind, "prompt");
+	assert.equal(store.getBlockSnapshot("prompt:prompt-waiting").block, undefined);
 	assert.equal(store.getSnapshot().header?.status, "running");
+});
+
+test("shows a waiting prompt when it is promoted and deduplicates delivery", () => {
+	const store = new TranscriptStore();
+	store.reset(snapshot());
+	store.apply(
+		envelope(1, {
+			actor: "human",
+			sessionId: "session-1",
+			turnId: "turn-queued",
+			type: "message_submitted",
+			messageId: "prompt-queued",
+			queueItemId: "queue-queued",
+			text: "Queued prompt",
+			admission: "waiting",
+		}),
+	);
+
+	assert.equal(store.getBlockSnapshot("prompt:prompt-queued").block, undefined);
+
+	store.apply(
+		envelope(2, {
+			actor: "process",
+			sessionId: "session-1",
+			type: "queue_changed",
+			queue: {
+				revision: 1,
+				running: {
+					id: "queue-queued",
+					turnId: "turn-queued",
+					kind: "prompt",
+					messageId: "prompt-queued",
+					text: "Queued prompt",
+					state: "running",
+					submittedAt: "2026-01-01T00:00:00.000Z",
+				},
+				waiting: [],
+			},
+		}),
+	);
+
+	assert.deepEqual(store.getBlockSnapshot("prompt:prompt-queued").block, {
+		kind: "prompt",
+		key: "prompt:prompt-queued",
+		text: "Queued prompt",
+	});
+
+	store.apply(
+		envelope(3, {
+			actor: "human",
+			modelRole: "user",
+			sessionId: "session-1",
+			turnId: "turn-queued",
+			type: "message_delivered",
+			messageId: "prompt-queued",
+			text: "Queued prompt",
+		}),
+	);
+
+	assert.deepEqual(store.getSnapshot().blockKeys, ["prompt:prompt-queued"]);
+});
+
+test("shows a prompt submitted directly into a running turn", () => {
+	const store = new TranscriptStore();
+	store.reset(snapshot());
+	store.apply(
+		envelope(1, {
+			actor: "human",
+			sessionId: "session-1",
+			turnId: "turn-running",
+			type: "message_submitted",
+			messageId: "prompt-running",
+			queueItemId: "queue-running",
+			text: "Run now",
+			admission: "running",
+		}),
+	);
+
+	assert.deepEqual(store.getBlockSnapshot("prompt:prompt-running").block, {
+		kind: "prompt",
+		key: "prompt:prompt-running",
+		text: "Run now",
+	});
 });
 
 test("shows authentication notices only when the mode changes", () => {

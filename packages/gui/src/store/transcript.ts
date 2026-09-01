@@ -147,9 +147,8 @@ export class TranscriptStore {
 			if (snapshot.entries[index + 1]?.turnId !== entry.turnId) flush(entry.turnId);
 		}
 		for (const turnId of pendingByTurn.keys()) flush(turnId);
-		for (const item of [snapshot.queue.running, ...snapshot.queue.waiting]) {
-			if (item?.kind === "prompt") this.#prompt(item.messageId, item.text);
-		}
+		const running = snapshot.queue.running;
+		if (running?.kind === "prompt") this.#prompt(running.messageId, running.text);
 		if (snapshot.compactionFailure) {
 			this.#notice(
 				`notice:compaction-failure:${snapshot.compactionFailure.turnId}`,
@@ -167,15 +166,12 @@ export class TranscriptStore {
 		if (this.#eventIds.has(eventId)) return;
 		this.#eventIds.add(eventId);
 		const event = envelope.event;
-		if (event.type === "message_submitted" || event.type === "message_delivered") {
+		if (event.type === "message_submitted" && event.admission === "running") {
 			this.#prompt(event.messageId, event.text);
 		}
-		if (event.type === "message_undelivered") {
-			this.#notice(
-				`notice:${eventId}`,
-				`Prompt was not delivered: ${event.reason}\n${event.text}`,
-				event.reason === "cancelled" ? "info" : "error",
-			);
+		if (event.type === "message_delivered") this.#prompt(event.messageId, event.text);
+		if (event.type === "message_undelivered" && event.reason !== "cancelled") {
+			this.#notice(`notice:${eventId}`, `Prompt was not delivered: ${event.reason}\n${event.text}`, "error");
 		}
 		if (event.type === "message_delta") this.#appendAnswer(event.messageId, event.offset, event.text);
 		if (event.type === "reasoning_delta") this.#appendReasoning(event.messageId, event.offset, event.text);
@@ -189,9 +185,8 @@ export class TranscriptStore {
 				queue: event.queue,
 				header: this.#view.header ? { ...this.#view.header, status: sessionStatus(event.queue) } : undefined,
 			};
-			for (const item of [event.queue.running, ...event.queue.waiting]) {
-				if (item?.kind === "prompt") this.#prompt(item.messageId, item.text);
-			}
+			const running = event.queue.running;
+			if (running?.kind === "prompt") this.#prompt(running.messageId, running.text);
 			this.#waitingCancellationTurnIds.clear();
 			this.#notifyView();
 		}
