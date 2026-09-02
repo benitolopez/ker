@@ -142,6 +142,7 @@ test("keeps v4 sessions unreadable without changing their bytes", async (t) => {
 	const scan = await store.scanCatalog();
 	assert.deepEqual(scan.sessions, []);
 	assert.equal(scan.unreadable[0]?.id, session.session.id);
+	assert.match(scan.unreadable[0]?.error ?? "", /Unsupported store version 4/);
 	assert.equal(await readFile(session.log.path, "utf8"), v4);
 });
 

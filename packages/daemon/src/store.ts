@@ -393,11 +393,13 @@ function parseRecord(line: string, path: string): StoredRecord {
 }
 
 function validateRecord(parsed: unknown, path: string): StoredRecord {
+	if (typeof parsed !== "object" || parsed === null || !("version" in parsed)) {
+		throw new Error(`Malformed record in ${path}`);
+	}
+	if (parsed.version !== STORE_VERSION) {
+		throw new Error(`Unsupported store version ${String(parsed.version)} in ${path}`);
+	}
 	if (
-		typeof parsed !== "object" ||
-		parsed === null ||
-		!("version" in parsed) ||
-		parsed.version !== STORE_VERSION ||
 		!("recordId" in parsed) ||
 		typeof parsed.recordId !== "string" ||
 		!("previousRecordId" in parsed) ||
