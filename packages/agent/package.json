@@ -9,7 +9,7 @@
   "types": "./dist/index.d.ts",
   "exports": { ".": "./src/index.ts" },
   "engines": { "node": ">=24.0.0" },
-  "dependencies": { "@ker-ai/engine": "^0.0.0" },
+  "dependencies": { "@ker-ai/engine": "^0.0.0", "diff": "8.0.4" },
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
     "clean": "shx rm -rf dist",

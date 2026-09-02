@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
+import type * as Engine from "@ker-ai/engine";
 import { applyEdit, createDefinition } from "../src/index.ts";
 
 function editTool() {
@@ -63,7 +64,13 @@ test("edits a file on disk and returns the success line", async (t) => {
 	const dir = await tempDir(t);
 	const path = join(dir, "f.txt");
 	await writeFile(path, "hello world", "utf8");
-	assert.equal(await edit.execute({ path, old_string: "world", new_string: "there" }), `Edited ${path} (1 occurrence)`);
+	const result = requireToolResult(await edit.execute({ path, old_string: "world", new_string: "there" }));
+	assert.equal(result.output, `Edited ${path} (1 occurrence)`);
+	assert.deepEqual(result.details, {
+		kind: "diff",
+		path,
+		patch: `--- ${path}\n+++ ${path}\n@@ -1,1 +1,1 @@\n-hello world\n\\ No newline at end of file\n+hello there\n\\ No newline at end of file\n`,
+	});
 	assert.equal(await readFile(path, "utf8"), "hello there");
 });
 
@@ -71,11 +78,48 @@ test("replaceAll on disk rewrites every occurrence", async (t) => {
 	const dir = await tempDir(t);
 	const path = join(dir, "g.txt");
 	await writeFile(path, "x x x", "utf8");
-	assert.equal(
-		await edit.execute({ path, old_string: "x", new_string: "y", replaceAll: true }),
-		`Edited ${path} (3 occurrences)`,
-	);
+	const result = requireToolResult(await edit.execute({ path, old_string: "x", new_string: "y", replaceAll: true }));
+	assert.equal(result.output, `Edited ${path} (3 occurrences)`);
 	assert.equal(await readFile(path, "utf8"), "y y y");
+});
+
+test("replaceAll emits separate hunks for distant replacements", async (t) => {
+	const dir = await tempDir(t);
+	const path = join(dir, "hunks.txt");
+	const original = Array.from({ length: 20 }, (_, index) =>
+		index === 0 || index === 19 ? "target" : `line ${index}`,
+	).join("\n");
+	await writeFile(path, `${original}\n`, "utf8");
+
+	const result = requireToolResult(
+		await edit.execute({ path, old_string: "target", new_string: "changed", replaceAll: true }),
+	);
+
+	assert.equal(result.details?.kind, "diff");
+	if (result.details?.kind === "diff") assert.equal(result.details.patch.match(/^@@/gm)?.length, 2);
+});
+
+test("the patch preserves a CRLF file's native line endings", async (t) => {
+	const dir = await tempDir(t);
+	const path = join(dir, "crlf.txt");
+	await writeFile(path, "one\r\ntwo\r\n", "utf8");
+
+	const result = requireToolResult(await edit.execute({ path, old_string: "two", new_string: "TWO" }));
+
+	assert.equal(result.details?.kind, "diff");
+	if (result.details?.kind === "diff") assert.match(result.details.patch, /-two\r\n\+TWO\r\n/);
+});
+
+test("drops diff details when an edit patch exceeds the cap", async (t) => {
+	const dir = await tempDir(t);
+	const path = join(dir, "large.txt");
+	const original = `old-${"x".repeat(140_000)}`;
+	const replacement = `new-${"y".repeat(140_000)}`;
+	await writeFile(path, original, "utf8");
+
+	const result = await edit.execute({ path, old_string: original, new_string: replacement });
+
+	assert.equal(result, `Edited ${path} (1 occurrence)`);
 });
 
 test("a non-unique match without replaceAll fails on disk", async (t) => {
@@ -103,3 +147,8 @@ test("rejects bad argument types and an up-front identical edit", async () => {
 	);
 	await assert.rejects(edit.execute({ path: "x", old_string: "a", new_string: "a" }), /identical/);
 });
+
+function requireToolResult(result: string | Engine.ToolResult): Engine.ToolResult {
+	if (typeof result === "string") throw new Error("Expected structured tool result");
+	return result;
+}

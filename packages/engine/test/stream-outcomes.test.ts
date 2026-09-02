@@ -284,7 +284,7 @@ test("stops before a tool follow-up when the oauth account changes mid-turn", as
 			model: "test-model",
 			usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 },
 		},
-		{ role: "tool", toolCallId: "call_1", content: "switched" },
+		{ role: "tool", toolCallId: "call_1", content: "switched", status: "ok" },
 	]);
 });
 
@@ -516,9 +516,58 @@ test("keeps completed tool history when auth disappears before the next model st
 			model: "test-model",
 			usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, total: 3 },
 		},
-		{ role: "tool", toolCallId: "call_1", content: "result" },
+		{ role: "tool", toolCallId: "call_1", content: "result", status: "ok" },
 	]);
 	assert.deepEqual(observed, { authCalls: 2 });
+});
+
+test("carries structured tool details on the event and stored message", async () => {
+	const details: Protocol.ToolDetails = {
+		kind: "diff",
+		path: "file.ts",
+		patch: "--- file.ts\n+++ file.ts\n@@ -1 +1 @@\n-old\n+new\n",
+	};
+	const edit: Tool = {
+		name: "edit",
+		description: "Edit a file",
+		parameters: { type: "object" },
+		async execute() {
+			return { output: "Edited file.ts", details };
+		},
+	};
+	let streams = 0;
+	const harness = createHarness(createConfig([edit]), {
+		stream: async function* () {
+			streams++;
+			if (streams === 1) yield { type: "tool_call", callId: "call_1", name: "edit", arguments: "{}" };
+			yield { type: "done", reason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 } };
+		},
+	});
+
+	const events = await collectProtocolEvents(send(harness, "change it"));
+
+	assert.deepEqual(
+		events.find((event) => event.type === "tool_result"),
+		{
+			actor: "process",
+			modelRole: "tool",
+			sessionId: "session-1",
+			turnId: "turn-1",
+			type: "tool_result",
+			id: "call_1",
+			name: "edit",
+			status: "ok",
+			output: "Edited file.ts",
+			details,
+		},
+	);
+	assert.deepEqual(harness.messages.at(-2), {
+		role: "tool",
+		toolCallId: "call_1",
+		content: "Edited file.ts",
+		status: "ok",
+		details,
+	});
 });
 
 test("stops a content-filtered turn without saving its response or executing its tools", async () => {
@@ -800,7 +849,12 @@ test("repairs a completed tool call from an interrupted provider response", asyn
 			toolCalls: [{ callId: "call_1", itemId: undefined, name: "lookup", arguments: "{}" }],
 			reasoning: [],
 		},
-		{ role: "tool", toolCallId: "call_1", content: "Tool not executed because the turn was aborted." },
+		{
+			role: "tool",
+			toolCallId: "call_1",
+			content: "Tool not executed because the turn was aborted.",
+			status: "error",
+		},
 		{
 			role: "developer",
 			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
@@ -892,8 +946,14 @@ test("repairs active and queued tool results before reporting the abort", async 
 			role: "tool",
 			toolCallId: "call_1",
 			content: "partial output\n\n[aborted by user; tool may have partially executed]",
+			status: "error",
 		},
-		{ role: "tool", toolCallId: "call_2", content: "Tool not executed because the turn was aborted." },
+		{
+			role: "tool",
+			toolCallId: "call_2",
+			content: "Tool not executed because the turn was aborted.",
+			status: "error",
+		},
 		{
 			role: "developer",
 			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
@@ -940,7 +1000,12 @@ test("repairs every advertised tool when cancellation follows provider completio
 	]);
 	assert.equal(observed.executions, 0);
 	assert.deepEqual(harness.messages.slice(-2), [
-		{ role: "tool", toolCallId: "call_1", content: "Tool not executed because the turn was aborted." },
+		{
+			role: "tool",
+			toolCallId: "call_1",
+			content: "Tool not executed because the turn was aborted.",
+			status: "error",
+		},
 		{
 			role: "developer",
 			content: "The previous turn was interrupted by the user. Aborted tools may have partially executed.",
@@ -1023,6 +1088,18 @@ test("estimates context from the latest valid assistant usage plus trailing text
 		3,
 	);
 	assert.equal(estimateContextTokens([{ role: "assistant", content: "", reasoningSummary: "x".repeat(40_000) }]), 0);
+	assert.equal(
+		estimateContextTokens([
+			{
+				role: "tool",
+				toolCallId: "x",
+				content: "123",
+				status: "ok",
+				details: { kind: "diff", path: "file.ts", patch: "x".repeat(40_000) },
+			},
+		]),
+		1,
+	);
 });
 
 function createConfig(tools: Tool[] = []): EngineConfig {

@@ -31,6 +31,12 @@ test("rebuilds a structurally faithful transcript from a snapshot", () => {
 			role: "tool",
 			toolCallId: "call-1",
 			content: "file contents",
+			status: "error",
+			details: {
+				kind: "diff",
+				path: "file.ts",
+				patch: "--- file.ts\n+++ file.ts\n@@ -1 +1 @@\n-old\n+new\n",
+			},
 		},
 		{
 			id: "entry-compaction",
@@ -84,7 +90,17 @@ test("rebuilds a structurally faithful transcript from a snapshot", () => {
 	);
 	const tool = store.getBlockSnapshot("tool:call-1").block;
 	assert.equal(tool?.kind, "tool");
-	if (tool?.kind === "tool") assert.deepEqual(tool.result, { status: "ok", output: "file contents" });
+	if (tool?.kind === "tool") {
+		assert.deepEqual(tool.result, {
+			status: "error",
+			output: "file contents",
+			details: {
+				kind: "diff",
+				path: "file.ts",
+				patch: "--- file.ts\n+++ file.ts\n@@ -1 +1 @@\n-old\n+new\n",
+			},
+		});
+	}
 	assert.equal(store.getBlockSnapshot("answer:answer-3").block?.kind, "answer");
 	assert.equal(store.getBlockSnapshot("prompt:prompt-2").block?.kind, "prompt");
 	assert.equal(store.getBlockSnapshot("prompt:prompt-3").block, undefined);
@@ -142,6 +158,11 @@ test("pairs live tools and applies queue, usage, notices, and full resets", () =
 			name: "bash",
 			status: "error",
 			output: "failed",
+			details: {
+				kind: "diff",
+				path: "file.ts",
+				patch: "--- file.ts\n+++ file.ts\n@@ -1 +1 @@\n-old\n+new\n",
+			},
 		}),
 	);
 	store.apply(
@@ -186,7 +207,17 @@ test("pairs live tools and applies queue, usage, notices, and full resets", () =
 
 	const tool = store.getBlockSnapshot("tool:call-live").block;
 	assert.equal(tool?.kind, "tool");
-	if (tool?.kind === "tool") assert.deepEqual(tool.result, { status: "error", output: "failed" });
+	if (tool?.kind === "tool") {
+		assert.deepEqual(tool.result, {
+			status: "error",
+			output: "failed",
+			details: {
+				kind: "diff",
+				path: "file.ts",
+				patch: "--- file.ts\n+++ file.ts\n@@ -1 +1 @@\n-old\n+new\n",
+			},
+		});
+	}
 	assert.equal(store.getSnapshot().header?.model?.id, "gpt-test");
 	assert.equal(store.getSnapshot().header?.usage.cumulative.total, 16);
 	assert.equal(store.getSnapshot().header?.status, "error");

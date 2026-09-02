@@ -3,9 +3,14 @@ import { setTimeout as sleep } from "node:timers/promises";
 import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 
+export interface ToolResult {
+	output: string;
+	details?: Protocol.ToolDetails;
+}
+
 // A tool the loop can run: the wire schema the model sees, plus the execute the model never sees.
 export interface Tool extends Llm.Tool {
-	execute(args: unknown, signal?: AbortSignal): Promise<string>;
+	execute(args: unknown, signal?: AbortSignal): Promise<string | ToolResult>;
 }
 
 export interface EngineConfig {
@@ -155,7 +160,13 @@ export function createHarness(
 					break;
 				}
 				const result = await runTool(config.tools, call, signal);
-				messages.push({ role: "tool", toolCallId: call.callId, content: result.output });
+				messages.push({
+					role: "tool",
+					toolCallId: call.callId,
+					content: result.output,
+					status: result.status,
+					...(result.details === undefined ? {} : { details: result.details }),
+				});
 				yield {
 					actor: "process",
 					modelRole: "tool",
@@ -165,6 +176,7 @@ export function createHarness(
 					name: call.name,
 					status: result.status,
 					output: result.output,
+					...(result.details === undefined ? {} : { details: result.details }),
 				};
 				if (signal?.aborted) {
 					for (const event of skipToolCalls(messages, scope, outcome.toolCalls.slice(index + 1))) yield event;
@@ -878,13 +890,15 @@ async function runTool(
 	tools: Tool[],
 	call: Llm.ToolCall,
 	signal?: AbortSignal,
-): Promise<{ status: "ok" | "error"; output: string }> {
+): Promise<{ status: "ok" | "error"; output: string; details?: Protocol.ToolDetails }> {
 	const tool = tools.find((candidate) => candidate.name === call.name);
 	if (!tool) return { status: "error", output: `Tool ${call.name} not found` };
 	try {
 		const args: unknown = JSON.parse(call.arguments);
 		signal?.throwIfAborted();
-		return { status: "ok", output: await tool.execute(args, signal) };
+		const result = await tool.execute(args, signal);
+		if (typeof result === "string") return { status: "ok", output: result };
+		return { status: "ok", ...result };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		const output =
@@ -902,7 +916,7 @@ function skipToolCalls(
 ): Protocol.ToolResultEvent[] {
 	return calls.map((call) => {
 		const output = "Tool not executed because the turn was aborted.";
-		messages.push({ role: "tool", toolCallId: call.callId, content: output });
+		messages.push({ role: "tool", toolCallId: call.callId, content: output, status: "error" });
 		return {
 			actor: "process",
 			modelRole: "tool",

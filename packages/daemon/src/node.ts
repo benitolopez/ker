@@ -1052,6 +1052,7 @@ export class Node {
 			role: "tool",
 			toolCallId: call.callId,
 			content: "Tool result unavailable because the daemon stopped during the turn.",
+			status: "error",
 		}));
 		if (delivered.size > 0 || repairs.length > 0) {
 			repairedMessages.push({
@@ -1361,6 +1362,8 @@ function toConversationEntry(record: ConversationRecord): Protocol.ConversationE
 			role: "tool",
 			toolCallId: record.message.toolCallId,
 			content: record.message.content,
+			status: record.message.status,
+			...(record.message.details === undefined ? {} : { details: record.message.details }),
 		};
 	}
 	return {

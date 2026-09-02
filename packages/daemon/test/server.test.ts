@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { type TestContext, test } from "node:test";
 import * as Engine from "@ker-ai/engine";
-import type * as Protocol from "@ker-ai/protocol";
+import * as Protocol from "@ker-ai/protocol";
+import { Value } from "@sinclair/typebox/value";
 import { createDaemon, type DaemonOptions, type Harness } from "../src/index.ts";
 import { type Definition, type Payload, SessionStore, type StoredRecord } from "../src/store.ts";
 
@@ -1135,6 +1136,128 @@ test("assistant reasoning effort survives persistence and replay without crossin
 	await second.close();
 });
 
+test("tool status and details survive persistence and replay", async (t) => {
+	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-tool-details-"));
+	t.after(() => rm(sessionDir, { recursive: true, force: true }));
+	const details: Protocol.ToolDetails = {
+		kind: "diff",
+		path: "file.ts",
+		patch: "--- file.ts\n+++ file.ts\n@@ -1 +1 @@\n-old\n+new\n",
+	};
+	const first = await startServer(
+		t,
+		(initial) => {
+			const state = structuredClone(initial);
+			return {
+				snapshot: () => structuredClone(state),
+				compact: skippedCompaction,
+				async *send(input) {
+					state.messages.push({ role: "user", content: input.text });
+					yield delivered(input);
+					const messageId = randomUUID();
+					const calls = [
+						{ callId: "call-edit", name: "edit", arguments: "{}" },
+						{ callId: "call-fail", name: "read", arguments: "{}" },
+					];
+					for (const call of calls) {
+						yield {
+							actor: "agent" as const,
+							modelRole: "assistant" as const,
+							sessionId: input.sessionId,
+							turnId: input.turnId,
+							type: "tool_call" as const,
+							messageId,
+							id: call.callId,
+							name: call.name,
+							arguments: call.arguments,
+						};
+					}
+					state.messages.push({ role: "assistant", content: "", toolCalls: calls });
+					yield completed(input, messageId);
+					state.messages.push({
+						role: "tool",
+						toolCallId: "call-edit",
+						content: "Edited file.ts",
+						status: "ok",
+						details,
+					});
+					yield {
+						actor: "process" as const,
+						modelRole: "tool" as const,
+						sessionId: input.sessionId,
+						turnId: input.turnId,
+						type: "tool_result" as const,
+						id: "call-edit",
+						name: "edit",
+						status: "ok" as const,
+						output: "Edited file.ts",
+						details,
+					};
+					state.messages.push({ role: "tool", toolCallId: "call-fail", content: "ENOENT", status: "error" });
+					yield {
+						actor: "process" as const,
+						modelRole: "tool" as const,
+						sessionId: input.sessionId,
+						turnId: input.turnId,
+						type: "tool_result" as const,
+						id: "call-fail",
+						name: "read",
+						status: "error" as const,
+						output: "ENOENT",
+					};
+					yield end(input);
+				},
+			};
+		},
+		{ sessionDir },
+		false,
+	);
+	const session = await createSession(first.url);
+	const admitted = await prompt(first.url, session.id, "change it");
+	await waitForTerminal(first.url, session.id, admitted.turnId);
+	const live = await getSnapshot(first.url, session.id);
+	assert(Value.Check(Protocol.SessionSnapshot, live));
+	const liveTools = live.entries.filter((entry) => entry.role === "tool");
+	assert.deepEqual(liveTools, [
+		{
+			id: liveTools[0]?.id,
+			parentId: liveTools[0]?.parentId,
+			turnId: admitted.turnId,
+			role: "tool",
+			toolCallId: "call-edit",
+			content: "Edited file.ts",
+			status: "ok",
+			details,
+		},
+		{
+			id: liveTools[1]?.id,
+			parentId: liveTools[1]?.parentId,
+			turnId: admitted.turnId,
+			role: "tool",
+			toolCallId: "call-fail",
+			content: "ENOENT",
+			status: "error",
+		},
+	]);
+	await first.close();
+
+	const captured: Engine.HarnessState[] = [];
+	const second = await startServer(t, passiveFactory(captured), { sessionDir }, false);
+	const rebuilt = await getSnapshot(second.url, session.id);
+	assert.deepEqual(
+		rebuilt.entries.filter((entry) => entry.role === "tool"),
+		liveTools,
+	);
+	assert.deepEqual(
+		captured[0]?.messages.filter((message) => message.role === "tool"),
+		[
+			{ role: "tool", toolCallId: "call-edit", content: "Edited file.ts", status: "ok", details },
+			{ role: "tool", toolCallId: "call-fail", content: "ENOENT", status: "error" },
+		],
+	);
+	await second.close();
+});
+
 test("snapshots preserve cumulative usage and current context across restart", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-usage-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
@@ -1274,6 +1397,7 @@ test("restart repairs an advertised tool call without executing it again", async
 		role: "tool",
 		toolCallId: "call-1",
 		content: "Tool result unavailable because the daemon stopped during the turn.",
+		status: "error",
 	});
 	assert.equal(restored?.at(-1)?.role, "developer");
 });
@@ -1310,6 +1434,7 @@ test("restart finalizes a durable cancellation as aborted without repeating tool
 		role: "tool",
 		toolCallId: "call-1",
 		content: "Tool result unavailable because the daemon stopped during the turn.",
+		status: "error",
 	});
 	const marker = captured.at(-1)?.messages.at(-1);
 	assert.equal(marker?.role, "developer");
@@ -1587,7 +1712,7 @@ test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
 	const store = new SessionStore({ baseDir: sessionDir });
 	const session = await store.create(process.cwd(), DEFINITION);
 	const tail = JSON.stringify({
-		version: 4,
+		version: 5,
 		recordId: "tail",
 		previousRecordId: "missing",
 		at: "2026-01-01T00:00:00.000Z",
@@ -1769,14 +1894,14 @@ test("a non-positive automatic trigger skips compaction and pruning while manual
 			id: "entry-tool-1",
 			parentId: "entry-owner",
 			turnId: "turn-old",
-			message: { role: "tool", toolCallId: "call-1", content: "x".repeat(200_000) },
+			message: { role: "tool", toolCallId: "call-1", content: "x".repeat(200_000), status: "ok" },
 		},
 		{
 			type: "conversation",
 			id: "entry-tool-2",
 			parentId: "entry-tool-1",
 			turnId: "turn-old",
-			message: { role: "tool", toolCallId: "call-2", content: "x".repeat(200_000) },
+			message: { role: "tool", toolCallId: "call-2", content: "x".repeat(200_000), status: "ok" },
 		},
 		{
 			type: "conversation",
@@ -2484,7 +2609,7 @@ test("replay applies prune records and strips stale assistant metadata", async (
 			id: "entry-tool",
 			parentId: "entry-assistant",
 			turnId: "turn-old",
-			message: { role: "tool", toolCallId: "call-old", content: "large output" },
+			message: { role: "tool", toolCallId: "call-old", content: "large output", status: "ok" },
 		},
 		{ type: "prune", toolCallIds: ["call-old"], tokensBefore: 80_001, tokensAfter: 30 },
 		{
@@ -2523,7 +2648,7 @@ test("ordered replay keeps pruned output through compaction in either record ord
 				content: "",
 				toolCalls: [{ callId: "call-old", name: "read", arguments: "{}" }],
 			},
-			{ role: "tool", toolCallId: "call-old", content: "large output" },
+			{ role: "tool", toolCallId: "call-old", content: "large output", status: "ok" },
 		],
 		["call-old"],
 	);
@@ -2551,7 +2676,7 @@ test("a log ending on a pruned event replays consistently during recovery", asyn
 			id: "entry-tool",
 			parentId: null,
 			turnId: "turn-old",
-			message: { role: "tool", toolCallId: "call-old", content: "large output" },
+			message: { role: "tool", toolCallId: "call-old", content: "large output", status: "ok" },
 		},
 		{ type: "prune", toolCallIds: ["call-old"], tokensBefore: 30_000, tokensAfter: 30 },
 		{
@@ -2578,7 +2703,7 @@ test("a log ending on a pruned event replays consistently during recovery", asyn
 	assert.equal(catalog.idle, false);
 });
 
-test("replay projects a v4 compaction while preserving every transcript entry", async (t) => {
+test("replay projects a v5 compaction while preserving every transcript entry", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-replay-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
@@ -3021,7 +3146,7 @@ function multiStepAccountingFactory(): NonNullable<DaemonOptions["harnessFactory
 				});
 				yield completed(input, firstMessageId);
 				yield usageEvent(input, model, firstUsage);
-				state.messages.push({ role: "tool", toolCallId: "call-1", content: "42" });
+				state.messages.push({ role: "tool", toolCallId: "call-1", content: "42", status: "ok" });
 				yield {
 					actor: "process",
 					modelRole: "tool",
@@ -3273,7 +3398,7 @@ function prunableToolTurn(id: string): Engine.HarnessState["messages"] {
 			content: "",
 			toolCalls: [{ callId: `call-${id}`, name: "read", arguments: "{}" }],
 		},
-		{ role: "tool", toolCallId: `call-${id}`, content },
+		{ role: "tool", toolCallId: `call-${id}`, content, status: "ok" },
 	];
 }
 
@@ -3313,7 +3438,7 @@ async function seedInterleavedContext(store: SessionStore, order: "prune-first" 
 			id: "entry-tool",
 			parentId: "entry-owner",
 			turnId: "turn-old",
-			message: { role: "tool", toolCallId: "call-old", content: "large output" },
+			message: { role: "tool", toolCallId: "call-old", content: "large output", status: "ok" },
 		},
 		...mutations,
 		{

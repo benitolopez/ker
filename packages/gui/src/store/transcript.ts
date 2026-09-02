@@ -9,7 +9,7 @@ export type Block =
 			key: string;
 			name: string;
 			args: string;
-			result?: { status: "ok" | "error"; output: string };
+			result?: { status: "ok" | "error"; output: string; details?: Protocol.ToolDetails };
 	  }
 	| { kind: "notice"; key: string; text: string; tone: "info" | "error" };
 
@@ -134,7 +134,8 @@ export class TranscriptStore {
 				if (!message && entry.content) this.#answer(entry.messageId ?? entry.id, entry.content, true);
 				for (const call of entry.toolCalls) this.#tool(call.id, call.name, call.arguments);
 			}
-			if (entry.role === "tool") this.#toolResult(entry.toolCallId, "ok", entry.content);
+			if (entry.role === "tool")
+				this.#toolResult(entry.toolCallId, entry.status, entry.content, undefined, entry.details);
 			if (entry.role === "compaction") {
 				flush(entry.turnId);
 				this.#compactionTurnIds.add(entry.turnId);
@@ -177,7 +178,9 @@ export class TranscriptStore {
 		if (event.type === "reasoning_delta") this.#appendReasoning(event.messageId, event.offset, event.text);
 		if (event.type === "assistant_message_completed") this.#completeAnswer(event.messageId);
 		if (event.type === "tool_call") this.#tool(event.id, event.name, event.arguments);
-		if (event.type === "tool_result") this.#toolResult(event.id, event.status, event.output, event.name);
+		if (event.type === "tool_result") {
+			this.#toolResult(event.id, event.status, event.output, event.name, event.details);
+		}
 		if (event.type === "usage") this.#usage(event);
 		if (event.type === "queue_changed") {
 			this.#view = {
@@ -329,17 +332,32 @@ export class TranscriptStore {
 		this.#addBlock({ kind: "tool", key, name, args });
 	}
 
-	#toolResult(id: string, status: "ok" | "error", output: string, name = "tool"): void {
+	#toolResult(id: string, status: "ok" | "error", output: string, name = "tool", details?: Protocol.ToolDetails): void {
 		const key = this.#toolKeysByCallId.get(id) ?? `tool:${id}`;
 		const current = this.#blocks.get(key)?.block;
 		if (current?.kind === "tool") {
-			if (current.result?.status === status && current.result.output === output) return;
-			this.#setBlock({ ...current, result: { status, output } });
+			if (
+				current.result?.status === status &&
+				current.result.output === output &&
+				JSON.stringify(current.result.details) === JSON.stringify(details)
+			) {
+				return;
+			}
+			this.#setBlock({
+				...current,
+				result: { status, output, ...(details === undefined ? {} : { details }) },
+			});
 			return;
 		}
 		this.#toolCallIds.add(id);
 		this.#toolKeysByCallId.set(id, key);
-		this.#addBlock({ kind: "tool", key, name, args: "", result: { status, output } });
+		this.#addBlock({
+			kind: "tool",
+			key,
+			name,
+			args: "",
+			result: { status, output, ...(details === undefined ? {} : { details }) },
+		});
 	}
 
 	#notice(key: string, text: string, tone: "info" | "error"): void {

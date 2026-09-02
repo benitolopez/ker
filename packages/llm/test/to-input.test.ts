@@ -38,7 +38,16 @@ test("omits the assistant text item when there is no text", () => {
 });
 
 test("maps a tool result to a function_call_output keyed by the call id", () => {
-	assert.deepEqual(toInput([{ role: "tool", toolCallId: "call_1", content: "file body" }]), [
-		{ type: "function_call_output", call_id: "call_1", output: "file body" },
-	]);
+	assert.deepEqual(
+		toInput([
+			{
+				role: "tool",
+				toolCallId: "call_1",
+				content: "file body",
+				status: "ok",
+				details: { kind: "diff", path: "file.ts", patch: "patch" },
+			},
+		]),
+		[{ type: "function_call_output", call_id: "call_1", output: "file body" }],
+	);
 });

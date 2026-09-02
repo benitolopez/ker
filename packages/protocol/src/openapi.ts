@@ -14,6 +14,8 @@ export const components = {
 	ReasoningEffort: Protocol.ReasoningEffort,
 	Model: Protocol.Model,
 	Usage: Protocol.Usage,
+	DiffDetails: Protocol.DiffDetails,
+	ToolDetails: Protocol.ToolDetails,
 	SessionUsage: Protocol.SessionUsage,
 	SessionDescriptor: Protocol.SessionDescriptor,
 	CreateSessionRequest: Protocol.CreateSessionRequest,

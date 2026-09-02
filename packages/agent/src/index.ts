@@ -1,8 +1,9 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type * as Engine from "@ker-ai/engine";
+import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 import * as Bash from "./bash-output.ts";
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES } from "./output-limits.ts";
 
@@ -11,6 +12,8 @@ export { truncateTail } from "./bash-output.ts";
 const DEFAULT_TIMEOUT_SECS = 120;
 const KILL_GRACE_MS = 2000;
 const IDLE_GRACE_MS = 100;
+const MAX_PATCH_BYTES = 256 * 1024;
+const MAX_DIFF_SOURCE_BYTES = 4 * 1024 * 1024;
 const COMPACTION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
 The newest part of the conversation is kept verbatim outside your summary; the messages you see are the older portion of a session that continues past them.
@@ -139,17 +142,32 @@ function createWrite(cwd: string): Engine.Tool {
 			required: ["path", "content"],
 			additionalProperties: false,
 		},
-		async execute(args: unknown, signal?: AbortSignal): Promise<string> {
+		async execute(args: unknown, signal?: AbortSignal): Promise<string | Engine.ToolResult> {
 			const { path, content } = args as { path?: unknown; content?: unknown };
 			if (typeof path !== "string" || path.trim() === "") throw new Error("write: 'path' must be a non-empty string");
 			if (typeof content !== "string") throw new Error("write: 'content' must be a string");
 			const resolved = resolve(cwd, path);
-			const existed = existsSync(resolved);
+			signal?.throwIfAborted();
+			const source = await stat(resolved).then(
+				(stats) => ({ existed: true as const, size: stats.size }),
+				(error: unknown) => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return { existed: false as const, size: 0 };
+					throw error;
+				},
+			);
+			const original =
+				source.existed && source.size > MAX_DIFF_SOURCE_BYTES
+					? undefined
+					: source.existed
+						? await readFile(resolved, { encoding: "utf8", signal })
+						: "";
 			signal?.throwIfAborted();
 			await mkdir(dirname(resolved), { recursive: true });
 			signal?.throwIfAborted();
 			await writeFile(resolved, content, "utf8");
-			return `${existed ? "Wrote" : "Created"} ${path} (${Buffer.byteLength(content, "utf8")} bytes)`;
+			const output = `${source.existed ? "Wrote" : "Created"} ${path} (${Buffer.byteLength(content, "utf8")} bytes)`;
+			if (original === undefined) return output;
+			return withDiff(output, path, original, content);
 		},
 	};
 }
@@ -182,7 +200,7 @@ function createEdit(cwd: string): Engine.Tool {
 			required: ["path", "old_string", "new_string"],
 			additionalProperties: false,
 		},
-		async execute(args: unknown, signal?: AbortSignal): Promise<string> {
+		async execute(args: unknown, signal?: AbortSignal): Promise<string | Engine.ToolResult> {
 			const { path, old_string, new_string, replaceAll } = args as {
 				path?: unknown;
 				old_string?: unknown;
@@ -202,7 +220,12 @@ function createEdit(cwd: string): Engine.Tool {
 			const { content, count } = applyEdit(original, old_string, new_string, replaceAll ?? false);
 			signal?.throwIfAborted();
 			await writeFile(resolved, content, "utf8");
-			return `Edited ${path} (${count} ${count === 1 ? "occurrence" : "occurrences"})`;
+			return withDiff(
+				`Edited ${path} (${count} ${count === 1 ? "occurrence" : "occurrences"})`,
+				path,
+				original,
+				content,
+			);
 		},
 	};
 }
@@ -260,6 +283,14 @@ export function createDefinition(cwd: string): {
 			updateInstructions: COMPACTION_UPDATE_INSTRUCTIONS,
 		},
 	};
+}
+
+function withDiff(output: string, path: string, original: string, content: string): string | Engine.ToolResult {
+	const patch = createTwoFilesPatch(path, path, original, content, undefined, undefined, {
+		headerOptions: FILE_HEADERS_ONLY,
+	});
+	if (Buffer.byteLength(patch, "utf8") > MAX_PATCH_BYTES) return output;
+	return { output, details: { kind: "diff", path, patch } };
 }
 
 // Number every line while keeping the complete result within both output caps. An oversized first line

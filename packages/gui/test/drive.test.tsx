@@ -3,7 +3,7 @@ import type * as Protocol from "@ker-ai/protocol";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, assert, test, vi } from "vitest";
 import { SessionsScreen } from "../src/screens/sessions.tsx";
-import { Composer, QueueStack, SessionHeader } from "../src/screens/transcript.tsx";
+import { Composer, QueueStack, SessionHeader, ToolBlock, toolLabel } from "../src/screens/transcript.tsx";
 
 afterEach(cleanup);
 
@@ -100,6 +100,87 @@ test("the compact control disables while compaction is queued", async () => {
 	assert.equal(button.disabled, false);
 	fireEvent.click(button);
 	await waitFor(() => assert.equal(compact.mock.calls.length, 1));
+});
+
+test("a diff tool block shows its path, counts, numbered rows, and no raw arguments", () => {
+	render(
+		<ToolBlock
+			block={{
+				kind: "tool",
+				key: "tool:call-1",
+				name: "edit",
+				args: '{"path":"file.ts","old_string":"old","new_string":"new"}',
+				result: {
+					status: "ok",
+					output: "Edited file.ts",
+					details: {
+						kind: "diff",
+						path: "file.ts",
+						patch: "--- file.ts\n+++ file.ts\n@@ -2 +2 @@\n-old\n+new\n",
+					},
+				},
+			}}
+		/>,
+	);
+
+	assert.match(screen.getByText("edit file.ts").textContent ?? "", /edit file\.ts/);
+	assert.equal(screen.getByText("· +1 −1").textContent, "· +1 −1");
+	const removed = screen.getByText("old");
+	const added = screen.getByText("new");
+	assert.equal(removed.textContent, "old");
+	assert.equal(added.textContent, "new");
+	assert.match(removed.closest("div")?.className ?? "", /bg-red/);
+	assert.match(added.closest("div")?.className ?? "", /bg-emerald/);
+	assert.equal(screen.queryByText(/old_string/), null);
+	assert.equal(screen.queryByText("Edited file.ts"), null);
+});
+
+test("detail-less and failed tool blocks keep their raw output rendering", () => {
+	render(
+		<ToolBlock
+			block={{
+				kind: "tool",
+				key: "tool:call-1",
+				name: "edit",
+				args: '{"path":"missing.ts"}',
+				result: { status: "error", output: "ENOENT" },
+			}}
+		/>,
+	);
+
+	assert.equal(screen.getByText("edit missing.ts").textContent, "edit missing.ts");
+	assert.equal(screen.getByText("ENOENT").textContent, "ENOENT");
+	assert.equal(screen.getByText("failed").textContent, "failed");
+});
+
+test("an invalid diff falls back to its raw patch", () => {
+	render(
+		<ToolBlock
+			block={{
+				kind: "tool",
+				key: "tool:call-1",
+				name: "write",
+				args: '{"path":"file.ts","content":"new"}',
+				result: {
+					status: "ok",
+					output: "Wrote file.ts",
+					details: { kind: "diff", path: "file.ts", patch: "not a patch" },
+				},
+			}}
+		/>,
+	);
+
+	assert.equal(screen.getByText("not a patch").textContent, "not a patch");
+	assert.equal(screen.queryByText(/· \+/), null);
+	assert.equal(screen.queryByText("Wrote file.ts"), null);
+});
+
+test("tool labels use paths and commands with a bare-name fallback", () => {
+	assert.equal(toolLabel("read", '{"path":"src/a.ts"}'), "read src/a.ts");
+	assert.equal(toolLabel("edit", '{"path":"src/a.ts"}'), "edit src/a.ts");
+	assert.equal(toolLabel("write", '{"path":"src/a.ts"}'), "write src/a.ts");
+	assert.equal(toolLabel("bash", '{"command":"npm test"}'), "bash npm test");
+	assert.equal(toolLabel("bash", "{"), "bash");
 });
 
 test("new session creation navigates to the empty transcript", async () => {

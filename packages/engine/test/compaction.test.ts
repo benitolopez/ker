@@ -26,7 +26,7 @@ test("keeps an assistant cut point and its complete tool step", async () => {
 			content: "",
 			toolCalls: [{ callId: "call-1", name: "read", arguments: "{}" }],
 		},
-		{ role: "tool", toolCallId: "call-1", content: "tool output".repeat(10) },
+		{ role: "tool", toolCallId: "call-1", content: "tool output".repeat(10), status: "ok" },
 	];
 	const harness = successfulHarness(messages);
 	const result = await collect(harness.compact(request({ keepRecentTokens: 10 })));
@@ -79,7 +79,7 @@ test("serializes roles while truncating tool arguments and results and omitting 
 			toolCalls: [{ callId: "call-1", name: "write", arguments: longArguments }],
 			reasoning: [{ encrypted_content: "must-not-appear" }],
 		},
-		{ role: "tool", toolCallId: "call-1", content: longResult },
+		{ role: "tool", toolCallId: "call-1", content: longResult, status: "ok" },
 		{ role: "user", content: "recent".repeat(40) },
 		{ role: "assistant", content: "answer".repeat(40) },
 	];
@@ -557,6 +557,10 @@ test("strips assistant request metadata without changing content", () => {
 
 test("prunes only worthwhile old tool output beyond the protected turns and token budget", () => {
 	const messages = prunableHistory();
+	const detailed = messages.find((message) => message.role === "tool" && message.toolCallId === "call-a");
+	if (detailed?.role === "tool") {
+		detailed.details = { kind: "diff", path: "file.ts", patch: "patch" };
+	}
 	const original = structuredClone(messages);
 
 	const result = pruneToolOutputs(messages);
@@ -578,6 +582,11 @@ test("prunes only worthwhile old tool output beyond the protected turns and toke
 	assert.notEqual(tools.get("call-c"), PRUNED_OUTPUT_PLACEHOLDER);
 	assert.notEqual(tools.get("call-previous"), PRUNED_OUTPUT_PLACEHOLDER);
 	assert.notEqual(tools.get("call-current"), PRUNED_OUTPUT_PLACEHOLDER);
+	const prunedDetailed = result.messages.find((message) => message.role === "tool" && message.toolCallId === "call-a");
+	assert.equal(prunedDetailed?.role, "tool");
+	if (prunedDetailed?.role === "tool") {
+		assert.deepEqual(prunedDetailed.details, { kind: "diff", path: "file.ts", patch: "patch" });
+	}
 });
 
 test("does not prune when the comparable context reduction is below the minimum", () => {
@@ -883,7 +892,12 @@ function toolTurn(id: string, size: number): Llm.Message[] {
 			model: "test-model",
 			usage: USAGE,
 		},
-		{ role: "tool", toolCallId: `call-${id}`, content: id.repeat(Math.ceil(size / id.length)).slice(0, size) },
+		{
+			role: "tool",
+			toolCallId: `call-${id}`,
+			content: id.repeat(Math.ceil(size / id.length)).slice(0, size),
+			status: "ok",
+		},
 	];
 }
 

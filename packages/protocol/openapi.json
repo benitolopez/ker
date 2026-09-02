@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "ker",
-    "version": "21"
+    "version": "22"
   },
   "paths": {
     "/health": {
@@ -1865,6 +1865,48 @@
           "total"
         ]
       },
+      "DiffDetails": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "kind": {
+            "const": "diff",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "path",
+          "patch"
+        ]
+      },
+      "ToolDetails": {
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "kind": {
+            "const": "diff",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "path",
+          "patch"
+        ]
+      },
       "SessionUsage": {
         "additionalProperties": false,
         "type": "object",
@@ -2514,6 +2556,21 @@
               },
               "content": {
                 "type": "string"
+              },
+              "status": {
+                "anyOf": [
+                  {
+                    "const": "ok",
+                    "type": "string"
+                  },
+                  {
+                    "const": "error",
+                    "type": "string"
+                  }
+                ]
+              },
+              "details": {
+                "$ref": "#/components/schemas/ToolDetails"
               }
             },
             "required": [
@@ -2522,7 +2579,8 @@
               "turnId",
               "role",
               "toolCallId",
-              "content"
+              "content",
+              "status"
             ]
           },
           {
@@ -3555,6 +3613,9 @@
           },
           "output": {
             "type": "string"
+          },
+          "details": {
+            "$ref": "#/components/schemas/ToolDetails"
           }
         },
         "required": [

@@ -17,6 +17,7 @@ test("optional component schemas are emitted as references", () => {
 		[schemas.ErrorEvent.properties?.code, "ErrorCode"],
 		[schemas.ErrorEvent.properties?.expected, "Identity"],
 		[schemas.ErrorEvent.properties?.actual, "Identity"],
+		[schemas.ToolResultEvent.properties?.details, "ToolDetails"],
 	];
 
 	for (const [schema, name] of references) {

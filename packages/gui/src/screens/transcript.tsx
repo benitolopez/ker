@@ -3,6 +3,7 @@ import type * as Protocol from "@ker-ai/protocol";
 import { type KeyboardEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import ReactMarkdown from "react-markdown";
 import { api, attach } from "../api.ts";
+import { parsePatch } from "../diff.ts";
 import { formatTokens } from "../format.ts";
 import { formatRoute } from "../router.ts";
 import { type Block, TranscriptStore } from "../store/transcript.ts";
@@ -209,22 +210,67 @@ function BlockView({ store, blockKey }: { store: TranscriptStore; blockKey: stri
 	);
 }
 
-function ToolBlock({ block }: { block: Extract<Block, { kind: "tool" }> }) {
+export function ToolBlock({ block }: { block: Extract<Block, { kind: "tool" }> }) {
+	const details = block.result?.details;
+	const parsed = details?.kind === "diff" ? parsePatch(details.patch) : undefined;
+	const label = details?.kind === "diff" ? `${block.name} ${details.path}` : toolLabel(block.name, block.args);
 	return (
 		<details className="fold-block">
 			<summary className="flex items-center gap-3">
 				<span className={`size-2 rounded-full ${block.result?.status === "error" ? "bg-red-500" : "bg-sky-500"}`} />
-				<span className="font-mono text-xs font-semibold">{block.name}</span>
+				<span className="min-w-0 truncate font-mono text-xs font-semibold">{label}</span>
+				{parsed?.valid ? (
+					<span className="shrink-0 font-mono text-xs text-[var(--muted)]">
+						· +{parsed.added} −{parsed.removed}
+					</span>
+				) : null}
 				<span className="ml-auto text-xs text-[var(--faint)]">
 					{block.result ? (block.result.status === "ok" ? "done" : "failed") : "running"}
 				</span>
 			</summary>
 			<div className="mt-3 space-y-3 border-t border-[var(--line)] pt-3">
-				{block.args ? <Code text={block.args} /> : null}
-				{block.result ? <Code text={block.result.output} error={block.result.status === "error"} /> : null}
+				{details?.kind === "diff" && parsed?.valid ? <DiffView parsed={parsed} /> : null}
+				{details?.kind === "diff" && !parsed?.valid ? <Code text={details.patch} /> : null}
+				{!details && block.args ? <Code text={block.args} /> : null}
+				{!details && block.result ? <Code text={block.result.output} error={block.result.status === "error"} /> : null}
 			</div>
 		</details>
 	);
+}
+
+function DiffView({ parsed }: { parsed: ReturnType<typeof parsePatch> }) {
+	return (
+		<div className="max-h-96 overflow-auto rounded-xl border border-[var(--line)] bg-[var(--code)] font-mono text-xs leading-5">
+			{parsed.rows.map((row, index) => (
+				<div
+					className={`grid min-w-max grid-cols-[3.5rem_3.5rem_1.5rem_minmax(0,1fr)] px-2 ${row.type === "add" ? "bg-emerald-500/10 text-emerald-800 dark:text-emerald-300" : row.type === "del" ? "bg-red-500/10 text-red-800 dark:text-red-300" : "text-[var(--muted)]"}`}
+					key={`${row.oldLine ?? ""}:${row.newLine ?? ""}:${index}`}
+				>
+					<span className="select-none text-right text-[var(--faint)]">{row.oldLine}</span>
+					<span className="select-none text-right text-[var(--faint)]">{row.newLine}</span>
+					<span className="select-none text-center">{row.type === "add" ? "+" : row.type === "del" ? "−" : ""}</span>
+					<span className="whitespace-pre pr-3">
+						{row.text}
+						{row.noNewline ? <span className="ml-3 text-[var(--faint)]">No newline at end of file</span> : null}
+					</span>
+				</div>
+			))}
+		</div>
+	);
+}
+
+export function toolLabel(name: string, args: string): string {
+	try {
+		const value: unknown = JSON.parse(args);
+		if (typeof value !== "object" || value === null) return name;
+		const field = name === "bash" ? "command" : ["read", "edit", "write"].includes(name) ? "path" : undefined;
+		if (!field) return name;
+		const label = Reflect.get(value, field);
+		if (typeof label !== "string" || label === "") return name;
+		return `${name} ${label}`;
+	} catch {
+		return name;
+	}
 }
 
 function Code({ text, error = false }: { text: string; error?: boolean }) {

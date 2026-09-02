@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { test } from "node:test";
+import type * as Engine from "@ker-ai/engine";
 import { createDefinition } from "../src/index.ts";
 
 function bashTool() {
@@ -24,7 +25,7 @@ function pidsMatching(pattern: string): string[] {
 }
 
 test("a non-zero exit comes back as data, not a throw", async () => {
-	assert.match(await bash.execute({ command: "exit 3" }), /\[exited with code 3\]/);
+	assert.match(requireString(await bash.execute({ command: "exit 3" })), /\[exited with code 3\]/);
 });
 
 test(
@@ -50,7 +51,7 @@ test("stdin is closed so a stdin-reader gets EOF instead of blocking", { timeout
 
 test("large output is tail-truncated with the full log spilled to a temp file", async () => {
 	const out = await bash.execute({ command: "seq 1 100000" });
-	const path = out.match(/full output: ([^\]]+)\]/)?.[1];
+	const path = requireString(out).match(/full output: ([^\]]+)\]/)?.[1];
 	assert.ok(path, "expected a temp-file path in the truncation notice");
 	const full = await readFile(path, "utf8");
 	const lines = full.split("\n").filter(Boolean);
@@ -60,6 +61,11 @@ test("large output is tail-truncated with the full log spilled to a temp file", 
 	assert.equal((await stat(path)).mode & 0o777, 0o600);
 	assert.equal((await stat(dirname(path))).mode & 0o777, 0o700);
 });
+
+function requireString(result: string | Engine.ToolResult): string {
+	if (typeof result !== "string") throw new Error("Expected a string tool result");
+	return result;
+}
 
 test("normal process exit removes its private spill directory", () => {
 	const agentUrl = JSON.stringify(new URL("../src/index.ts", import.meta.url).href);

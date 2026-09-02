@@ -1,4 +1,4 @@
-import type { Model, Provider, Usage } from "@ker-ai/protocol";
+import type { Model, Provider, ToolDetails, Usage } from "@ker-ai/protocol";
 import OpenAI, { APIConnectionError, APIConnectionTimeoutError, APIError, APIUserAbortError } from "openai";
 import { models } from "./models.generated.ts";
 
@@ -27,7 +27,13 @@ export type Message =
 			usage?: Usage;
 			reasoningEffort?: ReasoningEffort;
 	  }
-	| { role: "tool"; toolCallId: string; content: string };
+	| {
+			role: "tool";
+			toolCallId: string;
+			content: string;
+			status: "ok" | "error";
+			details?: ToolDetails;
+	  };
 
 // The wire-level view of a tool: the name, prose, and argument schema the model is shown. The engine's
 // Tool adds the execute function; the provider never sees or needs it.

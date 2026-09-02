@@ -84,6 +84,19 @@ export const Usage = Type.Object(
 );
 export type Usage = Static<typeof Usage>;
 
+export const DiffDetails = Type.Object(
+	{
+		kind: Type.Literal("diff"),
+		path: Type.String(),
+		patch: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+export type DiffDetails = Static<typeof DiffDetails>;
+
+export const ToolDetails = Type.Union([DiffDetails]);
+export type ToolDetails = Static<typeof ToolDetails>;
+
 export const SessionUsage = Type.Object(
 	{
 		contextTokens: Type.Number(),
@@ -295,6 +308,8 @@ const ToolConversationEntry = Type.Object(
 		role: Type.Literal("tool"),
 		toolCallId: Type.String(),
 		content: Type.String(),
+		status: Type.Union([Type.Literal("ok"), Type.Literal("error")]),
+		details: Type.Optional(ToolDetails),
 	},
 	{ additionalProperties: false },
 );
@@ -642,6 +657,7 @@ export const ToolResultEvent = Type.Object(
 		name: Type.String(),
 		status: Type.Union([Type.Literal("ok"), Type.Literal("error")]),
 		output: Type.String(),
+		details: Type.Optional(ToolDetails),
 	},
 	{ additionalProperties: false },
 );
@@ -748,7 +764,7 @@ export const ErrorBody = Type.Object(
 );
 export type ErrorBody = Static<typeof ErrorBody>;
 
-export const PROTOCOL_VERSION = "21" as const;
+export const PROTOCOL_VERSION = "22" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;
