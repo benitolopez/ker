@@ -42,8 +42,18 @@ Thank you for your interest and understanding.
   the full stream to a private temporary file.
 - Transparent context compaction that summarizes older history near the model ceiling while keeping
   the complete transcript on disk. Compaction can also be requested manually.
+- A web UI served by the daemon: projects, sessions, a live transcript with prompt, cancel, and
+  compaction controls, and per-project documents with a Markdown editor.
 
-Not there yet: the web UI, queue editing, or any provider other than OpenAI.
+Not there yet: the split into a server and remote agents, or any provider other than OpenAI.
+
+## A note on the web UI
+
+I'm not paying attention to the UI right now. What I care about at this stage is what ker can do,
+so the web app is completely vibe coded: I describe what I need, the model writes it, and I keep
+what works. It isn't designed, it isn't optimized, and none of it is final. It has interaction tests
+so the behavior doesn't regress, but that's the only care it gets at the moment. Expect rough edges.
+The daemon, the protocol, and the session store are where the attention goes.
 
 ## Requirements
 
@@ -109,6 +119,9 @@ Run these from the repo root. Start the daemon in one terminal (it listens on `1
 ```sh
 npx ker daemon
 ```
+
+The same address serves the web UI: open `http://127.0.0.1:5537` in a browser once the daemon is
+up.
 
 Start a new session with a prompt, then continue the latest session for the exact current directory:
 
