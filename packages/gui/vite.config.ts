@@ -14,6 +14,7 @@ export default defineConfig({
 			"/health": proxy,
 			"/sessions": proxy,
 			"/projects": proxy,
+			"/documents": proxy,
 			"/openapi.json": proxy,
 		},
 	},

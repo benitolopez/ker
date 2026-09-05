@@ -4,6 +4,7 @@ import { api } from "../api.ts";
 import { formatDate } from "../format.ts";
 import { useVisiblePoll } from "../hooks/use-visible-poll.ts";
 import { formatRoute } from "../router.ts";
+import { ProjectHeader } from "./project-header.tsx";
 
 interface SessionsState {
 	sessions: Protocol.CatalogSession[];
@@ -15,11 +16,13 @@ export function SessionsScreen({
 	projectId,
 	listProjectSessions = api.listProjectSessions,
 	createProjectSession = api.createProjectSession,
+	getProject = api.getProject,
 	navigate,
 }: {
 	projectId: string;
 	listProjectSessions?: typeof api.listProjectSessions;
 	createProjectSession?: typeof api.createProjectSession;
+	getProject?: typeof api.getProject;
 	navigate?: (route: string) => void;
 }) {
 	const [state, setState] = useState<SessionsState>({ sessions: [], loaded: false });
@@ -69,28 +72,24 @@ export function SessionsScreen({
 	const sessions = [...state.sessions].sort((left, right) =>
 		(right.updatedAt ?? "").localeCompare(left.updatedAt ?? ""),
 	);
-	const projectName = sessions.find((session) => session.projectName)?.projectName ?? "Project";
 
 	return (
 		<main className="mx-auto min-h-screen w-full max-w-5xl px-5 py-8 sm:px-8 lg:px-12">
-			<a className="back-link" href={formatRoute({ screen: "projects" })}>
-				← Projects
-			</a>
-			<header className="mb-8 mt-6 flex items-end justify-between gap-5">
-				<div className="min-w-0">
-					<p className="mb-2 font-mono text-xs tracking-[0.18em] text-[var(--muted)] uppercase">Project</p>
-					<h1 className="truncate text-4xl font-semibold tracking-[-0.04em] text-[var(--text)]">{projectName}</h1>
-					<p className="mt-3 truncate font-mono text-xs text-[var(--faint)]">{projectId}</p>
-				</div>
-				<button
-					className="shrink-0 rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
-					disabled={creating}
-					onClick={() => void createSession()}
-					type="button"
-				>
-					{creating ? "Creating…" : "New session"}
-				</button>
-			</header>
+			<ProjectHeader
+				action={
+					<button
+						className="shrink-0 rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45"
+						disabled={creating}
+						onClick={() => void createSession()}
+						type="button"
+					>
+						{creating ? "Creating…" : "New session"}
+					</button>
+				}
+				getProject={getProject}
+				projectId={projectId}
+				tab="sessions"
+			/>
 
 			{state.error ? (
 				<section className="empty-panel border-red-500/25">

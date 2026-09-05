@@ -4,14 +4,15 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type * as Protocol from "@ker-ai/protocol";
-import { and, asc, count, eq, getTableColumns, isNull, max, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, getTableColumns, isNull, max, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-sqlite";
 import type { NodeIdentity } from "./identity.ts";
-import { CATALOG_VERSION, DDL, MIGRATIONS, node, project, session, workspace } from "./schema.ts";
+import { CATALOG_VERSION, DDL, document, MIGRATIONS, node, project, session, workspace } from "./schema.ts";
 import { projectKey } from "./store.ts";
 
 const SQLITE_CORRUPT = 11;
 const SQLITE_NOTADB = 26;
+const SALVAGE_TABLES = ["node", "project", "workspace", "session", "document"] as const;
 
 export interface CatalogRow {
 	id: Protocol.SessionId;
@@ -62,6 +63,10 @@ export class Catalog {
 
 		const opened = openExistingDatabase(path);
 		if (!opened) return new Catalog(rebuildDatabase(path, "the catalog database is corrupt"));
+		if (!passesIntegrityCheck(opened.client)) {
+			opened.client.close();
+			return new Catalog(rebuildDatabase(path, "the catalog database failed its integrity check"));
+		}
 		if (opened.version === CATALOG_VERSION) return new Catalog(opened.client);
 		if (opened.version > CATALOG_VERSION) {
 			opened.client.close();
@@ -398,6 +403,81 @@ export class Catalog {
 			}));
 	}
 
+	getProject(id: Protocol.ProjectId): Protocol.Project | undefined {
+		const row = this.#db
+			.select({
+				id: project.id,
+				name: project.name,
+				created_at: project.created_at,
+				session_count: count(session.id),
+				last_activity_at: max(session.updated_at),
+			})
+			.from(project)
+			.leftJoin(session, eq(session.project_id, project.id))
+			.where(eq(project.id, id))
+			.groupBy(project.id)
+			.get();
+		if (!row) return undefined;
+		return {
+			id: row.id,
+			name: row.name,
+			createdAt: row.created_at,
+			sessionCount: row.session_count,
+			lastActivityAt: row.last_activity_at,
+		};
+	}
+
+	listDocuments(projectId: Protocol.ProjectId): Protocol.DocumentSummary[] {
+		return this.#db
+			.select({
+				id: document.id,
+				title: document.title,
+				createdAt: document.created_at,
+				updatedAt: document.updated_at,
+			})
+			.from(document)
+			.where(eq(document.project_id, projectId))
+			.orderBy(desc(document.updated_at))
+			.all();
+	}
+
+	createDocument(projectId: Protocol.ProjectId, input: Protocol.DocumentRequest): Protocol.Document {
+		const now = new Date().toISOString();
+		const row = this.#db
+			.insert(document)
+			.values({
+				id: randomUUID(),
+				project_id: projectId,
+				title: input.title,
+				body: input.body,
+				created_at: now,
+				updated_at: now,
+			})
+			.returning()
+			.get();
+		return toDocument(row);
+	}
+
+	getDocument(id: Protocol.DocumentId): Protocol.Document | undefined {
+		const row = this.#db.select().from(document).where(eq(document.id, id)).get();
+		return row ? toDocument(row) : undefined;
+	}
+
+	updateDocument(id: Protocol.DocumentId, input: Protocol.DocumentRequest): Protocol.Document | undefined {
+		const row = this.#db
+			.update(document)
+			.set({ title: input.title, body: input.body, updated_at: new Date().toISOString() })
+			.where(eq(document.id, id))
+			.returning()
+			.get();
+		return row ? toDocument(row) : undefined;
+	}
+
+	deleteDocument(id: Protocol.DocumentId): Protocol.Document | undefined {
+		const row = this.#db.delete(document).where(eq(document.id, id)).returning().get();
+		return row ? toDocument(row) : undefined;
+	}
+
 	projectExists(id: Protocol.ProjectId): boolean {
 		return this.#db.select({ id: project.id }).from(project).where(eq(project.id, id)).get() !== undefined;
 	}
@@ -435,6 +515,17 @@ function openExistingDatabase(path: string): ReturnType<typeof openDatabase> | u
 	}
 }
 
+// Checks every database page so corruption in an already-current catalog is detected before queries run.
+function passesIntegrityCheck(client: DatabaseSync): boolean {
+	try {
+		const rows = client.prepare("PRAGMA quick_check").all() as Array<{ quick_check: string }>;
+		return rows.length === 1 && rows[0]?.quick_check === "ok";
+	} catch (error) {
+		if (isCorruptDatabase(error)) return false;
+		throw error;
+	}
+}
+
 function migrateDatabase(client: DatabaseSync, fromVersion: number): void {
 	client.exec("BEGIN IMMEDIATE");
 	try {
@@ -463,7 +554,66 @@ function rebuildDatabase(path: string, reason: string): DatabaseSync {
 	console.error(`ker: ${reason}; preserved it at ${preservedPath} and created a fresh catalog`);
 	const client = openDatabase(path).client;
 	initializeDatabase(client);
+	salvageRows(preservedPath, client);
 	return client;
+}
+
+// Copies readable rows table by table; damaged pages stop only their table and invalid rows are skipped.
+function salvageRows(preservedPath: string, client: DatabaseSync): void {
+	const source = (() => {
+		try {
+			return new DatabaseSync(preservedPath);
+		} catch (error) {
+			console.error(`ker: could not open ${preservedPath} for salvage: ${describeError(error)}`);
+			return undefined;
+		}
+	})();
+	if (!source) return;
+	try {
+		client.exec("BEGIN");
+		for (const table of SALVAGE_TABLES) {
+			let copied = 0;
+			let skipped = 0;
+			try {
+				const sourceColumns = new Set(
+					(source.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name),
+				);
+				const columns = (client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+					.map((column) => column.name)
+					.filter((column) => sourceColumns.has(column));
+				if (columns.length === 0) continue;
+				const insert = client.prepare(
+					`INSERT OR IGNORE INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+				);
+				for (const row of source.prepare(`SELECT ${columns.join(", ")} FROM ${table}`).iterate()) {
+					try {
+						const result = insert.run(...columns.map((column) => row[column]));
+						if (Number(result.changes) === 1) copied++;
+						if (Number(result.changes) !== 1) skipped++;
+					} catch {
+						skipped++;
+					}
+				}
+			} catch (error) {
+				console.error(`ker: salvage of ${table} stopped: ${describeError(error)}`);
+			}
+			console.error(
+				`ker: salvaged ${copied} ${table} rows from ${preservedPath}${skipped > 0 ? ` (${skipped} skipped)` : ""}`,
+			);
+		}
+		client.exec("COMMIT");
+	} catch (error) {
+		try {
+			client.exec("ROLLBACK");
+		} catch {}
+		console.error(`ker: salvage aborted: ${describeError(error)}`);
+	} finally {
+		try {
+			source.close();
+		} catch (error) {
+			console.error(`ker: could not close ${preservedPath} after salvage: ${describeError(error)}`);
+		}
+	}
 }
 
 function isCorruptDatabase(error: unknown): boolean {
@@ -476,4 +626,19 @@ function isCorruptDatabase(error: unknown): boolean {
 function initializeDatabase(client: DatabaseSync): void {
 	client.exec(DDL);
 	client.exec(`PRAGMA user_version = ${CATALOG_VERSION}`);
+}
+
+function toDocument(row: typeof document.$inferSelect): Protocol.Document {
+	return {
+		id: row.id,
+		projectId: row.project_id,
+		title: row.title,
+		body: row.body,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }

@@ -1,7 +1,10 @@
 import type { Result } from "@ker-ai/client";
 import type * as Protocol from "@ker-ai/protocol";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, assert, test, vi } from "vitest";
+import { DocumentScreen } from "../src/screens/document.tsx";
+import { DocumentsScreen } from "../src/screens/documents.tsx";
+import { ProjectHeader } from "../src/screens/project-header.tsx";
 import { SessionsScreen } from "../src/screens/sessions.tsx";
 import { Composer, QueueStack, SessionHeader, ToolBlock, toolLabel } from "../src/screens/transcript.tsx";
 
@@ -204,6 +207,7 @@ test("new session creation navigates to the empty transcript", async () => {
 	render(
 		<SessionsScreen
 			createProjectSession={createProjectSession}
+			getProject={async () => projectResult()}
 			listProjectSessions={listProjectSessions}
 			navigate={navigate}
 			projectId="project/one"
@@ -212,6 +216,229 @@ test("new session creation navigates to the empty transcript", async () => {
 	await waitFor(() => assert.equal(listProjectSessions.mock.calls.length, 1));
 	fireEvent.click(screen.getByRole("button", { name: "New session" }));
 	await waitFor(() => assert.deepEqual(navigate.mock.calls, [["#/projects/project%2Fone/sessions/session%20one"]]));
+});
+
+test("the project header loads the name and links both project sections", async () => {
+	const pending = Promise.withResolvers<Result<Protocol.Project>>();
+	const getProject = vi.fn((_projectId: string, _signal?: AbortSignal) => pending.promise);
+	render(<ProjectHeader getProject={getProject} projectId="project/one" tab="documents" />);
+	assert.equal(screen.getAllByText("project/one").length, 2);
+	assert.equal(
+		screen.getByRole("link", { name: "Sessions" }).getAttribute("href"),
+		"#/projects/project%2Fone/sessions",
+	);
+	assert.equal(screen.getByRole("link", { name: "Documents" }).getAttribute("aria-current"), "page");
+
+	pending.resolve(projectResult("Project One"));
+	await waitFor(() => assert.equal(screen.getByRole("heading", { level: 1 }).textContent, "Project One"));
+});
+
+test("the document list keeps server order and opens the new-document route", async () => {
+	const listDocuments = vi.fn(
+		async () =>
+			({
+				ok: true,
+				status: 200,
+				value: {
+					documents: [
+						documentSummary("newer", "Newer", "2026-02-01T00:00:00.000Z"),
+						documentSummary("older", "Older", "2026-01-01T00:00:00.000Z"),
+					],
+				},
+			}) satisfies Result<Protocol.ListDocumentsResponse>,
+	);
+	const navigate = vi.fn<(route: string) => void>();
+	render(
+		<DocumentsScreen
+			getProject={async () => projectResult()}
+			listDocuments={listDocuments}
+			navigate={navigate}
+			projectId="project/one"
+		/>,
+	);
+	await waitFor(() => assert.equal(listDocuments.mock.calls.length, 1));
+	assert.deepEqual(
+		screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent),
+		["Newer", "Older"],
+	);
+	fireEvent.click(screen.getByRole("button", { name: "New document" }));
+	assert.deepEqual(navigate.mock.calls, [["#/projects/project%2Fone/documents/new"]]);
+});
+
+test("the document list renders its empty state", async () => {
+	render(
+		<DocumentsScreen
+			getProject={async () => projectResult()}
+			listDocuments={async () => ({ ok: true, status: 200, value: { documents: [] } })}
+			projectId="project-one"
+		/>,
+	);
+	await screen.findByText("No documents yet");
+});
+
+test("a document renders Markdown and supports edit, save, and cancel keys", async () => {
+	const original = documentRecord({ body: "# Heading\n\n<script>alert(1)</script>" });
+	const getDocument = vi.fn(async (_id: string, _signal?: AbortSignal) => documentResult(original));
+	const updateDocument = vi.fn(async (_id: string, input: Protocol.DocumentRequest, _signal?: AbortSignal) =>
+		documentResult({ ...original, ...input, updatedAt: "2026-02-01T00:00:00.000Z" }),
+	);
+	render(
+		<DocumentScreen
+			createDocument={async (_projectId, input) => documentResult({ ...original, ...input })}
+			deleteDocument={async () => documentResult(original)}
+			documentId={original.id}
+			getDocument={getDocument}
+			projectId={original.projectId}
+			updateDocument={updateDocument}
+		/>,
+	);
+	await screen.findByRole("heading", { level: 1, name: original.title });
+	assert.equal(screen.getByRole("heading", { level: 1, name: "Heading" }).textContent, "Heading");
+	assert.match(screen.getByRole("article").textContent ?? "", /<script>alert\(1\)<\/script>/);
+	assert.equal(screen.getByRole("article").querySelector("script"), null);
+
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const title = screen.getByLabelText("Title") as HTMLInputElement;
+	const body = screen.getByLabelText("Body") as HTMLTextAreaElement;
+	assert.equal(title.value, original.title);
+	assert.equal(title.maxLength, 200);
+	assert.equal(body.value, original.body);
+	assert.equal((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled, true);
+	fireEvent.change(title, { target: { value: "   " } });
+	assert.equal((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled, true);
+	fireEvent.change(title, { target: { value: "Updated title" } });
+	fireEvent.change(body, { target: { value: "Updated body" } });
+	fireEvent.keyDown(title, { key: "s", metaKey: true });
+	await waitFor(() =>
+		assert.deepEqual(updateDocument.mock.calls[0]?.slice(0, 2), [
+			original.id,
+			{
+				title: "Updated title",
+				body: "Updated body",
+			},
+		]),
+	);
+	await screen.findByRole("heading", { level: 1, name: "Updated title" });
+
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const editedBody = screen.getByLabelText("Body") as HTMLTextAreaElement;
+	fireEvent.change(editedBody, { target: { value: "Unsaved" } });
+	fireEvent.keyDown(editedBody, { key: "Escape" });
+	await screen.findByText("Updated body");
+	assert.equal(updateDocument.mock.calls.length, 1);
+});
+
+test("a document poll that resolves during editing keeps the draft", async () => {
+	const original = documentRecord();
+	const pending = Promise.withResolvers<Result<Protocol.Document>>();
+	const getDocument = vi
+		.fn((_id: string, _signal?: AbortSignal) => pending.promise)
+		.mockResolvedValueOnce(documentResult(original));
+	render(
+		<DocumentScreen
+			createDocument={async (_projectId, input) => documentResult({ ...original, ...input })}
+			deleteDocument={async () => documentResult(original)}
+			documentId={original.id}
+			getDocument={getDocument}
+			projectId={original.projectId}
+			updateDocument={async (_id, input) => documentResult({ ...original, ...input })}
+		/>,
+	);
+	await screen.findByRole("button", { name: "Edit" });
+	window.dispatchEvent(new Event("focus"));
+	await waitFor(() => assert.equal(getDocument.mock.calls.length, 2));
+
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const title = screen.getByLabelText("Title") as HTMLInputElement;
+	const body = screen.getByLabelText("Body") as HTMLTextAreaElement;
+	fireEvent.change(title, { target: { value: "Draft title" } });
+	fireEvent.change(body, { target: { value: "Draft body" } });
+	await act(async () => {
+		pending.resolve(documentResult({ ...original, title: "Remote title", body: "Remote body" }));
+		await pending.promise;
+	});
+
+	assert.equal(title.value, "Draft title");
+	assert.equal(body.value, "Draft body");
+});
+
+test("a new document creates on first save and navigates to its real id", async () => {
+	const created = documentRecord({ id: "document/new", title: "New title", body: "New body" });
+	const createDocument = vi.fn(async (_projectId: string, input: Protocol.DocumentRequest, _signal?: AbortSignal) =>
+		documentResult({ ...created, ...input }),
+	);
+	const navigate = vi.fn<(route: string) => void>();
+	render(
+		<DocumentScreen
+			createDocument={createDocument}
+			deleteDocument={async () => documentResult(created)}
+			documentId="new"
+			getDocument={async () => documentResult(created)}
+			navigate={navigate}
+			projectId="project/one"
+			updateDocument={async () => documentResult(created)}
+		/>,
+	);
+	const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+	assert.equal(save.disabled, true);
+	fireEvent.change(screen.getByLabelText("Title"), { target: { value: created.title } });
+	fireEvent.change(screen.getByLabelText("Body"), { target: { value: created.body } });
+	fireEvent.click(save);
+	await waitFor(() =>
+		assert.deepEqual(createDocument.mock.calls[0]?.slice(0, 2), [
+			"project/one",
+			{
+				title: created.title,
+				body: created.body,
+			},
+		]),
+	);
+	assert.deepEqual(navigate.mock.calls, [["#/projects/project%2Fone/documents/document%2Fnew"]]);
+});
+
+test("document deletion requires inline confirmation", async () => {
+	const document = documentRecord();
+	const deleteDocument = vi.fn(async (_id: string, _signal?: AbortSignal) => documentResult(document));
+	const navigate = vi.fn<(route: string) => void>();
+	render(
+		<DocumentScreen
+			createDocument={async (_projectId, input) => documentResult({ ...document, ...input })}
+			deleteDocument={deleteDocument}
+			documentId={document.id}
+			getDocument={async () => documentResult(document)}
+			navigate={navigate}
+			projectId={document.projectId}
+			updateDocument={async (_id, input) => documentResult({ ...document, ...input })}
+		/>,
+	);
+	await screen.findByRole("button", { name: "Delete" });
+	fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+	assert.equal(deleteDocument.mock.calls.length, 0);
+	assert.equal(screen.getByText("Delete this document?").textContent, "Delete this document?");
+	fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+	await waitFor(() => assert.deepEqual(deleteDocument.mock.calls, [[document.id]]));
+	assert.deepEqual(navigate.mock.calls, [["#/projects/project-one/documents"]]);
+});
+
+test("a failed document save keeps the draft and shows the error", async () => {
+	const document = documentRecord();
+	render(
+		<DocumentScreen
+			createDocument={async (_projectId, input) => documentResult({ ...document, ...input })}
+			deleteDocument={async () => documentResult(document)}
+			documentId={document.id}
+			getDocument={async () => documentResult(document)}
+			projectId={document.projectId}
+			updateDocument={async () => ({ ok: false, status: 500, error: { code: "internal", message: "try again" } })}
+		/>,
+	);
+	await screen.findByRole("button", { name: "Edit" });
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const body = screen.getByLabelText("Body") as HTMLTextAreaElement;
+	fireEvent.change(body, { target: { value: "Keep this draft" } });
+	fireEvent.click(screen.getByRole("button", { name: "Save" }));
+	await waitFor(() => assert.equal(screen.getByRole("alert").textContent, "try again"));
+	assert.equal(body.value, "Keep this draft");
 });
 
 function emptyQueue(): Protocol.QueueSnapshot {
@@ -323,4 +550,43 @@ function catalogSession(): Protocol.ReadableCatalogSession {
 		createdAt: "2026-01-01T00:00:00.000Z",
 		updatedAt: "2026-01-01T00:00:00.000Z",
 	};
+}
+
+function projectResult(name = "Project"): Result<Protocol.Project> {
+	return {
+		ok: true,
+		status: 200,
+		value: {
+			id: "project/one",
+			name,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			sessionCount: 0,
+			lastActivityAt: null,
+		},
+	};
+}
+
+function documentSummary(id: string, title: string, updatedAt: string): Protocol.DocumentSummary {
+	return {
+		id,
+		title,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt,
+	};
+}
+
+function documentRecord(overrides: Partial<Protocol.Document> = {}): Protocol.Document {
+	return {
+		id: "document-one",
+		projectId: "project-one",
+		title: "Document title",
+		body: "Document body",
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		...overrides,
+	};
+}
+
+function documentResult(document: Protocol.Document): Result<Protocol.Document> {
+	return { ok: true, status: 200, value: document };
 }
