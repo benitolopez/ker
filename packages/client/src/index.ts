@@ -15,6 +15,7 @@ export interface Client {
 	health(signal?: AbortSignal): Promise<Result<Protocol.Health>>;
 	openapi(signal?: AbortSignal): Promise<Result<Record<string, unknown>>>;
 	listProjects(signal?: AbortSignal): Promise<Result<Protocol.ListProjectsResponse>>;
+	getProject(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Protocol.Project>>;
 	listProjectSessions(
 		projectId: Protocol.ProjectId,
 		signal?: AbortSignal,
@@ -23,6 +24,19 @@ export interface Client {
 		projectId: Protocol.ProjectId,
 		signal?: AbortSignal,
 	): Promise<Result<Protocol.ReadableCatalogSession>>;
+	listDocuments(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Protocol.ListDocumentsResponse>>;
+	createDocument(
+		projectId: Protocol.ProjectId,
+		input: Protocol.DocumentRequest,
+		signal?: AbortSignal,
+	): Promise<Result<Protocol.Document>>;
+	getDocument(documentId: Protocol.DocumentId, signal?: AbortSignal): Promise<Result<Protocol.Document>>;
+	updateDocument(
+		documentId: Protocol.DocumentId,
+		input: Protocol.DocumentRequest,
+		signal?: AbortSignal,
+	): Promise<Result<Protocol.Document>>;
+	deleteDocument(documentId: Protocol.DocumentId, signal?: AbortSignal): Promise<Result<Protocol.Document>>;
 	createSession(cwd: string, signal?: AbortSignal): Promise<Result<Protocol.SessionDescriptor>>;
 	listSessions(
 		scope: { cwd: string } | { all: true },
@@ -65,9 +79,36 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 		health: (signal) => request(routes.health.path, { signal }),
 		openapi: (signal) => request(routes.openapi.path, { signal }),
 		listProjects: (signal) => request(routes.listProjects.path, { signal }),
+		getProject: (projectId, signal) => request(routes.getProject.path, { signal }, { projectId }),
 		listProjectSessions: (projectId, signal) => request(routes.listProjectSessions.path, { signal }, { projectId }),
 		createProjectSession: (projectId, signal) =>
 			request(routes.createProjectSession.path, { method: routes.createProjectSession.method, signal }, { projectId }),
+		listDocuments: (projectId, signal) => request(routes.listDocuments.path, { signal }, { projectId }),
+		createDocument: (projectId, input, signal) =>
+			request(
+				routes.createDocument.path,
+				{
+					method: routes.createDocument.method,
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(input satisfies Protocol.DocumentRequest),
+					signal,
+				},
+				{ projectId },
+			),
+		getDocument: (documentId, signal) => request(routes.getDocument.path, { signal }, { documentId }),
+		updateDocument: (documentId, input, signal) =>
+			request(
+				routes.updateDocument.path,
+				{
+					method: routes.updateDocument.method,
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(input satisfies Protocol.DocumentRequest),
+					signal,
+				},
+				{ documentId },
+			),
+		deleteDocument: (documentId, signal) =>
+			request(routes.deleteDocument.path, { method: routes.deleteDocument.method, signal }, { documentId }),
 		createSession: (cwd, signal) =>
 			request(routes.createSession.path, {
 				method: routes.createSession.method,

@@ -34,6 +34,8 @@ test("daemon responses conform to the route table", async (t) => {
 	);
 	const project = projects.projects[0];
 	assert(project);
+	await assertJson("getProject", await localFetch(`${running.url}/projects/${project.id}`), 200);
+	await assertJson("getProject", await localFetch(`${running.url}/projects/missing`), 404);
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/${project.id}/sessions`), 200);
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/missing/sessions`), 404);
 	await assertJson(
@@ -46,6 +48,52 @@ test("daemon responses conform to the route table", async (t) => {
 		await localFetch(`${running.url}/projects/missing/sessions`, { method: "POST" }),
 		404,
 	);
+	await assertJson("listDocuments", await localFetch(`${running.url}/projects/${project.id}/documents`), 200);
+	await assertJson("listDocuments", await localFetch(`${running.url}/projects/missing/documents`), 404);
+	const document = await assertJson<Protocol.Document>(
+		"createDocument",
+		await localFetch(`${running.url}/projects/${project.id}/documents`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ title: "Contract", body: "Body" } satisfies Protocol.DocumentRequest),
+		}),
+		201,
+	);
+	await assertJson(
+		"createDocument",
+		await localFetch(`${running.url}/projects/missing/documents`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ title: "Contract", body: "Body" } satisfies Protocol.DocumentRequest),
+		}),
+		404,
+	);
+	await assertJson("getDocument", await localFetch(`${running.url}/documents/${document.id}`), 200);
+	await assertJson("getDocument", await localFetch(`${running.url}/documents/missing`), 404);
+	await assertJson(
+		"updateDocument",
+		await localFetch(`${running.url}/documents/${document.id}`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ title: "Updated", body: "Replacement" } satisfies Protocol.DocumentRequest),
+		}),
+		200,
+	);
+	await assertJson(
+		"updateDocument",
+		await localFetch(`${running.url}/documents/missing`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ title: "Updated", body: "Replacement" } satisfies Protocol.DocumentRequest),
+		}),
+		404,
+	);
+	await assertJson(
+		"deleteDocument",
+		await localFetch(`${running.url}/documents/${document.id}`, { method: "DELETE" }),
+		200,
+	);
+	await assertJson("deleteDocument", await localFetch(`${running.url}/documents/missing`, { method: "DELETE" }), 404);
 	await assertJson(
 		"listSessions",
 		await localFetch(`${running.url}/sessions?cwd=${encodeURIComponent(process.cwd())}`),

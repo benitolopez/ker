@@ -1,10 +1,10 @@
 import { AttachError, type Result } from "@ker-ai/client";
 import type * as Protocol from "@ker-ai/protocol";
 import { type KeyboardEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import ReactMarkdown from "react-markdown";
 import { api, attach } from "../api.ts";
 import { parsePatch } from "../diff.ts";
 import { formatTokens } from "../format.ts";
+import { Markdown } from "../markdown.tsx";
 import { formatRoute } from "../router.ts";
 import { type Block, TranscriptStore } from "../store/transcript.ts";
 
@@ -280,14 +280,6 @@ function Code({ text, error = false }: { text: string; error?: boolean }) {
 		>
 			{text}
 		</pre>
-	);
-}
-
-function Markdown({ text }: { text: string }) {
-	return (
-		<div className="markdown">
-			<ReactMarkdown>{text}</ReactMarkdown>
-		</div>
 	);
 }
 

@@ -3,10 +3,14 @@ import {
 	CompactionAdmission,
 	CompactRequest,
 	CreateSessionRequest,
+	Document,
+	DocumentRequest,
 	EventEnvelope,
 	Health,
+	ListDocumentsResponse,
 	ListProjectsResponse,
 	ListSessionsResponse,
+	Project,
 	PromptAdmission,
 	PromptRequest,
 	ReadableCatalogSession,
@@ -16,7 +20,7 @@ import {
 } from "./index.ts";
 
 export interface RouteDefinition {
-	method: "GET" | "POST";
+	method: "GET" | "POST" | "PUT" | "DELETE";
 	path: string;
 	summary: string;
 	description?: string;
@@ -28,6 +32,7 @@ export interface RouteDefinition {
 }
 
 const openApiDocument = Type.Record(Type.String(), Type.Unknown());
+const documentId = { documentId: Type.String({ minLength: 1 }) };
 const sessionId = { sessionId: Type.String({ minLength: 1 }) };
 const turnId = { turnId: Type.String({ minLength: 1 }) };
 
@@ -64,6 +69,18 @@ export const routes = {
 			500: errorBody("internal"),
 		},
 	},
+	getProject: {
+		method: "GET",
+		path: "/projects/{projectId}",
+		summary: "Read a project",
+		params: { projectId: Type.String({ minLength: 1 }) },
+		responses: {
+			200: Project,
+			403: errorBody("forbidden"),
+			404: errorBody("project_not_found"),
+			500: errorBody("internal"),
+		},
+	},
 	listProjectSessions: {
 		method: "GET",
 		path: "/projects/{projectId}/sessions",
@@ -89,6 +106,77 @@ export const routes = {
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			409: errorBody("workspace_ambiguous"),
+			500: errorBody("internal"),
+		},
+	},
+	listDocuments: {
+		method: "GET",
+		path: "/projects/{projectId}/documents",
+		summary: "List a project's documents",
+		description: "Summaries ordered by updatedAt descending; fetch a document for its body.",
+		params: { projectId: Type.String({ minLength: 1 }) },
+		responses: {
+			200: ListDocumentsResponse,
+			403: errorBody("forbidden"),
+			404: errorBody("project_not_found"),
+			500: errorBody("internal"),
+		},
+	},
+	createDocument: {
+		method: "POST",
+		path: "/projects/{projectId}/documents",
+		summary: "Create a document in a project",
+		params: { projectId: Type.String({ minLength: 1 }) },
+		body: DocumentRequest,
+		responses: {
+			201: Document,
+			400: Type.Union([errorBody("invalid_document"), errorBody("invalid_json")]),
+			403: errorBody("forbidden"),
+			404: errorBody("project_not_found"),
+			413: errorBody("payload_too_large"),
+			415: errorBody("unsupported_media_type"),
+			500: errorBody("internal"),
+		},
+	},
+	getDocument: {
+		method: "GET",
+		path: "/documents/{documentId}",
+		summary: "Read a document",
+		params: documentId,
+		responses: {
+			200: Document,
+			403: errorBody("forbidden"),
+			404: errorBody("document_not_found"),
+			500: errorBody("internal"),
+		},
+	},
+	updateDocument: {
+		method: "PUT",
+		path: "/documents/{documentId}",
+		summary: "Replace a document's title and body",
+		description: "Last write wins; there is no revision check.",
+		params: documentId,
+		body: DocumentRequest,
+		responses: {
+			200: Document,
+			400: Type.Union([errorBody("invalid_document"), errorBody("invalid_json")]),
+			403: errorBody("forbidden"),
+			404: errorBody("document_not_found"),
+			413: errorBody("payload_too_large"),
+			415: errorBody("unsupported_media_type"),
+			500: errorBody("internal"),
+		},
+	},
+	deleteDocument: {
+		method: "DELETE",
+		path: "/documents/{documentId}",
+		summary: "Delete a document",
+		description: "Responds with the deleted document.",
+		params: documentId,
+		responses: {
+			200: Document,
+			403: errorBody("forbidden"),
+			404: errorBody("document_not_found"),
 			500: errorBody("internal"),
 		},
 	},

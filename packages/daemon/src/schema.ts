@@ -43,7 +43,18 @@ export const session = sqliteTable("session", {
 	node_id: text().references(() => node.id),
 });
 
-export const CATALOG_VERSION = 2;
+export const document = sqliteTable("document", {
+	id: text().primaryKey(),
+	project_id: text()
+		.notNull()
+		.references(() => project.id),
+	title: text().notNull(),
+	body: text().notNull(),
+	created_at: text().notNull(),
+	updated_at: text().notNull(),
+});
+
+export const CATALOG_VERSION = 3;
 
 export const DDL = `
 CREATE TABLE node (
@@ -78,6 +89,14 @@ CREATE TABLE session (
 	workspace_id TEXT REFERENCES workspace(id),
 	node_id TEXT REFERENCES node(id)
 ) STRICT;
+CREATE TABLE document (
+	id TEXT PRIMARY KEY,
+	project_id TEXT NOT NULL REFERENCES project(id),
+	title TEXT NOT NULL,
+	body TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+) STRICT;
 `;
 
 export const MIGRATIONS: Readonly<Record<number, string>> = {
@@ -105,5 +124,15 @@ ALTER TABLE session ADD COLUMN project_id TEXT REFERENCES project(id);
 ALTER TABLE session ADD COLUMN workspace_id TEXT REFERENCES workspace(id);
 ALTER TABLE session ADD COLUMN node_id TEXT REFERENCES node(id);
 ALTER TABLE session DROP COLUMN project_root;
+`,
+	3: `
+CREATE TABLE document (
+	id TEXT PRIMARY KEY,
+	project_id TEXT NOT NULL REFERENCES project(id),
+	title TEXT NOT NULL,
+	body TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+) STRICT;
 `,
 };

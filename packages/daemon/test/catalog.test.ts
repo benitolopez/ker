@@ -8,7 +8,7 @@ import type * as Protocol from "@ker-ai/protocol";
 import { drizzle } from "drizzle-orm/node-sqlite";
 import { Catalog, defaultCatalogPath } from "../src/catalog.ts";
 import type { NodeIdentity } from "../src/node.ts";
-import { CATALOG_VERSION, DDL, node, project, session, workspace } from "../src/schema.ts";
+import { CATALOG_VERSION, DDL, document, MIGRATIONS, node, project, session, workspace } from "../src/schema.ts";
 import { type CatalogedSession, projectKey } from "../src/store.ts";
 
 const IDENTITY: NodeIdentity = {
@@ -67,7 +67,7 @@ test("migrates a v1 catalog in place with titles intact", async (t) => {
 	catalog.close();
 
 	const client = new DatabaseSync(path);
-	assert.equal((client.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
+	assert.equal((client.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, CATALOG_VERSION);
 	assert.equal(
 		(client.prepare("SELECT title FROM session WHERE id = ?").get("session-old") as { title: string }).title,
 		"Saved title",
@@ -104,13 +104,116 @@ test("preserves corruption discovered during migration before rebuilding", async
 		(name) => name.startsWith("catalog.db.corrupt-") && !name.endsWith("-wal") && !name.endsWith("-shm"),
 	);
 	assert(preserved);
-	assert.match(errors.join("\n"), /became corrupt during migration/);
+	assert.match(errors.join("\n"), /failed its integrity check|became corrupt during migration/);
 	const old = new DatabaseSync(join(root, preserved));
 	assert.equal((old.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
 	old.close();
 	const fresh = new DatabaseSync(path);
-	assert.equal((fresh.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
+	assert.equal((fresh.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, CATALOG_VERSION);
 	fresh.close();
+});
+
+test("salvages shared columns from an older schema after corruption", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-corrupt-old-schema-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const path = join(root, "catalog.db");
+	createV1Catalog(path);
+	const source = new DatabaseSync(path);
+	source.exec("CREATE TABLE damaged (id INTEGER PRIMARY KEY, body TEXT NOT NULL) STRICT");
+	const insert = source.prepare("INSERT INTO damaged (body) VALUES (?)");
+	for (let index = 0; index < 400; index++) insert.run(`${index}-${"x".repeat(100)}`);
+	source.close();
+	await corruptLeafPage(path, "damaged");
+	t.mock.method(console, "error", () => undefined);
+
+	const recovered = Catalog.open(path);
+	t.after(() => recovered.close());
+	assert.equal(recovered.get("session-old")?.title, "Saved title");
+	assert.equal(recovered.get("session-old")?.project_id, null);
+});
+
+test("detects current-version corruption and salvages readable catalog rows", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-current-corrupt-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const path = join(root, "catalog.db");
+	const catalog = Catalog.open(path);
+	catalog.upsertNode(IDENTITY);
+	const binding = catalog.createWorkspace({
+		nodeId: IDENTITY.id,
+		rootPath: "/project/salvage",
+		projectName: "salvage",
+		gitRemote: "git@example.com:salvage.git",
+	});
+	for (let index = 0; index < 400; index++) {
+		const descriptor = sessionDescriptor(
+			`session-${String(index).padStart(3, "0")}`,
+			binding.rootPath,
+			binding.rootPath,
+		);
+		catalog.upsertCreated(descriptor, binding);
+		catalog.setTitleIfEmpty(descriptor.id, `Saved title ${index} ${"x".repeat(100)}`);
+	}
+	const savedDocument = catalog.createDocument(binding.projectId, { title: "Saved document", body: "Keep me" });
+	catalog.close();
+	await corruptLeafPage(path, "session");
+	const errors: string[] = [];
+	t.mock.method(console, "error", (...values: unknown[]) => errors.push(values.map(String).join(" ")));
+
+	const recovered = Catalog.open(path);
+	t.after(() => recovered.close());
+	assert.deepEqual(recovered.findWorkspaceByRoot(IDENTITY.id, binding.rootPath), binding);
+	assert.deepEqual(recovered.getProject(binding.projectId), {
+		id: binding.projectId,
+		name: binding.projectName,
+		createdAt: recovered.getProject(binding.projectId)?.createdAt,
+		sessionCount: recovered.list({ projectId: binding.projectId }).length,
+		lastActivityAt: recovered.getProject(binding.projectId)?.lastActivityAt,
+	});
+	assert(recovered.list({ projectId: binding.projectId }).some((row) => row.title?.startsWith("Saved title")));
+	assert.deepEqual(recovered.getDocument(savedDocument.id), savedDocument);
+	assert.match(errors.join("\n"), /failed its integrity check/);
+	for (const table of ["node", "project", "workspace", "session", "document"]) {
+		assert.match(errors.join("\n"), new RegExp(`salvaged \\d+ ${table} rows`));
+	}
+	const preserved = (await readdir(root)).find(
+		(name) => name.startsWith("catalog.db.corrupt-") && !name.endsWith("-wal") && !name.endsWith("-shm"),
+	);
+	assert(preserved);
+	const fresh = new DatabaseSync(path);
+	assert.equal((fresh.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, CATALOG_VERSION);
+	fresh.close();
+});
+
+test("salvage skips rows whose dependencies are missing", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-salvage-orphan-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const path = join(root, "catalog.db");
+	const catalog = Catalog.open(path);
+	catalog.upsertNode(IDENTITY);
+	const binding = catalog.createWorkspace({
+		nodeId: IDENTITY.id,
+		rootPath: "/project/valid",
+		projectName: "valid",
+		gitRemote: null,
+	});
+	catalog.close();
+	const source = new DatabaseSync(path);
+	source.exec("PRAGMA foreign_keys = OFF");
+	source
+		.prepare(
+			"INSERT INTO workspace (id, project_id, node_id, root_path, git_remote, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		)
+		.run("workspace-orphan", "project-missing", IDENTITY.id, "/project/orphan", null, IDENTITY.createdAt);
+	source.exec("PRAGMA user_version = 0");
+	source.close();
+	const errors: string[] = [];
+	t.mock.method(console, "error", (...values: unknown[]) => errors.push(values.map(String).join(" ")));
+
+	const recovered = Catalog.open(path);
+	t.after(() => recovered.close());
+	assert.deepEqual(recovered.findWorkspaceByRoot(IDENTITY.id, binding.rootPath), binding);
+	assert.equal(recovered.findWorkspaceByRoot(IDENTITY.id, "/project/orphan"), undefined);
+	assert.match(errors.join("\n"), /salvaged 1 workspace rows .+ \(1 skipped\)/);
 });
 
 test("fresh and migrated catalogs have equivalent structures", async (t) => {
@@ -124,7 +227,7 @@ test("fresh and migrated catalogs have equivalent structures", async (t) => {
 
 	const fresh = new DatabaseSync(freshPath);
 	const migrated = new DatabaseSync(migratedPath);
-	for (const table of ["node", "project", "workspace", "session"]) {
+	for (const table of ["node", "project", "workspace", "session", "document"]) {
 		for (const pragma of ["table_info", "foreign_key_list", "index_list"]) {
 			assert.deepEqual(
 				migrated.prepare(`PRAGMA ${pragma}(${table})`).all(),
@@ -169,8 +272,9 @@ test("preserves a corrupt catalog before rebuilding", async (t) => {
 	assert(preserved);
 	assert.equal(await readFile(join(root, preserved), "utf8"), "not a sqlite database");
 	assert.match(errors.join("\n"), /preserved it at .*catalog\.db\.corrupt-/);
+	assert.match(errors.join("\n"), /salvaged 0 node rows/);
 	const client = new DatabaseSync(path);
-	assert.equal((client.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
+	assert.equal((client.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, CATALOG_VERSION);
 	client.close();
 });
 
@@ -234,6 +338,41 @@ test("the DDL round-trips every schema column through Drizzle", () => {
 	};
 	db.insert(session).values(expected).run();
 	assert.deepEqual(db.select().from(session).get(), expected);
+	const expectedDocument = {
+		id: "document-1",
+		project_id: "project-1",
+		title: "Decision",
+		body: "Keep this text",
+		created_at: createdAt,
+		updated_at: "2026-01-03T00:00:00.000Z",
+	};
+	db.insert(document).values(expectedDocument).run();
+	assert.deepEqual(db.select().from(document).get(), expectedDocument);
+	client.close();
+});
+
+test("migrates a v2 catalog to v3 with session rows intact", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-v2-migrate-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const path = join(root, "catalog.db");
+	createV2Catalog(path);
+
+	Catalog.open(path).close();
+
+	const client = new DatabaseSync(path);
+	assert.equal((client.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, CATALOG_VERSION);
+	assert.equal(
+		(client.prepare("SELECT title FROM session WHERE id = ?").get("session-old") as { title: string }).title,
+		"Saved title",
+	);
+	assert.equal(
+		(
+			client.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'document'").get() as {
+				name: string;
+			}
+		).name,
+		"document",
+	);
 	client.close();
 });
 
@@ -408,6 +547,23 @@ test("project queries compute session activity and keep empty projects", async (
 			lastActivityAt: null,
 		},
 	);
+	assert.deepEqual(
+		catalog.getProject(binding.projectId),
+		catalog.listProjects().find((row) => row.id === binding.projectId),
+	);
+	assert.equal(catalog.getProject("missing"), undefined);
+	const firstDocument = catalog.createDocument(binding.projectId, { title: "First", body: "Original" });
+	const secondDocument = catalog.createDocument(binding.projectId, { title: "Second", body: "Another" });
+	assert.deepEqual(
+		new Set(catalog.listDocuments(binding.projectId).map((item) => item.id)),
+		new Set([firstDocument.id, secondDocument.id]),
+	);
+	assert.deepEqual(catalog.getDocument(firstDocument.id), firstDocument);
+	const updated = catalog.updateDocument(firstDocument.id, { title: "Updated", body: "Replacement" });
+	assert.equal(updated?.title, "Updated");
+	assert.equal(updated?.body, "Replacement");
+	assert.deepEqual(catalog.deleteDocument(secondDocument.id), secondDocument);
+	assert.equal(catalog.getDocument(secondDocument.id), undefined);
 });
 
 test("uses KER_CATALOG_PATH before the user-owned default", (t) => {
@@ -442,6 +598,29 @@ function createV1Catalog(path: string): void {
 		);
 	client.exec("PRAGMA user_version = 1");
 	client.close();
+}
+
+function createV2Catalog(path: string): void {
+	createV1Catalog(path);
+	const client = new DatabaseSync(path);
+	client.exec("PRAGMA foreign_keys = ON");
+	client.exec(MIGRATIONS[2] ?? "");
+	client.exec("PRAGMA user_version = 2");
+	client.close();
+}
+
+async function corruptLeafPage(path: string, table: string): Promise<void> {
+	const client = new DatabaseSync(path);
+	const pageSize = (client.prepare("PRAGMA page_size").get() as { page_size: number }).page_size;
+	const pages = client.prepare(`SELECT pageno FROM dbstat WHERE name = ? AND pagetype = 'leaf'`).all(table) as Array<{
+		pageno: number;
+	}>;
+	client.close();
+	const page = pages.at(-1);
+	assert(page);
+	const file = await open(path, "r+");
+	await file.write(Buffer.alloc(pageSize), 0, pageSize, (page.pageno - 1) * pageSize);
+	await file.close();
 }
 
 function sessionDescriptor(id: string, projectRoot: string, cwd: string): Protocol.SessionDescriptor {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -90,6 +90,15 @@ test("lists projects with aggregates and project-scoped sessions", async (t) => 
 			lastActivityAt: null,
 		},
 	);
+	const projectResponse = await localFetch(`${running.url}/projects/${projectId}`);
+	assert.equal(projectResponse.status, 200);
+	assert.deepEqual(
+		await readJson(projectResponse.body),
+		projects.projects.find((project) => project.id === projectId),
+	);
+	const missingProject = await localFetch(`${running.url}/projects/missing`);
+	assert.equal(missingProject.status, 404);
+	assert.deepEqual(await readJson(missingProject.body), { code: "project_not_found" });
 
 	const sessionsResponse = await localFetch(`${running.url}/projects/${projectId}/sessions`);
 	const sessions = await readJson<Protocol.ListSessionsResponse>(sessionsResponse.body);
@@ -102,6 +111,146 @@ test("lists projects with aggregates and project-scoped sessions", async (t) => 
 	const missing = await localFetch(`${running.url}/projects/missing/sessions`);
 	assert.equal(missing.status, 404);
 	assert.deepEqual(await readJson(missing.body), { code: "project_not_found" });
+});
+
+test("creates, lists, updates, and deletes project documents", async (t) => {
+	const running = await startServer(t, immediateFactory());
+	await createSession(running.url);
+	const projects = await readJson<Protocol.ListProjectsResponse>((await localFetch(`${running.url}/projects`)).body);
+	const project = projects.projects[0];
+	assert(project);
+
+	const empty = await localFetch(`${running.url}/projects/${project.id}/documents`);
+	assert.equal(empty.status, 200);
+	assert.deepEqual(await readJson(empty.body), { documents: [] });
+	const createdResponse = await rawCreateDocument(running.url, project.id, {
+		title: "  Design notes  ",
+		body: "# First\n\nOriginal body",
+	});
+	assert.equal(createdResponse.status, 201);
+	const created = await readJson<Protocol.Document>(createdResponse.body);
+	assert.deepEqual(created, {
+		id: created.id,
+		projectId: project.id,
+		title: "Design notes",
+		body: "# First\n\nOriginal body",
+		createdAt: created.createdAt,
+		updatedAt: created.updatedAt,
+	});
+
+	const listedResponse = await localFetch(`${running.url}/projects/${project.id}/documents`);
+	const listed = await readJson<Protocol.ListDocumentsResponse>(listedResponse.body);
+	assert.equal(listedResponse.status, 200);
+	assert.deepEqual(listed.documents, [
+		{
+			id: created.id,
+			title: created.title,
+			createdAt: created.createdAt,
+			updatedAt: created.updatedAt,
+		},
+	]);
+	assert.equal("body" in (listed.documents[0] ?? {}), false);
+	const readResponse = await localFetch(`${running.url}/documents/${created.id}`);
+	assert.equal(readResponse.status, 200);
+	assert.deepEqual(await readJson(readResponse.body), created);
+
+	await new Promise<void>((resolve) => setTimeout(resolve, 2));
+	const updatedResponse = await rawUpdateDocument(running.url, created.id, {
+		title: "Replacement",
+		body: "New body",
+	});
+	assert.equal(updatedResponse.status, 200);
+	const updated = await readJson<Protocol.Document>(updatedResponse.body);
+	assert.equal(updated.createdAt, created.createdAt);
+	assert(updated.updatedAt > created.updatedAt);
+	assert.equal(updated.title, "Replacement");
+	assert.equal(updated.body, "New body");
+
+	const largeBody = "x".repeat(900 * 1024);
+	const largeResponse = await rawCreateDocument(running.url, project.id, { title: "Large", body: largeBody });
+	assert.equal(largeResponse.status, 201);
+	assert.equal((await readJson<Protocol.Document>(largeResponse.body)).body, largeBody);
+
+	for (const title of ["", "   ", "x".repeat(201)]) {
+		const invalid = await rawCreateDocument(running.url, project.id, { title, body: "kept" });
+		assert.equal(invalid.status, 400);
+		assert.deepEqual(await readJson(invalid.body), { code: "invalid_document" });
+	}
+	const missingList = await localFetch(`${running.url}/projects/missing/documents`);
+	assert.equal(missingList.status, 404);
+	assert.deepEqual(await readJson(missingList.body), { code: "project_not_found" });
+	const missingCreate = await rawCreateDocument(running.url, "missing", { title: "Missing", body: "" });
+	assert.equal(missingCreate.status, 404);
+	assert.deepEqual(await readJson(missingCreate.body), { code: "project_not_found" });
+	for (const response of [
+		await localFetch(`${running.url}/documents/missing`),
+		await rawUpdateDocument(running.url, "missing", { title: "Missing", body: "" }),
+		await localFetch(`${running.url}/documents/missing`, { method: "DELETE" }),
+	]) {
+		assert.equal(response.status, 404);
+		assert.deepEqual(await readJson(response.body), { code: "document_not_found" });
+	}
+
+	const deletedResponse = await localFetch(`${running.url}/documents/${created.id}`, { method: "DELETE" });
+	assert.equal(deletedResponse.status, 200);
+	assert.deepEqual(await readJson(deletedResponse.body), updated);
+	const deleted = await localFetch(`${running.url}/documents/${created.id}`);
+	assert.equal(deleted.status, 404);
+	assert.deepEqual(await readJson(deleted.body), { code: "document_not_found" });
+});
+
+test("documents persist across daemon restarts", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-document-restart-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sessionDir = join(root, "sessions");
+	const catalogPath = join(root, "catalog.db");
+	const first = await startServer(t, immediateFactory(), { sessionDir, catalogPath }, false);
+	await createSession(first.url);
+	const projects = await readJson<Protocol.ListProjectsResponse>((await localFetch(`${first.url}/projects`)).body);
+	const project = projects.projects[0];
+	assert(project);
+	const createdResponse = await rawCreateDocument(first.url, project.id, { title: "Persistent", body: "Still here" });
+	const created = await readJson<Protocol.Document>(createdResponse.body);
+	await first.close();
+
+	const second = await startServer(t, immediateFactory(), { sessionDir, catalogPath }, false);
+	const response = await localFetch(`${second.url}/documents/${created.id}`);
+	assert.equal(response.status, 200);
+	assert.deepEqual(await readJson(response.body), created);
+	await second.close();
+});
+
+test("a corrupt catalog restart keeps project ids and documents", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-catalog-salvage-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sessionDir = join(root, "sessions");
+	const catalogPath = join(root, "catalog.db");
+	const first = await startServer(t, immediateFactory(), { sessionDir, catalogPath }, false);
+	await createSession(first.url);
+	const projects = await readJson<Protocol.ListProjectsResponse>((await localFetch(`${first.url}/projects`)).body);
+	const project = projects.projects[0];
+	assert(project);
+	const documentResponse = await rawCreateDocument(first.url, project.id, { title: "Saved", body: "Recovered" });
+	const document = await readJson<Protocol.Document>(documentResponse.body);
+	await first.close();
+	await corruptLeafPage(catalogPath, "session");
+	t.mock.method(console, "error", () => undefined);
+
+	const second = await startServer(t, immediateFactory(), { sessionDir, catalogPath }, false);
+	assert.equal((await localFetch(`${second.url}/health`)).status, 200);
+	const recoveredProjects = await readJson<Protocol.ListProjectsResponse>(
+		(await localFetch(`${second.url}/projects`)).body,
+	);
+	assert.equal(recoveredProjects.projects[0]?.id, project.id);
+	const recoveredDocument = await localFetch(`${second.url}/documents/${document.id}`);
+	assert.equal(recoveredDocument.status, 200);
+	assert.deepEqual(await readJson(recoveredDocument.body), document);
+	assert(
+		(await readdir(root)).some(
+			(name) => name.startsWith("catalog.db.corrupt-") && !name.endsWith("-wal") && !name.endsWith("-shm"),
+		),
+	);
+	await second.close();
 });
 
 test("creates a project session at its workspace root", async (t) => {
@@ -3763,6 +3912,22 @@ function rawCreateProjectSession(url: string, projectId: string): Promise<TestRe
 	return localFetch(`${url}/projects/${encodeURIComponent(projectId)}/sessions`, { method: "POST" });
 }
 
+function rawCreateDocument(url: string, projectId: string, body: Protocol.DocumentRequest): Promise<TestResponse> {
+	return localFetch(`${url}/projects/${encodeURIComponent(projectId)}/documents`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+}
+
+function rawUpdateDocument(url: string, documentId: string, body: Protocol.DocumentRequest): Promise<TestResponse> {
+	return localFetch(`${url}/documents/${encodeURIComponent(documentId)}`, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+}
+
 async function getSnapshot(url: string, sessionId: string): Promise<Protocol.SessionSnapshot> {
 	const response = await localFetch(`${url}/sessions/${sessionId}`);
 	assert.equal(response.status, 200);
@@ -3789,6 +3954,18 @@ function rawCompact(url: string, sessionId: string, body: object): Promise<TestR
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
+}
+
+async function corruptLeafPage(path: string, table: string): Promise<void> {
+	const client = new DatabaseSync(path);
+	const pageSize = (client.prepare("PRAGMA page_size").get() as { page_size: number }).page_size;
+	const page = client.prepare("SELECT pageno FROM dbstat WHERE name = ? AND pagetype = 'leaf'").get(table) as {
+		pageno: number;
+	};
+	client.close();
+	const file = await open(path, "r+");
+	await file.write(Buffer.alloc(pageSize), 0, pageSize, (page.pageno - 1) * pageSize);
+	await file.close();
 }
 
 async function waitForTerminal(url: string, sessionId: string, turnId: string): Promise<void> {

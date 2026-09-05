@@ -15,7 +15,7 @@ import { createConfiguredHarness, InvalidCwdError, Node, type NodeOptions, Sessi
 import { ControlPlane } from "./plane.ts";
 import { SessionStore } from "./store.ts";
 
-const MAX_BODY_BYTES = 64 * 1024;
+const MAX_BODY_BYTES = 1024 * 1024;
 const HEARTBEAT_MS = 15_000;
 const DEFAULT_EVENT_TAIL_SIZE = 2_000;
 const ALLOWED_HOSTS = new Set([`127.0.0.1:${Protocol.DEFAULT_PORT}`, `localhost:${Protocol.DEFAULT_PORT}`]);
@@ -172,6 +172,14 @@ const handlers = {
 		const body: Protocol.ListProjectsResponse = { projects: manager.listProjects() };
 		writeJson(res, 200, body);
 	},
+	getProject: ({ manager, res, params }) => {
+		const project = manager.getProject(params.projectId);
+		if (project === "missing") {
+			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		writeJson(res, 200, project);
+	},
 	listProjectSessions: ({ manager, res, params }) => {
 		const sessions = manager.listProjectSessions(params.projectId);
 		if (sessions === "missing") {
@@ -192,6 +200,47 @@ const handlers = {
 			return;
 		}
 		writeJson(res, 201, created);
+	},
+	listDocuments: ({ manager, res, params }) => {
+		const documents = manager.listDocuments(params.projectId);
+		if (documents === "missing") {
+			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		const body: Protocol.ListDocumentsResponse = { documents };
+		writeJson(res, 200, body);
+	},
+	createDocument: ({ manager, res, params, body }) => {
+		const created = manager.createDocument(params.projectId, body as Protocol.DocumentRequest);
+		if (created === "missing") {
+			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		writeJson(res, 201, created);
+	},
+	getDocument: ({ manager, res, params }) => {
+		const document = manager.getDocument(params.documentId);
+		if (document === "missing") {
+			writeJson(res, 404, { code: "document_not_found" });
+			return;
+		}
+		writeJson(res, 200, document);
+	},
+	updateDocument: ({ manager, res, params, body }) => {
+		const document = manager.updateDocument(params.documentId, body as Protocol.DocumentRequest);
+		if (document === "missing") {
+			writeJson(res, 404, { code: "document_not_found" });
+			return;
+		}
+		writeJson(res, 200, document);
+	},
+	deleteDocument: ({ manager, res, params }) => {
+		const document = manager.deleteDocument(params.documentId);
+		if (document === "missing") {
+			writeJson(res, 404, { code: "document_not_found" });
+			return;
+		}
+		writeJson(res, 200, document);
 	},
 	createSession: async ({ manager, res, body }) => {
 		const request = body as Protocol.CreateSessionRequest;
@@ -340,6 +389,7 @@ function readQuery(route: RouteDefinition, url: URL): Record<string, string | nu
 
 function invalidBodyCode(key: RouteKey): string {
 	if (key === "createSession") return "invalid_cwd";
+	if (key === "createDocument" || key === "updateDocument") return "invalid_document";
 	if (key === "prompt") return "invalid_prompt";
 	if (key === "compact") return "invalid_compaction";
 	throw new Error(`Route ${key} has no request body`);

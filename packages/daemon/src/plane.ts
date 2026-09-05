@@ -91,9 +91,35 @@ export class ControlPlane {
 		return this.#catalog.listProjects();
 	}
 
+	getProject(projectId: Protocol.ProjectId): Protocol.Project | "missing" {
+		return this.#catalog.getProject(projectId) ?? "missing";
+	}
+
 	listProjectSessions(projectId: Protocol.ProjectId): Protocol.CatalogSession[] | "missing" {
 		if (!this.#catalog.projectExists(projectId)) return "missing";
 		return this.#catalog.list({ projectId }).map(toCatalogSession);
+	}
+
+	listDocuments(projectId: Protocol.ProjectId): Protocol.DocumentSummary[] | "missing" {
+		if (!this.#catalog.projectExists(projectId)) return "missing";
+		return this.#catalog.listDocuments(projectId);
+	}
+
+	createDocument(projectId: Protocol.ProjectId, input: Protocol.DocumentRequest): Protocol.Document | "missing" {
+		if (!this.#catalog.projectExists(projectId)) return "missing";
+		return this.#catalog.createDocument(projectId, { ...input, title: input.title.trim() });
+	}
+
+	getDocument(documentId: Protocol.DocumentId): Protocol.Document | "missing" {
+		return this.#catalog.getDocument(documentId) ?? "missing";
+	}
+
+	updateDocument(documentId: Protocol.DocumentId, input: Protocol.DocumentRequest): Protocol.Document | "missing" {
+		return this.#catalog.updateDocument(documentId, { ...input, title: input.title.trim() }) ?? "missing";
+	}
+
+	deleteDocument(documentId: Protocol.DocumentId): Protocol.Document | "missing" {
+		return this.#catalog.deleteDocument(documentId) ?? "missing";
 	}
 
 	resolveProjectRoot(cwd: string): Promise<string> {

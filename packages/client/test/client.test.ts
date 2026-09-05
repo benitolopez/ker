@@ -32,7 +32,11 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const projects = await client.listProjects();
 	assert(projects.ok);
 	assert.equal(projects.value.projects.length, 1);
-	const projectSessions = await client.listProjectSessions(projects.value.projects[0]?.id ?? "missing");
+	const projectId = projects.value.projects[0]?.id ?? "missing";
+	const project = await client.getProject(projectId);
+	assert(project.ok);
+	assert.deepEqual(project.value, projects.value.projects[0]);
+	const projectSessions = await client.listProjectSessions(projectId);
 	assert(projectSessions.ok);
 	assert.deepEqual(
 		projectSessions.value.sessions.map((candidate) => candidate.id),
@@ -45,14 +49,43 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 		listed.value.sessions.map((candidate) => candidate.id),
 		[session.id],
 	);
-	const createdForProject = await client.createProjectSession(projects.value.projects[0]?.id ?? "missing");
+	const createdForProject = await client.createProjectSession(projectId);
 	assert(createdForProject.ok);
-	assert.equal(createdForProject.value.projectId, projects.value.projects[0]?.id);
+	assert.equal(createdForProject.value.projectId, projectId);
 	const missingProject = await client.createProjectSession("missing");
 	assert.equal(missingProject.ok, false);
 	if (!missingProject.ok) {
 		assert.equal(missingProject.status, 404);
 		assert.equal(missingProject.error.code, "project_not_found");
+	}
+	const emptyDocuments = await client.listDocuments(projectId);
+	assert(emptyDocuments.ok);
+	assert.deepEqual(emptyDocuments.value.documents, []);
+	const createdDocument = await client.createDocument(projectId, { title: "Notes", body: "Original" });
+	assert(createdDocument.ok);
+	const listedDocuments = await client.listDocuments(projectId);
+	assert(listedDocuments.ok);
+	assert.deepEqual(
+		listedDocuments.value.documents.map((candidate) => candidate.id),
+		[createdDocument.value.id],
+	);
+	const readDocument = await client.getDocument(createdDocument.value.id);
+	assert(readDocument.ok);
+	assert.deepEqual(readDocument.value, createdDocument.value);
+	const updatedDocument = await client.updateDocument(createdDocument.value.id, {
+		title: "Updated notes",
+		body: "Replacement",
+	});
+	assert(updatedDocument.ok);
+	assert.equal(updatedDocument.value.title, "Updated notes");
+	const deletedDocument = await client.deleteDocument(createdDocument.value.id);
+	assert(deletedDocument.ok);
+	assert.deepEqual(deletedDocument.value, updatedDocument.value);
+	const missingDocument = await client.getDocument(createdDocument.value.id);
+	assert.equal(missingDocument.ok, false);
+	if (!missingDocument.ok) {
+		assert.equal(missingDocument.status, 404);
+		assert.equal(missingDocument.error.code, "document_not_found");
 	}
 
 	const snapshot = await client.snapshot(createdForProject.value.id);

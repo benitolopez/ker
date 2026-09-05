@@ -13,6 +13,7 @@ export type TurnId = string;
 export type MessageId = string;
 export type QueueItemId = string;
 export type ProjectId = string;
+export type DocumentId = string;
 export type WorkspaceId = string;
 export type NodeId = string;
 
@@ -180,6 +181,45 @@ export type Project = Static<typeof Project>;
 
 export const ListProjectsResponse = Type.Object({ projects: Type.Array(Project) }, { additionalProperties: false });
 export type ListProjectsResponse = Static<typeof ListProjectsResponse>;
+
+export const Document = Type.Object(
+	{
+		id: Type.String(),
+		projectId: Type.String(),
+		title: Type.String(),
+		body: Type.String(),
+		createdAt: Type.String(),
+		updatedAt: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+export type Document = Static<typeof Document>;
+
+export const DocumentSummary = Type.Object(
+	{
+		id: Type.String(),
+		title: Type.String(),
+		createdAt: Type.String(),
+		updatedAt: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+export type DocumentSummary = Static<typeof DocumentSummary>;
+
+export const ListDocumentsResponse = Type.Object(
+	{ documents: Type.Array(DocumentSummary) },
+	{ additionalProperties: false },
+);
+export type ListDocumentsResponse = Static<typeof ListDocumentsResponse>;
+
+export const DocumentRequest = Type.Object(
+	{
+		title: Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" }),
+		body: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+export type DocumentRequest = Static<typeof DocumentRequest>;
 
 const queueItemFields = {
 	id: Type.String(),
@@ -764,7 +804,7 @@ export const ErrorBody = Type.Object(
 );
 export type ErrorBody = Static<typeof ErrorBody>;
 
-export const PROTOCOL_VERSION = "22" as const;
+export const PROTOCOL_VERSION = "23" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;
