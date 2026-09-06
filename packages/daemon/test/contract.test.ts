@@ -36,6 +36,16 @@ test("daemon responses conform to the route table", async (t) => {
 	assert(project);
 	await assertJson("getProject", await localFetch(`${running.url}/projects/${project.id}`), 200);
 	await assertJson("getProject", await localFetch(`${running.url}/projects/missing`), 404);
+	await assertJson("listWorkspaces", await localFetch(`${running.url}/projects/${project.id}/workspaces`), 200);
+	await assertJson(
+		"createWorkspace",
+		await localFetch(`${running.url}/projects/${project.id}/workspaces`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ path: process.cwd() } satisfies Protocol.WorkspaceRequest),
+		}),
+		200,
+	);
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/${project.id}/sessions`), 200);
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/missing/sessions`), 404);
 	await assertJson(
@@ -56,6 +66,19 @@ test("daemon responses conform to the route table", async (t) => {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ title: "Contract", body: "Body" } satisfies Protocol.DocumentRequest),
+		}),
+		201,
+	);
+	const exported = await localFetch(`${running.url}/projects/${project.id}/export`);
+	assert.equal(exported.status, 200);
+	assert.equal(exported.body.headers["content-type"], "application/zip");
+	const archive = await readBytes(exported.body);
+	await assertJson(
+		"importProject",
+		await localFetch(`${running.url}/projects/import`, {
+			method: "POST",
+			headers: { "content-type": "application/zip" },
+			body: archive,
 		}),
 		201,
 	);
@@ -257,7 +280,7 @@ interface TestResponse {
 
 function localFetch(
 	url: string,
-	init?: { method?: string; headers?: Record<string, string>; body?: string },
+	init?: { method?: string; headers?: Record<string, string>; body?: string | Uint8Array },
 ): Promise<TestResponse> {
 	return new Promise((resolve, reject) => {
 		const req = request(url, { method: init?.method, headers: { ...init?.headers, host: LOCAL_HOST } }, (res) =>
@@ -266,6 +289,12 @@ function localFetch(
 		req.on("error", reject);
 		req.end(init?.body);
 	});
+}
+
+async function readBytes(body: AsyncIterable<Uint8Array>): Promise<Buffer> {
+	const chunks: Buffer[] = [];
+	for await (const chunk of body) chunks.push(Buffer.from(chunk));
+	return Buffer.concat(chunks);
 }
 
 async function readJson<T>(body: AsyncIterable<Uint8Array>): Promise<T> {

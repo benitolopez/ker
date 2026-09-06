@@ -15,8 +15,10 @@ import { AttachError, attach, type Client, createClient } from "../src/index.ts"
 
 test("the client calls every route and parses a streamed turn", async (t) => {
 	const running = await startServer(t);
+	const target = await startServer(t);
 	t.mock.method(globalThis, "fetch", localFetch);
 	const client = createClient({ baseUrl: running.url });
+	const targetClient = createClient({ baseUrl: target.url });
 
 	const health = await client.health();
 	assert(health.ok);
@@ -36,6 +38,14 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const project = await client.getProject(projectId);
 	assert(project.ok);
 	assert.deepEqual(project.value, projects.value.projects[0]);
+	const workspaces = await client.listWorkspaces(projectId);
+	assert(workspaces.ok);
+	assert.equal(workspaces.value.workspaces.length, 1);
+	const existingWorkspace = await client.createWorkspace(projectId, { path: process.cwd() });
+	assert(existingWorkspace.ok);
+	assert.equal(existingWorkspace.status, 200);
+	assert.equal(existingWorkspace.value.exists, true);
+	assert.equal(client.exportProjectPath("project/one"), "/projects/project%2Fone/export");
 	const projectSessions = await client.listProjectSessions(projectId);
 	assert(projectSessions.ok);
 	assert.deepEqual(
@@ -72,6 +82,16 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const readDocument = await client.getDocument(createdDocument.value.id);
 	assert(readDocument.ok);
 	assert.deepEqual(readDocument.value, createdDocument.value);
+	const archive = await client.exportProject(projectId);
+	assert(archive.ok);
+	assert.equal(archive.value.type, "application/zip");
+	const imported = await targetClient.importProject(archive.value);
+	assert(imported.ok);
+	assert.equal(imported.value.created, true);
+	assert.deepEqual(imported.value.documents, { imported: 1, skipped: 0 });
+	const targetDocument = await targetClient.getDocument(createdDocument.value.id);
+	assert(targetDocument.ok);
+	assert.deepEqual(targetDocument.value, createdDocument.value);
 	const updatedDocument = await client.updateDocument(createdDocument.value.id, {
 		title: "Updated notes",
 		body: "Replacement",
@@ -325,11 +345,12 @@ function delivered(input: Engine.UserMessage): Protocol.MessageDeliveredEvent {
 	};
 }
 
-function localFetch(input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response> {
+async function localFetch(input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response> {
 	const url = new URL(input instanceof Request ? input.url : input);
 	const headers = new Headers(input instanceof Request ? input.headers : undefined);
 	for (const [name, value] of new Headers(init?.headers)) headers.set(name, value);
 	headers.set("host", `127.0.0.1:${DEFAULT_PORT}`);
+	const body = init?.body instanceof Blob ? new Uint8Array(await init.body.arrayBuffer()) : init?.body;
 	return new Promise((resolve, reject) => {
 		const req = request(
 			url,
@@ -358,8 +379,8 @@ function localFetch(input: string | URL | globalThis.Request, init?: RequestInit
 		const abort = () => req.destroy(new DOMException("This operation was aborted", "AbortError"));
 		if (init?.signal?.aborted) abort();
 		init?.signal?.addEventListener("abort", abort, { once: true });
-		if (typeof init?.body === "string" || init?.body instanceof Uint8Array) {
-			req.end(init.body);
+		if (typeof body === "string" || body instanceof Uint8Array) {
+			req.end(body);
 			return;
 		}
 		req.end();

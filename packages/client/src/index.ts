@@ -16,6 +16,15 @@ export interface Client {
 	openapi(signal?: AbortSignal): Promise<Result<Record<string, unknown>>>;
 	listProjects(signal?: AbortSignal): Promise<Result<Protocol.ListProjectsResponse>>;
 	getProject(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Protocol.Project>>;
+	exportProject(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Blob>>;
+	importProject(archive: Blob, signal?: AbortSignal): Promise<Result<Protocol.ImportResult>>;
+	listWorkspaces(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Protocol.ListWorkspacesResponse>>;
+	createWorkspace(
+		projectId: Protocol.ProjectId,
+		input: Protocol.WorkspaceRequest,
+		signal?: AbortSignal,
+	): Promise<Result<Protocol.Workspace>>;
+	exportProjectPath(projectId: Protocol.ProjectId): string;
 	listProjectSessions(
 		projectId: Protocol.ProjectId,
 		signal?: AbortSignal,
@@ -65,14 +74,20 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 		params: Record<string, string> = {},
 		query?: URLSearchParams,
 	): Promise<Result<T>> => {
-		const pathname = Object.entries(params).reduce(
-			(current, [name, value]) => current.replace(`{${name}}`, encodeURIComponent(value)),
-			path,
-		);
+		const pathname = formatPath(path, params);
 		const response = await fetch(`${baseUrl}${pathname}${query ? `?${query}` : ""}`, init);
 		const value = (await response.json()) as unknown;
 		if (response.ok) return { ok: true, status: response.status, value: value as T };
 		return { ok: false, status: response.status, error: value as Protocol.ErrorBody };
+	};
+	const requestBlob = async (
+		path: string,
+		init: RequestInit,
+		params: Record<string, string>,
+	): Promise<Result<Blob>> => {
+		const response = await fetch(`${baseUrl}${formatPath(path, params)}`, init);
+		if (response.ok) return { ok: true, status: response.status, value: await response.blob() };
+		return { ok: false, status: response.status, error: (await response.json()) as Protocol.ErrorBody };
 	};
 
 	return {
@@ -80,6 +95,27 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 		openapi: (signal) => request(routes.openapi.path, { signal }),
 		listProjects: (signal) => request(routes.listProjects.path, { signal }),
 		getProject: (projectId, signal) => request(routes.getProject.path, { signal }, { projectId }),
+		exportProject: (projectId, signal) => requestBlob(routes.exportProject.path, { signal }, { projectId }),
+		importProject: (archive, signal) =>
+			request(routes.importProject.path, {
+				method: routes.importProject.method,
+				headers: { "content-type": "application/zip" },
+				body: archive,
+				signal,
+			}),
+		listWorkspaces: (projectId, signal) => request(routes.listWorkspaces.path, { signal }, { projectId }),
+		createWorkspace: (projectId, input, signal) =>
+			request(
+				routes.createWorkspace.path,
+				{
+					method: routes.createWorkspace.method,
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(input satisfies Protocol.WorkspaceRequest),
+					signal,
+				},
+				{ projectId },
+			),
+		exportProjectPath: (projectId) => formatPath(routes.exportProject.path, { projectId }),
 		listProjectSessions: (projectId, signal) => request(routes.listProjectSessions.path, { signal }, { projectId }),
 		createProjectSession: (projectId, signal) =>
 			request(routes.createProjectSession.path, { method: routes.createProjectSession.method, signal }, { projectId }),
@@ -170,6 +206,13 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 			return { kind: "stream", envelopes: eventEnvelopes(response.body) };
 		},
 	};
+}
+
+function formatPath(path: string, params: Record<string, string>): string {
+	return Object.entries(params).reduce(
+		(current, [name, value]) => current.replace(`{${name}}`, encodeURIComponent(value)),
+		path,
+	);
 }
 
 export type AttachItem =

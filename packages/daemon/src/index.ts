@@ -3,13 +3,15 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
 import * as Agent from "@ker-ai/agent";
 import * as Config from "@ker-ai/config";
 import * as Protocol from "@ker-ai/protocol";
 import { createOpenApiJson } from "@ker-ai/protocol/openapi";
 import { type RouteDefinition, type RouteKey, routes } from "@ker-ai/protocol/routes";
 import { Value } from "@sinclair/typebox/value";
-import { defaultCatalogPath } from "./catalog.ts";
+import { ArchiveTooLargeError, InvalidArchiveError, MAX_ARCHIVE_BYTES, UnsupportedArchiveError } from "./archive.ts";
+import { defaultCatalogPath, WorkspaceConflictError } from "./catalog.ts";
 import { defaultNodePath } from "./identity.ts";
 import { createConfiguredHarness, InvalidCwdError, Node, type NodeOptions, SessionUnreadableError } from "./node.ts";
 import { ControlPlane } from "./plane.ts";
@@ -21,6 +23,8 @@ const DEFAULT_EVENT_TAIL_SIZE = 2_000;
 const ALLOWED_HOSTS = new Set([`127.0.0.1:${Protocol.DEFAULT_PORT}`, `localhost:${Protocol.DEFAULT_PORT}`]);
 const OPENAPI_JSON = createOpenApiJson();
 const BODY_REJECTED = Symbol("body_rejected");
+
+class PayloadTooLargeError extends InvalidArchiveError {}
 
 export type { Harness } from "./node.ts";
 
@@ -59,8 +63,9 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 	let plane: ControlPlane;
 	const manager = (async () => {
 		const config = Config.loadConfig();
+		const store = new SessionStore({ baseDir: options.sessionDir });
 		const node = new Node({
-			store: new SessionStore({ baseDir: options.sessionDir }),
+			store,
 			nodePath: options.nodePath ?? defaultNodePath(),
 			harnessFactory: options.harnessFactory ?? ((state, cwd) => createConfiguredHarness(state, cwd, config)),
 			definition:
@@ -78,7 +83,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 			compaction: options.compaction ?? config.compaction,
 			onSessionChange: (change) => plane.applySessionChange(change),
 		});
-		plane = new ControlPlane({ node, catalogPath: options.catalogPath ?? defaultCatalogPath() });
+		plane = new ControlPlane({ node, store, catalogPath: options.catalogPath ?? defaultCatalogPath() });
 		await plane.initialize();
 		return plane;
 	})();
@@ -129,6 +134,14 @@ async function handleRequest(
 			writeJson(res, 400, { code: match.key === "events" ? "invalid_cursor" : "invalid_scope" });
 			return;
 		}
+		if (match.route.upload && !hasContentType(req, match.route.upload)) {
+			writeJson(res, 415, { code: "unsupported_media_type" });
+			return;
+		}
+		if (match.route.upload && Number(req.headers["content-length"]) > MAX_ARCHIVE_BYTES) {
+			writeJson(res, 413, { code: "payload_too_large" });
+			return;
+		}
 		const body = match.route.body ? await readJsonBody(req, res) : undefined;
 		if (body === BODY_REJECTED) return;
 		if (match.route.body && !Value.Check(match.route.body, body)) {
@@ -138,6 +151,26 @@ async function handleRequest(
 		await handlers[match.key]({ manager, subscribers, req, res, url, params: match.params, query, body });
 	} catch (error) {
 		if (!res.headersSent) {
+			if (error instanceof PayloadTooLargeError) {
+				writeJson(res, 413, { code: "payload_too_large" });
+				return;
+			}
+			if (error instanceof UnsupportedArchiveError) {
+				writeJson(res, 400, { code: "unsupported_archive", message: error.message });
+				return;
+			}
+			if (error instanceof InvalidArchiveError) {
+				writeJson(res, 400, { code: "invalid_archive", message: error.message });
+				return;
+			}
+			if (error instanceof WorkspaceConflictError) {
+				writeJson(res, 409, { code: "workspace_conflict", message: error.message });
+				return;
+			}
+			if (error instanceof ArchiveTooLargeError) {
+				writeJson(res, 409, { code: "archive_too_large", message: error.message });
+				return;
+			}
 			if (error instanceof InvalidCwdError) {
 				writeJson(res, 400, { code: "invalid_cwd" });
 				return;
@@ -180,6 +213,44 @@ const handlers = {
 		}
 		writeJson(res, 200, project);
 	},
+	exportProject: async ({ manager, res, params }) => {
+		const archive = await manager.exportProject(params.projectId);
+		if (archive === "missing") {
+			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		res.writeHead(200, {
+			"content-type": "application/zip",
+			"content-disposition": `attachment; filename="${archive.fileName}"`,
+			"cache-control": "no-store",
+		});
+		await pipeline(archive.stream, res);
+	},
+	importProject: async ({ manager, req, res }) => {
+		writeJson(res, 201, await manager.importProject(limitArchive(req)));
+	},
+	listWorkspaces: async ({ manager, res, params }) => {
+		const workspaces = await manager.listWorkspaces(params.projectId);
+		if (workspaces === "missing") {
+			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		const body: Protocol.ListWorkspacesResponse = { workspaces };
+		writeJson(res, 200, body);
+	},
+	createWorkspace: async ({ manager, res, params, body }) => {
+		try {
+			const result = await manager.addWorkspace(params.projectId, (body as Protocol.WorkspaceRequest).path);
+			if (result === "missing") {
+				writeJson(res, 404, { code: "project_not_found" });
+				return;
+			}
+			writeJson(res, result.created ? 201 : 200, result.workspace);
+		} catch (error) {
+			if (!(error instanceof InvalidCwdError)) throw error;
+			writeJson(res, 400, { code: "invalid_workspace", message: error.message });
+		}
+	},
 	listProjectSessions: ({ manager, res, params }) => {
 		const sessions = manager.listProjectSessions(params.projectId);
 		if (sessions === "missing") {
@@ -191,8 +262,12 @@ const handlers = {
 	},
 	createProjectSession: async ({ manager, res, params }) => {
 		const created = await manager.createProjectSession(params.projectId);
-		if (created === "missing") {
+		if (created === "project_missing") {
 			writeJson(res, 404, { code: "project_not_found" });
+			return;
+		}
+		if (created === "workspace_missing") {
+			writeJson(res, 409, { code: "workspace_missing" });
 			return;
 		}
 		if (created === "ambiguous") {
@@ -389,6 +464,7 @@ function readQuery(route: RouteDefinition, url: URL): Record<string, string | nu
 
 function invalidBodyCode(key: RouteKey): string {
 	if (key === "createSession") return "invalid_cwd";
+	if (key === "createWorkspace") return "invalid_workspace";
 	if (key === "createDocument" || key === "updateDocument") return "invalid_document";
 	if (key === "prompt") return "invalid_prompt";
 	if (key === "compact") return "invalid_compaction";
@@ -516,6 +592,19 @@ async function readJsonBody(req: IncomingMessage, res: ServerResponse): Promise<
 		chunks.push(chunk);
 	}
 	return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+}
+
+async function* limitArchive(req: IncomingMessage): AsyncGenerator<Uint8Array> {
+	let size = 0;
+	for await (const chunk of req) {
+		size += chunk.length;
+		if (size > MAX_ARCHIVE_BYTES) throw new PayloadTooLargeError("Project archive exceeds 4 GiB");
+		yield chunk;
+	}
+}
+
+function hasContentType(req: IncomingMessage, expected: string): boolean {
+	return req.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() === expected;
 }
 
 function writeEvent(res: ServerResponse, envelope: Protocol.EventEnvelope): void {

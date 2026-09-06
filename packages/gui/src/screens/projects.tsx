@@ -1,5 +1,5 @@
 import type * as Protocol from "@ker-ai/protocol";
-import { useCallback, useState } from "react";
+import { type ChangeEvent, useCallback, useState } from "react";
 import { api } from "../api.ts";
 import { formatDate } from "../format.ts";
 import { useVisiblePoll } from "../hooks/use-visible-poll.ts";
@@ -11,11 +11,21 @@ interface ProjectsState {
 	error?: string;
 }
 
-export function ProjectsScreen() {
+type ImportState = { kind: "success"; result: Protocol.ImportResult } | { kind: "error"; message: string };
+
+export function ProjectsScreen({
+	listProjects = api.listProjects,
+	importProject = api.importProject,
+}: {
+	listProjects?: typeof api.listProjects;
+	importProject?: typeof api.importProject;
+} = {}) {
 	const [state, setState] = useState<ProjectsState>({ projects: [], loaded: false });
+	const [importing, setImporting] = useState(false);
+	const [importState, setImportState] = useState<ImportState>();
 	const refetch = useCallback(async () => {
 		try {
-			const result = await api.listProjects();
+			const result = await listProjects();
 			if (!result.ok) {
 				setState((current) => ({ ...current, loaded: true, error: result.error.message ?? result.error.code }));
 				return;
@@ -28,8 +38,28 @@ export function ProjectsScreen() {
 				error: error instanceof Error ? error.message : String(error),
 			}));
 		}
-	}, []);
+	}, [listProjects]);
 	useVisiblePoll(refetch);
+	const onPick = async (event: ChangeEvent<HTMLInputElement>) => {
+		const archive = event.currentTarget.files?.[0];
+		event.currentTarget.value = "";
+		if (!archive) return;
+		setImporting(true);
+		setImportState(undefined);
+		try {
+			const result = await importProject(archive);
+			if (!result.ok) {
+				setImportState({ kind: "error", message: importErrorMessage(result.error) });
+				return;
+			}
+			setImportState({ kind: "success", result: result.value });
+			await refetch();
+		} catch (error) {
+			setImportState({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+		} finally {
+			setImporting(false);
+		}
+	};
 	const projects = [...state.projects].sort((left, right) => {
 		if (!left.lastActivityAt && !right.lastActivityAt) return 0;
 		if (!left.lastActivityAt) return 1;
@@ -46,18 +76,31 @@ export function ProjectsScreen() {
 					</p>
 					<h1 className="text-4xl font-semibold tracking-[-0.04em] text-[var(--text)] sm:text-5xl">Projects</h1>
 				</div>
-				<div className="status-pill">
-					<span className="size-2 rounded-full bg-emerald-500" />
-					Live
+				<div className="flex items-center gap-3">
+					<label className="cursor-pointer rounded-xl border border-[var(--line)] bg-[var(--surface)] px-4 py-2.5 text-sm font-semibold text-[var(--text)] shadow-[var(--shadow)]">
+						{importing ? "Importing…" : "Import"}
+						<input
+							accept=".zip,application/zip"
+							className="sr-only"
+							disabled={importing}
+							onChange={(event) => void onPick(event)}
+							type="file"
+						/>
+					</label>
+					<div className="status-pill">
+						<span className="size-2 rounded-full bg-emerald-500" />
+						Live
+					</div>
 				</div>
 			</header>
 
+			{importState ? <ImportPanel state={importState} /> : null}
 			{state.error ? <ErrorPanel message={state.error} retry={refetch} /> : null}
 			{!state.loaded ? <LoadingRows /> : null}
 			{state.loaded && !state.error && projects.length === 0 ? (
 				<section className="empty-panel">
 					<p className="text-lg font-medium text-[var(--text)]">No projects yet</p>
-					<p className="mt-2 text-sm text-[var(--muted)]">Start a session from the CLI and it will appear here.</p>
+					<p className="mt-2 text-sm text-[var(--muted)]">Start a session from a folder or import an archive.</p>
 				</section>
 			) : null}
 			<section className="grid gap-4 md:grid-cols-2">
@@ -85,9 +128,44 @@ export function ProjectsScreen() {
 					</a>
 				))}
 			</section>
-			<footer className="mt-auto pt-12 font-mono text-xs text-[var(--faint)]">ker · read-only surface</footer>
+			<footer className="mt-auto pt-12 font-mono text-xs text-[var(--faint)]">ker · control plane</footer>
 		</main>
 	);
+}
+
+function ImportPanel({ state }: { state: ImportState }) {
+	if (state.kind === "error") {
+		return (
+			<section className="mb-5 rounded-2xl border border-red-500/25 bg-red-500/8 p-5 text-sm text-red-700 dark:text-red-300">
+				{state.message}
+			</section>
+		);
+	}
+	const result = state.result;
+	const skipped = result.documents.skipped + result.sessions.skipped;
+	return (
+		<section className="mb-5 rounded-2xl border border-emerald-500/25 bg-emerald-500/8 p-5 text-sm text-[var(--text)]">
+			<p>
+				Imported {result.project.name}: {result.documents.imported} documents, {result.sessions.imported} sessions
+				{result.sessions.unreadable ? ` (${result.sessions.unreadable} unreadable)` : ""}
+				{skipped ? `, ${skipped} skipped` : ""}
+			</p>
+			<a
+				className="mt-3 inline-block font-semibold text-[var(--accent)] underline underline-offset-4"
+				href={formatRoute({ screen: "sessions", projectId: result.project.id })}
+			>
+				Open project
+			</a>
+		</section>
+	);
+}
+
+function importErrorMessage(error: Protocol.ErrorBody): string {
+	if (error.code === "unsupported_archive") return "This archive was made by a newer ker.";
+	if (error.code === "invalid_archive") {
+		return `This file is not a ker archive.${error.message ? ` ${error.message}` : ""}`;
+	}
+	return error.message ?? error.code;
 }
 
 function ProjectGlyph() {

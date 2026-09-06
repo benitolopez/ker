@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { appendFile, mkdir, open, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse } from "node:path";
@@ -6,8 +7,9 @@ import type * as Engine from "@ker-ai/engine";
 import type * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
 
-const STORE_VERSION = 5 as const;
+export const STORE_VERSION = 5 as const;
 export const SESSION_FILE = "session.jsonl";
+export const PROJECT_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const HEADER_SCAN_BYTES = 8_192;
 const TAIL_SCAN_BYTES = 8_192;
 
@@ -209,16 +211,45 @@ export class SessionStore {
 		return { log, records, session };
 	}
 
+	logPath(key: string, sessionId: Protocol.SessionId): string {
+		return join(this.baseDir, key, sessionId, SESSION_FILE);
+	}
+
+	stagingDir(): string {
+		const parent = join(this.baseDir, ".staging");
+		const directory = join(parent, randomUUID());
+		mkdirSync(parent, { recursive: true, mode: 0o700 });
+		mkdirSync(directory, { mode: 0o700 });
+		return directory;
+	}
+
+	placeLog(
+		stagedPath: string,
+		key: string,
+		sessionId: Protocol.SessionId,
+	): { placed: true; path: string } | { placed: false } {
+		const path = this.logPath(key, sessionId);
+		if (existsSync(path)) return { placed: false };
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		renameSync(stagedPath, path);
+		return { placed: true, path };
+	}
+
+	removeStaging(directory: string): void {
+		rmSync(directory, { recursive: true, force: true });
+	}
+
 	// Discovers sessions by reading only each log's header line and a bounded tail, so startup
 	// cost stays flat in history size. Full replay happens in loadSession.
 	async scanCatalog(): Promise<{
 		sessions: CatalogedSession[];
 		unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }>;
 	}> {
+		rmSync(join(this.baseDir, ".staging"), { recursive: true, force: true });
 		await mkdir(this.baseDir, { recursive: true, mode: 0o700 });
 		const projects = [];
 		for await (const entry of await opendir(this.baseDir)) {
-			if (entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)) projects.push(entry);
+			if (entry.isDirectory() && PROJECT_KEY_PATTERN.test(entry.name)) projects.push(entry);
 		}
 		const sessions: CatalogedSession[] = [];
 		const unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }> = [];

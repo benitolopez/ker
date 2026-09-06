@@ -182,6 +182,29 @@ export type Project = Static<typeof Project>;
 export const ListProjectsResponse = Type.Object({ projects: Type.Array(Project) }, { additionalProperties: false });
 export type ListProjectsResponse = Static<typeof ListProjectsResponse>;
 
+export const Workspace = Type.Object(
+	{
+		id: Type.String(),
+		projectId: Type.String(),
+		nodeId: Type.String(),
+		rootPath: Type.String(),
+		gitRemote: Type.Union([Type.String(), Type.Null()]),
+		createdAt: Type.String(),
+		exists: Type.Boolean(),
+	},
+	{ additionalProperties: false },
+);
+export type Workspace = Static<typeof Workspace>;
+
+export const ListWorkspacesResponse = Type.Object(
+	{ workspaces: Type.Array(Workspace) },
+	{ additionalProperties: false },
+);
+export type ListWorkspacesResponse = Static<typeof ListWorkspacesResponse>;
+
+export const WorkspaceRequest = Type.Object({ path: Type.String({ minLength: 1 }) }, { additionalProperties: false });
+export type WorkspaceRequest = Static<typeof WorkspaceRequest>;
+
 export const Document = Type.Object(
 	{
 		id: Type.String(),
@@ -220,6 +243,97 @@ export const DocumentRequest = Type.Object(
 	{ additionalProperties: false },
 );
 export type DocumentRequest = Static<typeof DocumentRequest>;
+
+export const ImportResult = Type.Object(
+	{
+		project: Project,
+		created: Type.Boolean(),
+		workspaces: Type.Object({ created: Type.Number(), reused: Type.Number() }, { additionalProperties: false }),
+		documents: Type.Object({ imported: Type.Number(), skipped: Type.Number() }, { additionalProperties: false }),
+		sessions: Type.Object(
+			{
+				imported: Type.Number(),
+				skipped: Type.Number(),
+				unreadable: Type.Number(),
+				missing: Type.Number(),
+			},
+			{ additionalProperties: false },
+		),
+	},
+	{ additionalProperties: false },
+);
+export type ImportResult = Static<typeof ImportResult>;
+
+export const ARCHIVE_FORMAT = 1 as const;
+
+export const ArchiveNode = Type.Object(
+	{ id: Type.String(), name: Type.String(), createdAt: Type.String() },
+	{ additionalProperties: false },
+);
+export type ArchiveNode = Static<typeof ArchiveNode>;
+
+export const ArchiveWorkspace = Type.Object(
+	{
+		id: Type.String(),
+		nodeId: Type.String(),
+		rootPath: Type.String(),
+		gitRemote: Type.Union([Type.String(), Type.Null()]),
+		createdAt: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+export type ArchiveWorkspace = Static<typeof ArchiveWorkspace>;
+
+export const ArchiveSession = Type.Object(
+	{
+		id: Type.String({ pattern: "^[0-9a-f-]{36}$" }),
+		projectKey: Type.String({ pattern: "^[a-f0-9]{64}$" }),
+		workspaceId: Type.Union([Type.String(), Type.Null()]),
+		nodeId: Type.Union([Type.String(), Type.Null()]),
+		cwd: Type.Union([Type.String(), Type.Null()]),
+		title: Type.Union([Type.String(), Type.Null()]),
+		status: Type.Union([Type.Literal("idle"), Type.Literal("busy"), Type.Literal("unreadable")]),
+		error: Type.Union([Type.String(), Type.Null()]),
+		createdAt: Type.Union([Type.String(), Type.Null()]),
+		updatedAt: Type.Union([Type.String(), Type.Null()]),
+		file: Type.Union([Type.String({ pattern: "^sessions/[0-9a-f-]{36}/session\\.jsonl$" }), Type.Null()]),
+	},
+	{ additionalProperties: false },
+);
+export type ArchiveSession = Static<typeof ArchiveSession>;
+
+export const ArchiveDocument = Type.Object(
+	{
+		id: Type.String(),
+		title: Type.String(),
+		createdAt: Type.String(),
+		updatedAt: Type.String(),
+		file: Type.String({ pattern: "^documents/[a-z0-9-]{1,60}-[0-9a-f]{8,32}\\.md$" }),
+	},
+	{ additionalProperties: false },
+);
+export type ArchiveDocument = Static<typeof ArchiveDocument>;
+
+export const ArchiveManifest = Type.Object(
+	{
+		format: Type.Integer({ minimum: 1 }),
+		exportedAt: Type.String(),
+		versions: Type.Object(
+			{ protocol: Type.String(), store: Type.Integer(), catalog: Type.Integer() },
+			{ additionalProperties: false },
+		),
+		project: Type.Object(
+			{ id: Type.String(), name: Type.String(), createdAt: Type.String() },
+			{ additionalProperties: false },
+		),
+		nodes: Type.Array(ArchiveNode),
+		workspaces: Type.Array(ArchiveWorkspace),
+		sessions: Type.Array(ArchiveSession),
+		documents: Type.Array(ArchiveDocument),
+	},
+	{ additionalProperties: false },
+);
+export type ArchiveManifest = Static<typeof ArchiveManifest>;
 
 const queueItemFields = {
 	id: Type.String(),
@@ -804,7 +918,7 @@ export const ErrorBody = Type.Object(
 );
 export type ErrorBody = Static<typeof ErrorBody>;
 
-export const PROTOCOL_VERSION = "23" as const;
+export const PROTOCOL_VERSION = "24" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

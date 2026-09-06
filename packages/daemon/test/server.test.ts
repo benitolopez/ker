@@ -306,6 +306,7 @@ test("project session creation rejects unknown and ambiguous projects", async (t
 	assert.deepEqual(await readJson(missing.body), { code: "project_not_found" });
 
 	const seeded = await createSession(running.url, projectRoot);
+	await mkdir(join(root, "other"));
 	const client = new DatabaseSync(catalogPath);
 	const binding = client.prepare("SELECT project_id, node_id FROM session WHERE id = ?").get(seeded.id) as {
 		project_id: string;
@@ -321,6 +322,8 @@ test("project session creation rejects unknown and ambiguous projects", async (t
 	const ambiguous = await rawCreateProjectSession(running.url, binding.project_id);
 	assert.equal(ambiguous.status, 409);
 	assert.deepEqual(await readJson(ambiguous.body), { code: "workspace_ambiguous" });
+	await rm(join(root, "other"), { recursive: true });
+	assert.equal((await rawCreateProjectSession(running.url, binding.project_id)).status, 201);
 });
 
 test("project session creation rejects a workspace root that vanished", async (t) => {
@@ -336,8 +339,63 @@ test("project session creation rejects a workspace root that vanished", async (t
 	await rm(projectRoot, { recursive: true });
 
 	const response = await rawCreateProjectSession(running.url, project.id);
-	assert.equal(response.status, 400);
-	assert.deepEqual(await readJson(response.body), { code: "invalid_cwd" });
+	assert.equal(response.status, 409);
+	assert.deepEqual(await readJson(response.body), { code: "workspace_missing" });
+});
+
+test("lists, adds, canonicalizes, and conflicts project workspaces", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-daemon-workspaces-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const firstRoot = join(root, "first");
+	const secondRoot = join(root, "second");
+	const cloneRoot = join(root, "clone");
+	const cloneNested = join(cloneRoot, "nested");
+	await Promise.all([
+		mkdir(firstRoot, { recursive: true }),
+		mkdir(secondRoot, { recursive: true }),
+		mkdir(join(cloneRoot, ".git", "objects"), { recursive: true }),
+		mkdir(join(cloneRoot, ".git", "refs", "heads"), { recursive: true }),
+		mkdir(cloneNested, { recursive: true }),
+	]);
+	await Promise.all([
+		writeFile(join(cloneRoot, ".git", "HEAD"), "ref: refs/heads/main\n"),
+		writeFile(
+			join(cloneRoot, ".git", "config"),
+			'[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = clone.git\n',
+		),
+	]);
+	const running = await startServer(t, immediateFactory(), {
+		sessionDir: join(root, "sessions"),
+		catalogPath: join(root, "catalog.db"),
+	});
+	await createSession(running.url, firstRoot);
+	await createSession(running.url, secondRoot);
+	const projects = await readJson<Protocol.ListProjectsResponse>((await localFetch(`${running.url}/projects`)).body);
+	const firstProject = projects.projects.find((project) => project.name === "first");
+	const secondProject = projects.projects.find((project) => project.name === "second");
+	assert(firstProject);
+	assert(secondProject);
+
+	const listed = await localFetch(`${running.url}/projects/${firstProject.id}/workspaces`);
+	assert.equal(listed.status, 200);
+	assert.equal((await readJson<Protocol.ListWorkspacesResponse>(listed.body)).workspaces[0]?.exists, true);
+	const added = await rawCreateWorkspace(running.url, firstProject.id, cloneNested);
+	assert.equal(added.status, 201);
+	const created = await readJson<Protocol.Workspace>(added.body);
+	assert.deepEqual(created, {
+		id: created.id,
+		projectId: firstProject.id,
+		nodeId: created.nodeId,
+		rootPath: await realpath(cloneRoot),
+		gitRemote: "clone.git",
+		createdAt: created.createdAt,
+		exists: true,
+	});
+	assert.equal((await rawCreateWorkspace(running.url, firstProject.id, cloneNested)).status, 200);
+	assert.equal((await rawCreateWorkspace(running.url, firstProject.id, join(root, "missing"))).status, 400);
+	const conflict = await rawCreateWorkspace(running.url, firstProject.id, secondRoot);
+	assert.equal(conflict.status, 409);
+	assert.match((await readJson<Protocol.ErrorBody>(conflict.body)).message ?? "", new RegExp(secondProject.name));
 });
 
 test("serves injected GUI files with cache headers and guards the asset directory", async (t) => {
@@ -3910,6 +3968,14 @@ async function createSession(url: string, cwd = process.cwd()): Promise<Protocol
 
 function rawCreateProjectSession(url: string, projectId: string): Promise<TestResponse> {
 	return localFetch(`${url}/projects/${encodeURIComponent(projectId)}/sessions`, { method: "POST" });
+}
+
+function rawCreateWorkspace(url: string, projectId: string, path: string): Promise<TestResponse> {
+	return localFetch(`${url}/projects/${encodeURIComponent(projectId)}/workspaces`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ path } satisfies Protocol.WorkspaceRequest),
+	});
 }
 
 function rawCreateDocument(url: string, projectId: string, body: Protocol.DocumentRequest): Promise<TestResponse> {

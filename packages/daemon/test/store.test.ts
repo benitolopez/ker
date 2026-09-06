@@ -86,6 +86,19 @@ test("serializes concurrent appends within one session", async (t) => {
 	assert.equal(loaded.records.length, 4);
 });
 
+test("catalog scanning removes abandoned import staging", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-staging-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const store = new SessionStore({ baseDir });
+	const session = await store.create(baseDir, DEFINITION);
+	const staging = store.stagingDir();
+	await writeFile(join(staging, ".archive.zip"), "partial upload");
+
+	const catalog = await store.scanCatalog();
+	assert.equal(catalog.sessions[0]?.session.id, session.session.id);
+	await assert.rejects(stat(join(baseDir, ".staging")), { code: "ENOENT" });
+});
+
 test("round-trips prune records", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-prune-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));

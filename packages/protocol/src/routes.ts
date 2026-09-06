@@ -7,9 +7,11 @@ import {
 	DocumentRequest,
 	EventEnvelope,
 	Health,
+	ImportResult,
 	ListDocumentsResponse,
 	ListProjectsResponse,
 	ListSessionsResponse,
+	ListWorkspacesResponse,
 	Project,
 	PromptAdmission,
 	PromptRequest,
@@ -17,6 +19,8 @@ import {
 	SessionDescriptor,
 	SessionSnapshot,
 	TurnCancellationResult,
+	Workspace,
+	WorkspaceRequest,
 } from "./index.ts";
 
 export interface RouteDefinition {
@@ -24,7 +28,8 @@ export interface RouteDefinition {
 	path: string;
 	summary: string;
 	description?: string;
-	kind?: "sse";
+	kind?: "sse" | "download";
+	upload?: "application/zip";
 	params?: Record<string, TSchema>;
 	query?: Record<string, { schema: TSchema; required?: true; coerce?: "integer" }>;
 	body?: TSchema;
@@ -32,7 +37,9 @@ export interface RouteDefinition {
 }
 
 const openApiDocument = Type.Record(Type.String(), Type.Unknown());
+const binary = Type.String({ format: "binary" });
 const documentId = { documentId: Type.String({ minLength: 1 }) };
+const projectId = { projectId: Type.String({ minLength: 1 }) };
 const sessionId = { sessionId: Type.String({ minLength: 1 }) };
 const turnId = { turnId: Type.String({ minLength: 1 }) };
 
@@ -73,7 +80,7 @@ export const routes = {
 		method: "GET",
 		path: "/projects/{projectId}",
 		summary: "Read a project",
-		params: { projectId: Type.String({ minLength: 1 }) },
+		params: projectId,
 		responses: {
 			200: Project,
 			403: errorBody("forbidden"),
@@ -81,11 +88,77 @@ export const routes = {
 			500: errorBody("internal"),
 		},
 	},
+	exportProject: {
+		method: "GET",
+		path: "/projects/{projectId}/export",
+		summary: "Download a project archive",
+		description:
+			"Streams a zip: manifest.json first, then documents as Markdown files and session logs verbatim. See docs/archive-format.md.",
+		kind: "download",
+		params: projectId,
+		responses: {
+			200: binary,
+			403: errorBody("forbidden"),
+			404: errorBody("project_not_found"),
+			409: errorBody("archive_too_large"),
+			500: errorBody("internal"),
+		},
+	},
+	importProject: {
+		method: "POST",
+		path: "/projects/import",
+		summary: "Import a project archive",
+		description:
+			"Accepts a zip produced by the export route. IDs are kept; rows and logs that already exist are skipped; folders and sessions bind to this node.",
+		upload: "application/zip",
+		responses: {
+			201: ImportResult,
+			400: Type.Union([errorBody("invalid_archive"), errorBody("unsupported_archive")]),
+			403: errorBody("forbidden"),
+			409: errorBody("workspace_conflict"),
+			413: errorBody("payload_too_large"),
+			415: errorBody("unsupported_media_type"),
+			500: errorBody("internal"),
+		},
+	},
+	listWorkspaces: {
+		method: "GET",
+		path: "/projects/{projectId}/workspaces",
+		summary: "List a project's folders",
+		description: "exists reports whether the folder is present on the node that owns it.",
+		params: projectId,
+		responses: {
+			200: ListWorkspacesResponse,
+			403: errorBody("forbidden"),
+			404: errorBody("project_not_found"),
+			500: errorBody("internal"),
+		},
+	},
+	createWorkspace: {
+		method: "POST",
+		path: "/projects/{projectId}/workspaces",
+		summary: "Add a folder to a project",
+		description:
+			"The path must be a directory on this node; it is canonicalized and walked up to its git root. Responds 200 with the existing row when this project already has that folder.",
+		params: projectId,
+		body: WorkspaceRequest,
+		responses: {
+			200: Workspace,
+			201: Workspace,
+			400: Type.Union([errorBody("invalid_workspace"), errorBody("invalid_json")]),
+			403: errorBody("forbidden"),
+			404: errorBody("project_not_found"),
+			409: errorBody("workspace_conflict"),
+			413: errorBody("payload_too_large"),
+			415: errorBody("unsupported_media_type"),
+			500: errorBody("internal"),
+		},
+	},
 	listProjectSessions: {
 		method: "GET",
 		path: "/projects/{projectId}/sessions",
 		summary: "List a project's sessions",
-		params: { projectId: Type.String({ minLength: 1 }) },
+		params: projectId,
 		responses: {
 			200: ListSessionsResponse,
 			403: errorBody("forbidden"),
@@ -98,14 +171,14 @@ export const routes = {
 		path: "/projects/{projectId}/sessions",
 		summary: "Create a session in a project",
 		description:
-			"Creates a session running at the project's sole workspace root. Responds 409 workspace_ambiguous when the project does not have exactly one workspace.",
-		params: { projectId: Type.String({ minLength: 1 }) },
+			"Creates a session in the project's sole existing workspace on this node. Responds 409 when none or more than one exist.",
+		params: projectId,
 		responses: {
 			201: ReadableCatalogSession,
 			400: errorBody("invalid_cwd"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
-			409: errorBody("workspace_ambiguous"),
+			409: Type.Union([errorBody("workspace_ambiguous"), errorBody("workspace_missing")]),
 			500: errorBody("internal"),
 		},
 	},
@@ -114,7 +187,7 @@ export const routes = {
 		path: "/projects/{projectId}/documents",
 		summary: "List a project's documents",
 		description: "Summaries ordered by updatedAt descending; fetch a document for its body.",
-		params: { projectId: Type.String({ minLength: 1 }) },
+		params: projectId,
 		responses: {
 			200: ListDocumentsResponse,
 			403: errorBody("forbidden"),
@@ -126,7 +199,7 @@ export const routes = {
 		method: "POST",
 		path: "/projects/{projectId}/documents",
 		summary: "Create a document in a project",
-		params: { projectId: Type.String({ minLength: 1 }) },
+		params: projectId,
 		body: DocumentRequest,
 		responses: {
 			201: Document,

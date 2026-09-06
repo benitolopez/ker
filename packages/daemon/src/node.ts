@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import * as Agent from "@ker-ai/agent";
 import * as Auth from "@ker-ai/auth";
@@ -29,6 +30,8 @@ const INTERRUPTED_HISTORY_MARKER =
 	"The previous turn was interrupted by a daemon restart. Tools may have partially executed.";
 const CANCELLED_DURING_RESTART_HISTORY_MARKER =
 	"The previous turn was cancelled before a daemon restart finished cleanup. Tools may have partially executed.";
+const IMPORTED_RUNNING_HISTORY_MARKER =
+	"The turn was active when this session was exported. Tools may have partially executed.";
 
 export interface Harness {
 	send(input: Engine.UserMessage, signal?: AbortSignal): AsyncIterable<Protocol.TurnEvent>;
@@ -160,9 +163,32 @@ export class Node {
 		if (failures.length > 0) throw new AggregateError(failures, "Session recovery failed");
 	}
 
-	async #recoverSession(sessionId: Protocol.SessionId): Promise<void> {
+	logPath(sessionId: Protocol.SessionId): string | undefined {
+		return this.#paths.get(sessionId);
+	}
+
+	async registerSession(sessionId: Protocol.SessionId, path: string, options: { recover: boolean }): Promise<void> {
+		if (this.#states.has(sessionId)) return;
+		this.#paths.set(sessionId, path);
+		if (options.recover) await this.#recoverSession(sessionId, true);
+	}
+
+	async folderExists(rootPath: string): Promise<boolean> {
+		try {
+			return (await stat(rootPath)).isDirectory();
+		} catch {
+			return false;
+		}
+	}
+
+	async #recoverSession(sessionId: Protocol.SessionId, imported = false): Promise<void> {
 		const state = await this.#state(sessionId);
 		await this.#withQueueLock(state, async () => {
+			if (imported) {
+				if (state.queue.running) await this.#recoverRunning(state, state.queue.running, true);
+				await this.#drainExpiredWaiting(state, true);
+				return;
+			}
 			await this.#drainExpiredWaiting(state);
 			if (state.queue.running) {
 				await this.#recoverRunning(state, state.queue.running);
@@ -944,14 +970,14 @@ export class Node {
 		};
 	}
 
-	// Runs only during restart recovery, never while the daemon is live: waiting work older
-	// than the recovery window is dropped as expired instead of auto-running unattended.
-	async #drainExpiredWaiting(state: SessionState): Promise<void> {
+	// During recovery, expired work is dropped instead of auto-running unattended. Imported
+	// sessions expire all waiting work because an archive represents history, not pending work.
+	async #drainExpiredWaiting(state: SessionState, expireAll = false): Promise<void> {
 		if (state.queue.waiting.length === 0) return;
 		const now = Date.now();
 		const windowMs = this.#recoveryWindowMinutes * 60_000;
 		const isFresh = (item: Protocol.QueueItem) =>
-			this.#recoveryWindowMinutes > 0 && now - Date.parse(item.submittedAt) <= windowMs;
+			!expireAll && this.#recoveryWindowMinutes > 0 && now - Date.parse(item.submittedAt) <= windowMs;
 		const expired = state.queue.waiting.filter((item) => !isFresh(item));
 		if (expired.length === 0) return;
 		state.queue.waiting = state.queue.waiting.filter(isFresh);
@@ -982,9 +1008,9 @@ export class Node {
 		await this.#appendAndPublish(state, payloads);
 	}
 
-	async #recoverRunning(state: SessionState, item: Protocol.QueueItem): Promise<void> {
+	async #recoverRunning(state: SessionState, item: Protocol.QueueItem, imported = false): Promise<void> {
 		const scope = { sessionId: state.stored.session.id, turnId: item.turnId };
-		const cancellation = item.state === "cancelling";
+		const cancellation = item.state === "cancelling" || imported;
 		if (state.turns.has(item.turnId)) {
 			const hasEnd = state.stored.records.some(
 				(record) => record.type === "event" && record.event.type === "end" && record.event.turnId === item.turnId,
@@ -992,7 +1018,7 @@ export class Node {
 			if (!hasEnd) {
 				await this.#appendAndPublish(state, [{ type: "event", event: { actor: "process", ...scope, type: "end" } }]);
 			}
-			await this.#advanceQueue(state, item.id);
+			await this.#finishRecoveredItem(state, item, imported);
 			return;
 		}
 		if (item.kind === "compaction") {
@@ -1016,7 +1042,7 @@ export class Node {
 				{ type: "event", event: { actor: "process", ...scope, type: "end" } },
 			);
 			await this.#appendAndPublish(state, payloads);
-			await this.#advanceQueue(state, item.id);
+			await this.#finishRecoveredItem(state, item, imported);
 			return;
 		}
 		const submitted = state.stored.records
@@ -1057,7 +1083,11 @@ export class Node {
 		if (delivered.size > 0 || repairs.length > 0) {
 			repairedMessages.push({
 				role: "developer",
-				content: cancellation ? CANCELLED_DURING_RESTART_HISTORY_MARKER : INTERRUPTED_HISTORY_MARKER,
+				content: imported
+					? IMPORTED_RUNNING_HISTORY_MARKER
+					: cancellation
+						? CANCELLED_DURING_RESTART_HISTORY_MARKER
+						: INTERRUPTED_HISTORY_MARKER,
 			});
 		}
 
@@ -1128,7 +1158,18 @@ export class Node {
 			state.stored.session.cwd,
 		);
 		state.persistedMessageCount = nextHistory.length;
-		await this.#advanceQueue(state, item.id);
+		await this.#finishRecoveredItem(state, item, imported);
+	}
+
+	async #finishRecoveredItem(state: SessionState, item: Protocol.QueueItem, imported: boolean): Promise<void> {
+		if (!imported) {
+			await this.#advanceQueue(state, item.id);
+			return;
+		}
+		if (state.queue.running?.id !== item.id) return;
+		state.queue.running = undefined;
+		state.queue.revision++;
+		await this.#appendAndPublish(state, [this.#queueChangedPayload(state)]);
 	}
 
 	async #advanceQueue(state: SessionState, finishedItemId: Protocol.QueueItemId): Promise<void> {

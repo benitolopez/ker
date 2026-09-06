@@ -1,10 +1,19 @@
+import { once } from "node:events";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
+import { PassThrough, type Readable } from "node:stream";
 import type * as Protocol from "@ker-ai/protocol";
+import { PROTOCOL_VERSION } from "@ker-ai/protocol";
+import { archiveFileName, buildManifest, InvalidArchiveError, readArchive, writeArchive } from "./archive.ts";
 import { Catalog, type CatalogListRow, type CatalogRow } from "./catalog.ts";
 import { type Node, type SessionChange, SessionUnreadableError } from "./node.ts";
+import { CATALOG_VERSION } from "./schema.ts";
+import { type SessionStore, STORE_VERSION } from "./store.ts";
 
 export interface ControlPlaneOptions {
 	node: Node;
+	store: SessionStore;
 	catalogPath: string;
 }
 
@@ -15,11 +24,13 @@ export interface Subscription {
 
 export class ControlPlane {
 	readonly #node: Node;
+	readonly #store: SessionStore;
 	readonly #catalogPath: string;
 	#catalog!: Catalog;
 
 	constructor(options: ControlPlaneOptions) {
 		this.#node = options.node;
+		this.#store = options.store;
 		this.#catalogPath = options.catalogPath;
 	}
 
@@ -60,10 +71,20 @@ export class ControlPlane {
 
 	async createProjectSession(
 		projectId: Protocol.ProjectId,
-	): Promise<Protocol.ReadableCatalogSession | "missing" | "ambiguous"> {
-		if (!this.#catalog.projectExists(projectId)) return "missing";
-		const workspaces = this.#catalog.projectWorkspaces(projectId);
-		if (workspaces.length !== 1) return "ambiguous";
+	): Promise<Protocol.ReadableCatalogSession | "project_missing" | "workspace_missing" | "ambiguous"> {
+		if (!this.#catalog.projectExists(projectId)) return "project_missing";
+		const candidates = this.#catalog
+			.projectWorkspaces(projectId)
+			.filter((workspace) => workspace.nodeId === this.#node.identity.id);
+		const workspaces = (
+			await Promise.all(
+				candidates.map(async (workspace) => ({ workspace, exists: await this.#node.folderExists(workspace.rootPath) })),
+			)
+		)
+			.filter((candidate) => candidate.exists)
+			.map((candidate) => candidate.workspace);
+		if (workspaces.length === 0) return "workspace_missing";
+		if (workspaces.length > 1) return "ambiguous";
 		const binding = workspaces[0];
 		const descriptor = await this.#node.createSession(binding.rootPath);
 		this.#catalog.upsertCreated(descriptor, binding);
@@ -93,6 +114,138 @@ export class ControlPlane {
 
 	getProject(projectId: Protocol.ProjectId): Protocol.Project | "missing" {
 		return this.#catalog.getProject(projectId) ?? "missing";
+	}
+
+	async exportProject(
+		projectId: Protocol.ProjectId,
+	): Promise<"missing" | { fileName: string; manifest: Protocol.ArchiveManifest; stream: Readable }> {
+		const rows = this.#catalog.exportRows(projectId);
+		if (!rows) return "missing";
+		const exportedAt = new Date().toISOString();
+		const archive = await buildManifest({
+			exportedAt,
+			versions: { protocol: PROTOCOL_VERSION, store: STORE_VERSION, catalog: CATALOG_VERSION },
+			project: { id: rows.project.id, name: rows.project.name, createdAt: rows.project.created_at },
+			nodes: rows.nodes.map((item) => ({ id: item.id, name: item.name, createdAt: item.created_at })),
+			workspaces: rows.workspaces.map((item) => ({
+				id: item.id,
+				nodeId: item.node_id,
+				rootPath: item.root_path,
+				gitRemote: item.git_remote,
+				createdAt: item.created_at,
+			})),
+			sessions: rows.sessions.map((item) => ({
+				id: item.id,
+				projectKey: item.project_key,
+				workspaceId: item.workspace_id,
+				nodeId: item.node_id,
+				cwd: item.cwd,
+				title: item.title,
+				status: item.status,
+				error: item.error,
+				createdAt: item.created_at,
+				updatedAt: item.updated_at,
+				path: this.#node.logPath(item.id),
+			})),
+			documents: rows.documents,
+		});
+		const stream = new PassThrough();
+		void writeArchive(archive, async (chunk) => {
+			if (stream.destroyed) throw new Error("archive stream closed");
+			if (!stream.write(chunk)) await once(stream, "drain");
+		}).then(
+			() => stream.end(),
+			(error: unknown) => stream.destroy(error instanceof Error ? error : new Error(String(error))),
+		);
+		return { fileName: archiveFileName(rows.project.name, exportedAt), manifest: archive.manifest, stream };
+	}
+
+	async importProject(source: AsyncIterable<Uint8Array>): Promise<Protocol.ImportResult> {
+		const staging = this.#store.stagingDir();
+		try {
+			const archive = await readArchive(source, staging);
+			const bodies = new Map<string, string>();
+			for (const document of archive.manifest.documents) {
+				const path = archive.files.get(document.file);
+				if (!path) throw new InvalidArchiveError(`Archive is missing ${document.file}`);
+				try {
+					bodies.set(document.file, new TextDecoder("utf-8", { fatal: true }).decode(await readFile(path)));
+				} catch (error) {
+					throw new InvalidArchiveError(error instanceof Error ? error.message : String(error));
+				}
+			}
+			const logs = new Map<Protocol.SessionId, string>();
+			for (const session of archive.manifest.sessions) {
+				if (!session.file) continue;
+				const path = archive.files.get(session.file);
+				if (!path) throw new InvalidArchiveError(`Archive is missing ${session.file}`);
+				logs.set(session.id, path);
+			}
+			const imported = this.#catalog.importRows(
+				archive.manifest,
+				this.#node.identity.id,
+				bodies,
+				logs,
+				(projectKey, sessionId) => {
+					const path = this.#store.logPath(projectKey, sessionId);
+					return existsSync(path) ? path : undefined;
+				},
+				(sessionId, projectKey, stagedPath) => this.#store.placeLog(stagedPath, projectKey, sessionId),
+			);
+			for (const log of imported.logs) {
+				try {
+					await this.#node.registerSession(log.sessionId, log.path, { recover: log.recover });
+				} catch (error) {
+					if (!(error instanceof SessionUnreadableError)) throw error;
+					this.#markUnreadable(log.sessionId, error);
+				}
+			}
+			const project = this.#catalog.getProject(archive.manifest.project.id);
+			if (!project) throw new Error(`Imported project ${archive.manifest.project.id} is missing`);
+			return { project, ...imported.counts };
+		} finally {
+			this.#store.removeStaging(staging);
+		}
+	}
+
+	async listWorkspaces(projectId: Protocol.ProjectId): Promise<Protocol.Workspace[] | "missing"> {
+		if (!this.#catalog.projectExists(projectId)) return "missing";
+		return Promise.all(
+			this.#catalog.listWorkspaces(projectId).map(async (binding) => ({
+				id: binding.workspaceId,
+				projectId: binding.projectId,
+				nodeId: binding.nodeId,
+				rootPath: binding.rootPath,
+				gitRemote: binding.gitRemote,
+				createdAt: binding.createdAt,
+				exists: binding.nodeId === this.#node.identity.id && (await this.#node.folderExists(binding.rootPath)),
+			})),
+		);
+	}
+
+	async addWorkspace(
+		projectId: Protocol.ProjectId,
+		path: string,
+	): Promise<"missing" | { workspace: Protocol.Workspace; created: boolean }> {
+		if (!this.#catalog.projectExists(projectId)) return "missing";
+		const rootPath = await this.#node.resolveProjectRoot(path);
+		const result = this.#catalog.addWorkspace(projectId, {
+			nodeId: this.#node.identity.id,
+			rootPath,
+			gitRemote: await this.#node.observeGitRemote(rootPath),
+		});
+		return {
+			created: result.created,
+			workspace: {
+				id: result.binding.workspaceId,
+				projectId: result.binding.projectId,
+				nodeId: result.binding.nodeId,
+				rootPath: result.binding.rootPath,
+				gitRemote: result.binding.gitRemote,
+				createdAt: result.binding.createdAt,
+				exists: await this.#node.folderExists(result.binding.rootPath),
+			},
+		};
 	}
 
 	listProjectSessions(projectId: Protocol.ProjectId): Protocol.CatalogSession[] | "missing" {

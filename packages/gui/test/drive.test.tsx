@@ -5,7 +5,8 @@ import { afterEach, assert, test, vi } from "vitest";
 import { DocumentScreen } from "../src/screens/document.tsx";
 import { DocumentsScreen } from "../src/screens/documents.tsx";
 import { ProjectHeader } from "../src/screens/project-header.tsx";
-import { SessionsScreen } from "../src/screens/sessions.tsx";
+import { ProjectsScreen } from "../src/screens/projects.tsx";
+import { FoldersStrip, SessionsScreen } from "../src/screens/sessions.tsx";
 import { Composer, QueueStack, SessionHeader, ToolBlock, toolLabel } from "../src/screens/transcript.tsx";
 
 afterEach(cleanup);
@@ -207,8 +208,10 @@ test("new session creation navigates to the empty transcript", async () => {
 	render(
 		<SessionsScreen
 			createProjectSession={createProjectSession}
+			createWorkspace={async () => ({ ok: false, status: 500, error: { code: "unused" } })}
 			getProject={async () => projectResult()}
 			listProjectSessions={listProjectSessions}
+			listWorkspaces={async () => ({ ok: true, status: 200, value: { workspaces: [] } })}
 			navigate={navigate}
 			projectId="project/one"
 		/>,
@@ -228,9 +231,139 @@ test("the project header loads the name and links both project sections", async 
 		"#/projects/project%2Fone/sessions",
 	);
 	assert.equal(screen.getByRole("link", { name: "Documents" }).getAttribute("aria-current"), "page");
+	assert.equal(screen.getByRole("link", { name: "Export" }).getAttribute("href"), "/projects/project%2Fone/export");
 
 	pending.resolve(projectResult("Project One"));
 	await waitFor(() => assert.equal(screen.getByRole("heading", { level: 1 }).textContent, "Project One"));
+});
+
+test("project import uploads the selected zip and links its result", async () => {
+	const listProjects = vi.fn(
+		async () => ({ ok: true, status: 200, value: { projects: [] } }) satisfies Result<Protocol.ListProjectsResponse>,
+	);
+	const importProject = vi.fn(
+		async (_archive: Blob) =>
+			({
+				ok: true,
+				status: 201,
+				value: importResult(),
+			}) satisfies Result<Protocol.ImportResult>,
+	);
+	const view = render(<ProjectsScreen importProject={importProject} listProjects={listProjects} />);
+	await waitFor(() => assert.equal(listProjects.mock.calls.length, 1));
+	const input = view.container.querySelector('input[type="file"]');
+	assert(input instanceof HTMLInputElement);
+	const archive = new File(["zip"], "ker.zip", { type: "application/zip" });
+	fireEvent.change(input, { target: { files: [archive] } });
+	await waitFor(() => assert.deepEqual(importProject.mock.calls, [[archive]]));
+	assert.match(
+		screen.getByText(/Imported Project:/).textContent ?? "",
+		/2 documents, 4 sessions \(1 unreadable\), 2 skipped/,
+	);
+	assert.equal(
+		screen.getByRole("link", { name: "Open project" }).getAttribute("href"),
+		"#/projects/project%2Fone/sessions",
+	);
+	assert(listProjects.mock.calls.length >= 2);
+});
+
+test("project import shows workspace conflicts", async () => {
+	const view = render(
+		<ProjectsScreen
+			importProject={async () => ({
+				ok: false,
+				status: 409,
+				error: { code: "workspace_conflict", message: "/work/ker already belongs to project Existing" },
+			})}
+			listProjects={async () => ({ ok: true, status: 200, value: { projects: [] } })}
+		/>,
+	);
+	const input = view.container.querySelector('input[type="file"]');
+	assert(input instanceof HTMLInputElement);
+	fireEvent.change(input, { target: { files: [new File(["zip"], "ker.zip")] } });
+	await screen.findByText("/work/ker already belongs to project Existing");
+});
+
+test("folders list existing paths first and refreshes after adding one", async () => {
+	const listWorkspaces = vi
+		.fn<() => Promise<Result<Protocol.ListWorkspacesResponse>>>()
+		.mockResolvedValueOnce({
+			ok: true,
+			status: 200,
+			value: {
+				workspaces: [workspace("missing", "/old/ker", false), workspace("existing", "/work/ker", true)],
+			},
+		})
+		.mockResolvedValue({
+			ok: true,
+			status: 200,
+			value: { workspaces: [workspace("existing", "/work/ker", true), workspace("new", "/clone/ker", true)] },
+		});
+	const createWorkspace = vi.fn(
+		async (_projectId: string, input: Protocol.WorkspaceRequest) =>
+			({ ok: true, status: 201, value: workspace("new", input.path, true) }) satisfies Result<Protocol.Workspace>,
+	);
+	render(<FoldersStrip createWorkspace={createWorkspace} listWorkspaces={listWorkspaces} projectId="project/one" />);
+	await screen.findByText("/old/ker");
+	assert.deepEqual(
+		screen.getAllByText(/^\/(work|old)\/ker$/).map((item) => item.textContent),
+		["/work/ker", "/old/ker"],
+	);
+	assert.equal(screen.getByText("missing").textContent, "missing");
+	const input = screen.getByLabelText("Folder path") as HTMLInputElement;
+	fireEvent.change(input, { target: { value: "/clone/ker" } });
+	fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+	await waitFor(() => assert.deepEqual(createWorkspace.mock.calls[0], ["project/one", { path: "/clone/ker" }]));
+	await screen.findByText("/clone/ker");
+	assert.equal(input.value, "");
+});
+
+test("folders explain invalid paths and project conflicts", async () => {
+	const cases: Array<{ error: Protocol.ErrorBody; message: string }> = [
+		{
+			error: { code: "invalid_workspace" },
+			message: "Enter an absolute path to an existing folder.",
+		},
+		{
+			error: { code: "workspace_conflict", message: "/work/ker already belongs to project Existing" },
+			message: "/work/ker already belongs to project Existing",
+		},
+	];
+	for (const item of cases) {
+		const view = render(
+			<FoldersStrip
+				createWorkspace={async () => ({ ok: false, status: 409, error: item.error })}
+				listWorkspaces={async () => ({ ok: true, status: 200, value: { workspaces: [] } })}
+				projectId="project/one"
+			/>,
+		);
+		const input = screen.getByLabelText("Folder path");
+		fireEvent.change(input, { target: { value: "/work/ker" } });
+		fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+		await screen.findByText(item.message);
+		view.unmount();
+	}
+});
+
+test("new session explains when no project folder exists", async () => {
+	const listWorkspaces = vi.fn(
+		async () =>
+			({ ok: true, status: 200, value: { workspaces: [] } }) satisfies Result<Protocol.ListWorkspacesResponse>,
+	);
+	render(
+		<SessionsScreen
+			createProjectSession={async () => ({ ok: false, status: 409, error: { code: "workspace_missing" } })}
+			createWorkspace={async () => ({ ok: false, status: 500, error: { code: "unused" } })}
+			getProject={async () => projectResult()}
+			listProjectSessions={async () => ({ ok: true, status: 200, value: { sessions: [] } })}
+			listWorkspaces={listWorkspaces}
+			projectId="project/one"
+		/>,
+	);
+	await waitFor(() => assert.equal(listWorkspaces.mock.calls.length, 1));
+	fireEvent.click(await screen.findByRole("button", { name: "New session" }));
+	await screen.findByText("None of this project's folders exist on this node. Add one below.");
+	await waitFor(() => assert.equal(listWorkspaces.mock.calls.length, 2));
 });
 
 test("the document list keeps server order and opens the new-document route", async () => {
@@ -563,6 +696,34 @@ function projectResult(name = "Project"): Result<Protocol.Project> {
 			sessionCount: 0,
 			lastActivityAt: null,
 		},
+	};
+}
+
+function importResult(): Protocol.ImportResult {
+	return {
+		project: {
+			id: "project/one",
+			name: "Project",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			sessionCount: 4,
+			lastActivityAt: "2026-01-01T00:00:00.000Z",
+		},
+		created: true,
+		workspaces: { created: 1, reused: 0 },
+		documents: { imported: 2, skipped: 1 },
+		sessions: { imported: 4, skipped: 1, unreadable: 1, missing: 0 },
+	};
+}
+
+function workspace(id: string, rootPath: string, exists: boolean): Protocol.Workspace {
+	return {
+		id,
+		projectId: "project/one",
+		nodeId: "node-one",
+		rootPath,
+		gitRemote: "git@example.com:ker.git",
+		createdAt: "2026-01-01T00:00:00.000Z",
+		exists,
 	};
 }
 

@@ -8,11 +8,13 @@ export function ProjectHeader({
 	tab,
 	action,
 	getProject = api.getProject,
+	exportProjectPath = api.exportProjectPath,
 }: {
 	projectId: string;
 	tab: "sessions" | "documents";
 	action?: ReactNode;
 	getProject?: typeof api.getProject;
+	exportProjectPath?: typeof api.exportProjectPath;
 }) {
 	const [name, setName] = useState(projectId);
 	useEffect(() => {
@@ -39,7 +41,16 @@ export function ProjectHeader({
 					<h1 className="truncate text-4xl font-semibold tracking-[-0.04em] text-[var(--text)]">{name}</h1>
 					<p className="mt-3 truncate font-mono text-xs text-[var(--faint)]">{projectId}</p>
 				</div>
-				{action}
+				<div className="flex shrink-0 items-center gap-3">
+					<a
+						className="text-sm font-semibold text-[var(--muted)] hover:text-[var(--accent)]"
+						download
+						href={exportProjectPath(projectId)}
+					>
+						Export
+					</a>
+					{action}
+				</div>
 			</header>
 			<nav className="mb-8 mt-7 flex gap-5 border-b border-[var(--line)]" aria-label="Project sections">
 				<a

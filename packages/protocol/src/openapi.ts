@@ -25,10 +25,19 @@ export const components = {
 	ListSessionsResponse: Protocol.ListSessionsResponse,
 	Project: Protocol.Project,
 	ListProjectsResponse: Protocol.ListProjectsResponse,
+	Workspace: Protocol.Workspace,
+	ListWorkspacesResponse: Protocol.ListWorkspacesResponse,
+	WorkspaceRequest: Protocol.WorkspaceRequest,
 	Document: Protocol.Document,
 	DocumentSummary: Protocol.DocumentSummary,
 	ListDocumentsResponse: Protocol.ListDocumentsResponse,
 	DocumentRequest: Protocol.DocumentRequest,
+	ImportResult: Protocol.ImportResult,
+	ArchiveNode: Protocol.ArchiveNode,
+	ArchiveWorkspace: Protocol.ArchiveWorkspace,
+	ArchiveSession: Protocol.ArchiveSession,
+	ArchiveDocument: Protocol.ArchiveDocument,
+	ArchiveManifest: Protocol.ArchiveManifest,
 	QueueItemBase: Protocol.QueueItemBase,
 	PromptQueueItem: Protocol.PromptQueueItem,
 	CompactionQueueItem: Protocol.CompactionQueueItem,
@@ -121,12 +130,19 @@ function createOperation(key: RouteKey, route: RouteDefinition): Record<string, 
 		summary: route.summary,
 		...(route.description === undefined ? {} : { description: route.description }),
 		...(parameters.length === 0 ? {} : { parameters }),
-		...(route.body === undefined
-			? {}
+		...(route.upload === undefined
+			? route.body === undefined
+				? {}
+				: {
+						requestBody: {
+							required: true,
+							content: { "application/json": { schema: replaceComponents(route.body) } },
+						},
+					}
 			: {
 					requestBody: {
 						required: true,
-						content: { "application/json": { schema: replaceComponents(route.body) } },
+						content: { [route.upload]: { schema: { type: "string", format: "binary" } } },
 					},
 				}),
 		responses: Object.fromEntries(
@@ -135,7 +151,7 @@ function createOperation(key: RouteKey, route: RouteDefinition): Record<string, 
 				{
 					description: Number(status) >= 400 ? "Error" : "Success",
 					content: {
-						[route.kind === "sse" && status === "200" ? "text/event-stream" : "application/json"]: {
+						[responseContentType(route, status)]: {
 							schema: replaceComponents(schema),
 						},
 					},
@@ -143,6 +159,13 @@ function createOperation(key: RouteKey, route: RouteDefinition): Record<string, 
 			]),
 		),
 	};
+}
+
+function responseContentType(route: RouteDefinition, status: string): string {
+	if (status !== "200") return "application/json";
+	if (route.kind === "sse") return "text/event-stream";
+	if (route.kind === "download") return "application/zip";
+	return "application/json";
 }
 
 // TypeBox clones schemas wrapped in Type.Optional, so component matching uses their JSON form.

@@ -201,6 +201,8 @@ Sessions are stored under `KER_SESSION_DIR` when set, otherwise at `~/.ker/sessi
 canonical Git root and session ID. Older session-log store versions are reported as unreadable and
 left byte-for-byte unchanged until manually removed.
 
+Project exports use the documented, versioned [ker archive format](docs/archive-format.md).
+
 Concurrent sessions intentionally use their recorded working directories without worktree isolation.
 Running two sessions against the same files can therefore conflict. Cooperative cancellation cannot
 force-stop code that ignores its abort signal; safe force stopping remains deferred until turns run in

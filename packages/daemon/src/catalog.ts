@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type * as Protocol from "@ker-ai/protocol";
-import { and, asc, count, desc, eq, getTableColumns, isNull, max, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, getTableColumns, inArray, isNull, max, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-sqlite";
 import type { NodeIdentity } from "./identity.ts";
 import { CATALOG_VERSION, DDL, document, MIGRATIONS, node, project, session, workspace } from "./schema.ts";
@@ -37,6 +37,41 @@ export interface WorkspaceBinding {
 	nodeId: Protocol.NodeId;
 	rootPath: string;
 	gitRemote: string | null;
+	createdAt: string;
+}
+
+export interface ExportRows {
+	project: { id: Protocol.ProjectId; name: string; created_at: string };
+	nodes: Array<{ id: Protocol.NodeId; name: string; created_at: string }>;
+	workspaces: Array<typeof workspace.$inferSelect>;
+	sessions: CatalogRow[];
+	documents: Protocol.Document[];
+}
+
+export interface ImportCounts {
+	created: boolean;
+	workspaces: { created: number; reused: number };
+	documents: { imported: number; skipped: number };
+	sessions: { imported: number; skipped: number; unreadable: number; missing: number };
+}
+
+export interface ImportedLog {
+	sessionId: Protocol.SessionId;
+	path: string;
+	recover: boolean;
+}
+
+export class WorkspaceConflictError extends Error {
+	readonly rootPath: string;
+	readonly projectId: Protocol.ProjectId;
+	readonly projectName: string;
+
+	constructor(rootPath: string, projectId: Protocol.ProjectId, projectName: string) {
+		super(`${rootPath} already belongs to project ${projectName}`);
+		this.rootPath = rootPath;
+		this.projectId = projectId;
+		this.projectName = projectName;
+	}
 }
 
 type CatalogScan = {
@@ -106,6 +141,7 @@ export class Catalog {
 				nodeId: workspace.node_id,
 				rootPath: workspace.root_path,
 				gitRemote: workspace.git_remote,
+				createdAt: workspace.created_at,
 			})
 			.from(workspace)
 			.innerJoin(project, eq(workspace.project_id, project.id))
@@ -122,6 +158,7 @@ export class Catalog {
 				nodeId: workspace.node_id,
 				rootPath: workspace.root_path,
 				gitRemote: workspace.git_remote,
+				createdAt: workspace.created_at,
 			})
 			.from(workspace)
 			.innerJoin(project, eq(workspace.project_id, project.id))
@@ -158,11 +195,59 @@ export class Catalog {
 					nodeId: input.nodeId,
 					rootPath: input.rootPath,
 					gitRemote: input.gitRemote,
+					createdAt: now,
 				};
 			});
 		} catch (error) {
 			const existing = this.findWorkspaceByRoot(input.nodeId, input.rootPath);
 			if (existing) return existing;
+			throw error;
+		}
+	}
+
+	listWorkspaces(projectId: Protocol.ProjectId): WorkspaceBinding[] {
+		return this.projectWorkspaces(projectId);
+	}
+
+	addWorkspace(
+		projectId: Protocol.ProjectId,
+		input: { nodeId: Protocol.NodeId; rootPath: string; gitRemote: string | null },
+	): { binding: WorkspaceBinding; created: boolean } {
+		const insert = () => {
+			const createdAt = new Date().toISOString();
+			const row = {
+				id: randomUUID(),
+				project_id: projectId,
+				node_id: input.nodeId,
+				root_path: input.rootPath,
+				git_remote: input.gitRemote,
+				created_at: createdAt,
+			};
+			this.#db.insert(workspace).values(row).run();
+			const projectRow = this.#db.select({ name: project.name }).from(project).where(eq(project.id, projectId)).get();
+			if (!projectRow) throw new Error(`Project ${projectId} does not exist`);
+			return {
+				binding: {
+					projectId,
+					projectName: projectRow.name,
+					workspaceId: row.id,
+					nodeId: input.nodeId,
+					rootPath: input.rootPath,
+					gitRemote: input.gitRemote,
+					createdAt,
+				},
+				created: true,
+			};
+		};
+		const existing = this.findWorkspaceByRoot(input.nodeId, input.rootPath);
+		if (existing?.projectId === projectId) return { binding: existing, created: false };
+		if (existing) throw new WorkspaceConflictError(input.rootPath, existing.projectId, existing.projectName);
+		try {
+			return insert();
+		} catch (error) {
+			const raced = this.findWorkspaceByRoot(input.nodeId, input.rootPath);
+			if (raced?.projectId === projectId) return { binding: raced, created: false };
+			if (raced) throw new WorkspaceConflictError(input.rootPath, raced.projectId, raced.projectName);
 			throw error;
 		}
 	}
@@ -180,6 +265,7 @@ export class Catalog {
 					nodeId: workspace.node_id,
 					rootPath: workspace.root_path,
 					gitRemote: workspace.git_remote,
+					createdAt: workspace.created_at,
 				})
 				.from(workspace)
 				.innerJoin(project, eq(workspace.project_id, project.id))
@@ -220,6 +306,7 @@ export class Catalog {
 							nodeId,
 							rootPath: descriptor.projectRoot,
 							gitRemote: null,
+							createdAt: now,
 						};
 					})();
 				bindingsByRoot.set(binding.rootPath, binding);
@@ -425,6 +512,180 @@ export class Catalog {
 			sessionCount: row.session_count,
 			lastActivityAt: row.last_activity_at,
 		};
+	}
+
+	exportRows(projectId: Protocol.ProjectId): ExportRows | undefined {
+		const projectRow = this.#db.select().from(project).where(eq(project.id, projectId)).get();
+		if (!projectRow) return undefined;
+		const workspaces = this.#db.select().from(workspace).where(eq(workspace.project_id, projectId)).all();
+		const nodeIds = [...new Set(workspaces.map((item) => item.node_id))];
+		return {
+			project: projectRow,
+			nodes: nodeIds.length === 0 ? [] : this.#db.select().from(node).where(inArray(node.id, nodeIds)).all(),
+			workspaces,
+			sessions: this.#db
+				.select()
+				.from(session)
+				.where(eq(session.project_id, projectId))
+				.orderBy(asc(session.created_at))
+				.all(),
+			documents: this.#db
+				.select()
+				.from(document)
+				.where(eq(document.project_id, projectId))
+				.orderBy(asc(document.created_at))
+				.all()
+				.map(toDocument),
+		};
+	}
+
+	importRows(
+		manifest: Protocol.ArchiveManifest,
+		localNodeId: Protocol.NodeId,
+		bodies: Map<string, string>,
+		logs: Map<Protocol.SessionId, string>,
+		logExists: (projectKey: string, sessionId: Protocol.SessionId) => string | undefined,
+		placeLog: (
+			sessionId: Protocol.SessionId,
+			projectKey: string,
+			stagedPath: string,
+		) => { placed: true; path: string } | { placed: false },
+	): { counts: ImportCounts; logs: ImportedLog[] } {
+		return this.#db.transaction((tx) => {
+			const moved: string[] = [];
+			try {
+				const created =
+					Number(
+						tx
+							.insert(project)
+							.values({
+								id: manifest.project.id,
+								name: manifest.project.name,
+								created_at: manifest.project.createdAt,
+							})
+							.onConflictDoNothing()
+							.run().changes,
+					) === 1;
+				const workspaceIds = new Map<string, string>();
+				let workspacesCreated = 0;
+				let workspacesReused = 0;
+				for (const item of manifest.workspaces) {
+					const existing = tx
+						.select({
+							id: workspace.id,
+							projectId: workspace.project_id,
+							projectName: project.name,
+						})
+						.from(workspace)
+						.innerJoin(project, eq(workspace.project_id, project.id))
+						.where(and(eq(workspace.node_id, localNodeId), eq(workspace.root_path, item.rootPath)))
+						.get();
+					if (existing && existing.projectId !== manifest.project.id) {
+						throw new WorkspaceConflictError(item.rootPath, existing.projectId, existing.projectName);
+					}
+					if (existing) {
+						workspaceIds.set(item.id, existing.id);
+						workspacesReused++;
+						continue;
+					}
+					tx.insert(workspace)
+						.values({
+							id: item.id,
+							project_id: manifest.project.id,
+							node_id: localNodeId,
+							root_path: item.rootPath,
+							git_remote: item.gitRemote,
+							created_at: item.createdAt,
+						})
+						.run();
+					workspaceIds.set(item.id, item.id);
+					workspacesCreated++;
+				}
+
+				let documentsImported = 0;
+				let documentsSkipped = 0;
+				for (const item of manifest.documents) {
+					const body = bodies.get(item.file);
+					if (body === undefined) throw new Error(`Document body ${item.file} is missing`);
+					const changes = Number(
+						tx
+							.insert(document)
+							.values({
+								id: item.id,
+								project_id: manifest.project.id,
+								title: item.title,
+								body,
+								created_at: item.createdAt,
+								updated_at: item.updatedAt,
+							})
+							.onConflictDoNothing()
+							.run().changes,
+					);
+					if (changes === 1) documentsImported++;
+					if (changes !== 1) documentsSkipped++;
+				}
+
+				let sessionsImported = 0;
+				let sessionsSkipped = 0;
+				let sessionsUnreadable = 0;
+				let sessionsMissing = 0;
+				const importedLogs: ImportedLog[] = [];
+				for (const item of manifest.sessions) {
+					const staged = logs.get(item.id);
+					const existingLog = logExists(item.projectKey, item.id);
+					if (!staged && !existingLog) {
+						sessionsMissing++;
+						continue;
+					}
+					const changes = Number(
+						tx
+							.insert(session)
+							.values({
+								id: item.id,
+								project_key: item.projectKey,
+								cwd: item.cwd,
+								title: item.title,
+								status: item.status,
+								error: item.error,
+								created_at: item.createdAt,
+								updated_at: item.updatedAt,
+								project_id: manifest.project.id,
+								workspace_id: item.workspaceId === null ? null : (workspaceIds.get(item.workspaceId) ?? null),
+								node_id: localNodeId,
+							})
+							.onConflictDoNothing()
+							.run().changes,
+					);
+					if (changes !== 1) {
+						sessionsSkipped++;
+						continue;
+					}
+					sessionsImported++;
+					if (item.status === "unreadable") sessionsUnreadable++;
+					const placed = staged ? placeLog(item.id, item.projectKey, staged) : { placed: false as const };
+					if (placed.placed) moved.push(placed.path);
+					const path = placed.placed ? placed.path : existingLog;
+					if (path) importedLogs.push({ sessionId: item.id, path, recover: item.status === "busy" });
+				}
+				return {
+					counts: {
+						created,
+						workspaces: { created: workspacesCreated, reused: workspacesReused },
+						documents: { imported: documentsImported, skipped: documentsSkipped },
+						sessions: {
+							imported: sessionsImported,
+							skipped: sessionsSkipped,
+							unreadable: sessionsUnreadable,
+							missing: sessionsMissing,
+						},
+					},
+					logs: importedLogs,
+				};
+			} catch (error) {
+				for (const path of moved) rmSync(path, { force: true });
+				throw error;
+			}
+		});
 	}
 
 	listDocuments(projectId: Protocol.ProjectId): Protocol.DocumentSummary[] {
