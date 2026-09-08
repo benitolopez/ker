@@ -2,18 +2,26 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, request } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { type TestContext, test } from "node:test";
+import { test as nodeTest, type TestContext, type TestOptions } from "node:test";
 import * as Engine from "@ker-ai/engine";
+import { canonicalDirectory, canonicalProjectRoot } from "@ker-ai/node";
 import * as Protocol from "@ker-ai/protocol";
+import {
+	SessionStore as BaseSessionStore,
+	type Definition,
+	type Payload,
+	type StoredRecord,
+	type StoredSession,
+} from "@ker-ai/store";
 import { Value } from "@sinclair/typebox/value";
-import { createDaemon, type DaemonOptions, type Harness } from "../src/index.ts";
-import { type Definition, type Payload, SessionStore, type StoredRecord } from "../src/store.ts";
+import type { DaemonOptions, Harness } from "../src/index.ts";
+import { startTestRuntime } from "./runtime.ts";
 
 const LOCAL_HOST = "127.0.0.1:5537";
+const NODE_ID = "00000000-0000-4000-8000-000000000001";
 const PRUNED_OUTPUT_PLACEHOLDER =
 	"[Old tool output removed to free context space. Re-read the file or re-run the command if you still need it.]";
 const DEFINITION: Definition = {
@@ -25,6 +33,46 @@ const DEFINITION: Definition = {
 		updateInstructions: "Update summary instructions",
 	},
 };
+const runtimeClosers = new WeakMap<TestContext, Set<() => Promise<void>>>();
+
+function test(
+	name: string,
+	optionsOrRun: TestOptions | ((context: TestContext) => Promise<void> | void),
+	maybeRun?: (context: TestContext) => Promise<void> | void,
+): void {
+	const options = typeof optionsOrRun === "function" ? {} : optionsOrRun;
+	const run = typeof optionsOrRun === "function" ? optionsOrRun : maybeRun;
+	if (!run) throw new Error(`Test ${name} has no callback`);
+	void nodeTest(name, options, async (context) => {
+		try {
+			await run(context);
+		} finally {
+			await Promise.all([...(runtimeClosers.get(context) ?? new Set()).values()].map((close) => close()));
+		}
+	});
+}
+
+class SessionStore extends BaseSessionStore {
+	async create(cwd: string, definition: Definition): Promise<StoredSession> {
+		const canonicalCwd = await canonicalDirectory(cwd);
+		const projectRoot = await canonicalProjectRoot(canonicalCwd);
+		const now = new Date().toISOString();
+		const session: Protocol.SessionDescriptor = {
+			id: randomUUID(),
+			nodeId: NODE_ID,
+			cwd: canonicalCwd,
+			projectRoot,
+			createdAt: now,
+			updatedAt: now,
+		};
+		const log = await this.createLog(projectRoot, session.id);
+		const records = await log.append([
+			{ type: "session", session },
+			{ type: "definition", ...definition },
+		]);
+		return { log, records, session: { ...session, updatedAt: records.at(-1)?.at ?? now } };
+	}
+}
 
 test("creates and lists explicit durable sessions", async (t) => {
 	const running = await startServer(t, immediateFactory());
@@ -276,6 +324,7 @@ test("creates a project session at its workspace root", async (t) => {
 		projectName: project.name,
 		workspaceId: created.workspaceId,
 		nodeId: created.nodeId,
+		nodeName: created.nodeName,
 		title: null,
 		createdAt: created.createdAt,
 		updatedAt: created.updatedAt,
@@ -386,6 +435,8 @@ test("lists, adds, canonicalizes, and conflicts project workspaces", async (t) =
 		id: created.id,
 		projectId: firstProject.id,
 		nodeId: created.nodeId,
+		nodeName: created.nodeName,
+		nodeConnected: true,
 		rootPath: await realpath(cloneRoot),
 		gitRemote: "clone.git",
 		createdAt: created.createdAt,
@@ -637,9 +688,10 @@ test("creates, filters, and restores sessions from multiple projects", async (t)
 	assert.equal(restoredB?.projectId, listedB?.projectId);
 	assert.equal(restoredB?.workspaceId, listedB?.workspaceId);
 	assert.deepEqual(restoredCwds, []);
-	await getSnapshot(second.url, sessionA.id);
-	await getSnapshot(second.url, otherSessionA.id);
-	await getSnapshot(second.url, sessionB.id);
+	for (const id of [sessionA.id, otherSessionA.id, sessionB.id]) {
+		const attached = await compact(second.url, id);
+		await waitForTerminal(second.url, id, attached.turnId);
+	}
 	assert.deepEqual(new Set(restoredCwds), new Set([canonicalProjectA, canonicalOtherCwdA, canonicalProjectB]));
 	const retargetedResponse = await localFetch(
 		`${second.url}/sessions/${sessionA.id}?cwd=${encodeURIComponent(projectB)}`,
@@ -946,7 +998,7 @@ test("cancels a whole waiting turn without aborting the running turn", async (t)
 	assert.equal((await getSnapshot(running.url, session.id)).queue.revision, afterCancellation.queue.revision);
 	controlled.release(0);
 	await controlled.finished(0);
-	const snapshot = await getSnapshot(running.url, session.id);
+	const snapshot = await waitForIdle(running.url, session.id);
 	assert.equal(snapshot.turns.find((turn) => turn.id === waiting.turnId)?.status, "cancelled");
 	assert.deepEqual(controlled.initials, ["A"]);
 });
@@ -1000,7 +1052,7 @@ test("active cancellation becomes durable and returns before cleanup", async (t)
 	);
 	await frames.return?.(undefined);
 
-	const snapshot = await getSnapshot(running.url, session.id);
+	const snapshot = await waitForIdle(running.url, session.id);
 	assert.equal(snapshot.messages.length, 1);
 	assert.deepEqual(
 		{ ...snapshot.messages[0], id: undefined },
@@ -1210,9 +1262,11 @@ test("reloading appends a definition only when model-visible settings change", a
 
 	const second = await startServer(t, immediateFactory(), { sessionDir }, false);
 	await getSnapshot(second.url, session.id);
+	const secondCompaction = await compact(second.url, session.id);
+	await waitForTerminal(second.url, session.id, secondCompaction.turnId);
 	await second.close();
 	const unchanged = await store.loadSession(initial.log.path);
-	assert.equal(unchanged.records.length, initial.records.length);
+	assert.equal(unchanged.records.filter((record) => record.type === "definition").length, 1);
 
 	const changedDefinition: Definition = { ...DEFINITION, systemPrompt: "Changed system prompt" };
 	const third = await startServer(
@@ -1222,10 +1276,12 @@ test("reloading appends a definition only when model-visible settings change", a
 		false,
 	);
 	await getSnapshot(third.url, session.id);
+	const thirdCompaction = await compact(third.url, session.id);
+	await waitForTerminal(third.url, session.id, thirdCompaction.turnId);
 	await third.close();
 	const changed = await store.loadSession(initial.log.path);
-	assert.equal(changed.records.length, initial.records.length + 1);
-	const latest = changed.records.at(-1);
+	assert.equal(changed.records.filter((record) => record.type === "definition").length, 2);
+	const latest = changed.records.findLast((record) => record.type === "definition");
 	assert.equal(latest?.type, "definition");
 	if (latest?.type === "definition") assert.equal(latest.systemPrompt, "Changed system prompt");
 });
@@ -1277,6 +1333,8 @@ test("reasoning summaries survive replay without exposing encrypted reasoning", 
 	const captured: Engine.HarnessState[] = [];
 	const second = await startServer(t, passiveFactory(captured), { sessionDir }, false);
 	const snapshot = await getSnapshot(second.url, session.id);
+	const attached = await compact(second.url, session.id);
+	await waitForTerminal(second.url, session.id, attached.turnId);
 	const entry = snapshot.entries.find((candidate) => candidate.role === "assistant");
 	assert.equal(entry?.role, "assistant");
 	if (entry?.role === "assistant") {
@@ -1334,6 +1392,8 @@ test("assistant reasoning effort survives persistence and replay without crossin
 	const captured: Engine.HarnessState[] = [];
 	const second = await startServer(t, passiveFactory(captured), { sessionDir }, false);
 	const snapshot = await getSnapshot(second.url, session.id);
+	const attached = await compact(second.url, session.id);
+	await waitForTerminal(second.url, session.id, attached.turnId);
 	const restored = captured[0]?.messages.find((message) => message.role === "assistant");
 	assert.equal(restored?.role, "assistant");
 	if (restored?.role === "assistant") assert.equal(restored.reasoningEffort, "high");
@@ -1455,6 +1515,8 @@ test("tool status and details survive persistence and replay", async (t) => {
 		rebuilt.entries.filter((entry) => entry.role === "tool"),
 		liveTools,
 	);
+	const attached = await compact(second.url, session.id);
+	await waitForTerminal(second.url, session.id, attached.turnId);
 	assert.deepEqual(
 		captured[0]?.messages.filter((message) => message.role === "tool"),
 		[
@@ -1559,6 +1621,8 @@ test("restored sessions configure their harness with the recorded cwd", async (t
 	);
 
 	await getSnapshot(running.url, session.session.id);
+	const attached = await compact(running.url, session.session.id);
+	await waitForTerminal(running.url, session.session.id, attached.turnId);
 	assert.deepEqual(captured, [canonicalCwd]);
 });
 
@@ -1850,7 +1914,7 @@ test("restart drains stale waiting work before finalizing the interrupted turn",
 	assert.deepEqual(snapshot.queue.waiting, []);
 });
 
-test("restart constructs harnesses only for sessions with pending work", async (t) => {
+test("restart constructs harnesses for pending work and leaves read-only sessions projected", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-lazy-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const first = await startServer(t, immediateFactory(), { sessionDir }, false);
@@ -1875,12 +1939,15 @@ test("restart constructs harnesses only for sessions with pending work", async (
 	await waitForTerminal(second.url, seeded.session.session.id, "turn-1");
 	assert.equal(constructions, 1);
 	const snapshot = await getSnapshot(second.url, idleSession.id);
-	assert.equal(constructions, 2);
+	assert.equal(constructions, 1);
 	assert.deepEqual(
 		snapshot.messages.map((message) => message.text),
 		["answer:done"],
 	);
 	assert(snapshot.entries.length >= 2);
+	const attached = await compact(second.url, idleSession.id);
+	await waitForTerminal(second.url, idleSession.id, attached.turnId);
+	assert.equal(constructions, 2);
 	await second.close();
 });
 
@@ -1919,7 +1986,7 @@ test("corruption behind an idle-looking tail surfaces at attach", async (t) => {
 	const store = new SessionStore({ baseDir: sessionDir });
 	const session = await store.create(process.cwd(), DEFINITION);
 	const tail = JSON.stringify({
-		version: 5,
+		version: 6,
 		recordId: "tail",
 		previousRecordId: "missing",
 		at: "2026-01-01T00:00:00.000Z",
@@ -2134,6 +2201,16 @@ test("a non-positive automatic trigger skips compaction and pruning while manual
 				provider: "openai",
 				model: "gpt-5.4-mini",
 				usage,
+			},
+		},
+		{
+			type: "stats",
+			contextTokens: 100,
+			model: {
+				provider: "openai",
+				id: "gpt-5.4-mini",
+				contextWindow: 272_000,
+				maxOutputTokens: 128_000,
 			},
 		},
 		{
@@ -2568,6 +2645,16 @@ test("an over-ceiling idle session compacts before admitting its next prompt", a
 			},
 		},
 		{
+			type: "stats",
+			contextTokens: 100,
+			model: {
+				provider: "openai",
+				id: "gpt-5.4-mini",
+				contextWindow: 272_000,
+				maxOutputTokens: 128_000,
+			},
+		},
+		{
 			type: "event",
 			event: {
 				actor: "process",
@@ -2832,6 +2919,8 @@ test("replay applies prune records and strips stale assistant metadata", async (
 	const captured: Engine.HarnessState[] = [];
 	const running = await startServer(t, passiveFactory(captured), { sessionDir });
 	await getSnapshot(running.url, session.session.id);
+	const attached = await compact(running.url, session.session.id);
+	await waitForTerminal(running.url, session.session.id, attached.turnId);
 
 	const assistant = captured[0]?.messages[0];
 	assert.equal(assistant?.role, "assistant");
@@ -2867,6 +2956,8 @@ test("ordered replay keeps pruned output through compaction in either record ord
 		const captured: Engine.HarnessState[] = [];
 		const running = await startServer(t, passiveFactory(captured), { sessionDir });
 		await getSnapshot(running.url, session.session.id);
+		const attached = await compact(running.url, session.session.id);
+		await waitForTerminal(running.url, session.session.id, attached.turnId);
 
 		assert.deepEqual(captured[0]?.messages, liveProjection);
 	}
@@ -2910,7 +3001,7 @@ test("a log ending on a pruned event replays consistently during recovery", asyn
 	assert.equal(catalog.idle, false);
 });
 
-test("replay projects a v5 compaction while preserving every transcript entry", async (t) => {
+test("replay projects a stored compaction while preserving every transcript entry", async (t) => {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-compaction-replay-"));
 	t.after(() => rm(sessionDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir: sessionDir });
@@ -3004,6 +3095,8 @@ test("replay projects a v5 compaction while preserving every transcript entry", 
 	const captured: Engine.HarnessState[] = [];
 	const running = await startServer(t, passiveFactory(captured), { sessionDir });
 	const snapshot = await getSnapshot(running.url, session.session.id);
+	const attached = await compact(running.url, session.session.id);
+	await waitForTerminal(running.url, session.session.id, attached.turnId);
 
 	assert.deepEqual(
 		snapshot.entries.map((entry) => entry.role),
@@ -3583,6 +3676,16 @@ async function seedPrunableSession(store: SessionStore) {
 			},
 		},
 		{
+			type: "stats",
+			contextTokens: Engine.estimateContextTokens(messages),
+			model: {
+				provider: "openai",
+				id: "gpt-5.4-mini",
+				contextWindow: 272_000,
+				maxOutputTokens: 128_000,
+			},
+		},
+		{
 			type: "event",
 			event: {
 				actor: "process",
@@ -3924,10 +4027,19 @@ async function startServer(
 ): Promise<{ url: string; close: () => Promise<void> }> {
 	const sessionDir = options.sessionDir ?? (await mkdtemp(join(tmpdir(), "ker-daemon-")));
 	if (!options.sessionDir) t.after(() => rm(sessionDir, { recursive: true, force: true }));
-	const server = createDaemon({
+	await mkdir(sessionDir, { recursive: true });
+	const nodePath = options.nodePath ?? join(sessionDir, "node.json");
+	await writeFile(
+		nodePath,
+		`${JSON.stringify({ id: NODE_ID, name: "test-node", createdAt: "2026-01-01T00:00:00.000Z" })}\n`,
+		{ flag: "wx" },
+	).catch((error: unknown) => {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	});
+	const running = await startTestRuntime({
 		sessionDir,
 		catalogPath: options.catalogPath ?? join(sessionDir, "catalog.db"),
-		nodePath: options.nodePath ?? join(sessionDir, "node.json"),
+		nodePath,
 		harnessFactory,
 		definition: options.definition ?? (() => structuredClone(DEFINITION)),
 		eventTailSize: options.eventTailSize,
@@ -3940,19 +4052,13 @@ async function startServer(
 		},
 		guiDir: options.guiDir,
 	});
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(0, "127.0.0.1", resolve);
-	});
-	const address = server.address();
-	assert(address && typeof address !== "string");
-	const close = async () => {
-		await server.shutdown();
-		server.closeAllConnections();
-		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-	};
-	if (autoClose) t.after(close);
-	return { url: `http://127.0.0.1:${(address as AddressInfo).port}`, close };
+	const close = running.stop;
+	if (autoClose) {
+		const closers = runtimeClosers.get(t) ?? new Set<() => Promise<void>>();
+		closers.add(close);
+		runtimeClosers.set(t, closers);
+	}
+	return { url: running.url, close };
 }
 
 async function createSession(url: string, cwd = process.cwd()): Promise<Protocol.SessionDescriptor> {
@@ -4020,6 +4126,12 @@ function rawCompact(url: string, sessionId: string, body: object): Promise<TestR
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
+}
+
+async function compact(url: string, sessionId: string): Promise<Protocol.CompactionAdmission> {
+	const response = await rawCompact(url, sessionId, {});
+	assert.equal(response.status, 202);
+	return readJson(response.body);
 }
 
 async function corruptLeafPage(path: string, table: string): Promise<void> {

@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { request } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 import type * as Engine from "@ker-ai/engine";
 import * as Protocol from "@ker-ai/protocol";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
-import { createDaemon, type Daemon, type DaemonOptions } from "../src/index.ts";
+import type { DaemonOptions } from "../src/index.ts";
+import { startTestRuntime } from "./runtime.ts";
 
 test("a project archive round-trips through two daemons and re-import skips existing data", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "ker-export-import-"));
@@ -339,7 +339,7 @@ async function startServer(
 	root: string,
 	options: Pick<DaemonOptions, "harnessFactory" | "compaction"> = {},
 ): Promise<{ url: string; stop: () => Promise<void> }> {
-	const server = createDaemon({
+	const running = await startTestRuntime({
 		sessionDir: join(root, "sessions"),
 		catalogPath: join(root, "catalog.db"),
 		nodePath: join(root, "node.json"),
@@ -356,26 +356,14 @@ async function startServer(
 		recoveryWindowMinutes: Number.MAX_SAFE_INTEGER,
 		compaction: options.compaction ?? { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(0, "127.0.0.1", resolve);
-	});
 	let stopped = false;
 	const stop = async () => {
 		if (stopped) return;
 		stopped = true;
-		await stopServer(server);
+		await running.stop();
 	};
 	t.after(stop);
-	const address = server.address();
-	assert(address && typeof address !== "string");
-	return { url: `http://127.0.0.1:${(address as AddressInfo).port}`, stop };
-}
-
-async function stopServer(server: Daemon): Promise<void> {
-	await server.shutdown();
-	server.closeAllConnections();
-	await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+	return { url: running.url, stop };
 }
 
 function immediateFactory(): NonNullable<DaemonOptions["harnessFactory"]> {

@@ -202,6 +202,7 @@ function snapshot(): Protocol.SessionSnapshot {
 	return {
 		session: {
 			id: "session-1",
+			nodeId: "node-1",
 			cwd: process.cwd(),
 			projectRoot: process.cwd(),
 			createdAt: "2026-01-01T00:00:00.000Z",

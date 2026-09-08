@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { type IncomingMessage, request } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 import * as Protocol from "@ker-ai/protocol";
 import { type RouteDefinition, type RouteKey, routes } from "@ker-ai/protocol/routes";
 import { Value } from "@sinclair/typebox/value";
-import { createDaemon, type DaemonOptions } from "../src/index.ts";
+import type { DaemonOptions } from "../src/index.ts";
+import { startTestRuntime } from "./runtime.ts";
 
 const LOCAL_HOST = `127.0.0.1:${Protocol.DEFAULT_PORT}`;
 
@@ -17,6 +17,18 @@ test("daemon responses conform to the route table", async (t) => {
 	const running = await startServer(t);
 	await assertJson("health", await localFetch(`${running.url}/health`), 200);
 	await assertJson("openapi", await localFetch(`${running.url}/openapi.json`), 200);
+	const nodes = await assertJson<Protocol.ListNodesResponse>(
+		"listNodes",
+		await localFetch(`${running.url}/nodes`),
+		200,
+	);
+	const node = nodes.nodes[0];
+	assert(node);
+	await assertJson<Protocol.Enrollment>(
+		"createEnrollment",
+		await localFetch(`${running.url}/nodes/enrollments`, { method: "POST" }),
+		201,
+	);
 
 	const session = await assertJson<Protocol.SessionDescriptor>(
 		"createSession",
@@ -36,7 +48,13 @@ test("daemon responses conform to the route table", async (t) => {
 	assert(project);
 	await assertJson("getProject", await localFetch(`${running.url}/projects/${project.id}`), 200);
 	await assertJson("getProject", await localFetch(`${running.url}/projects/missing`), 404);
-	await assertJson("listWorkspaces", await localFetch(`${running.url}/projects/${project.id}/workspaces`), 200);
+	const workspaces = await assertJson<Protocol.ListWorkspacesResponse>(
+		"listWorkspaces",
+		await localFetch(`${running.url}/projects/${project.id}/workspaces`),
+		200,
+	);
+	const workspace = workspaces.workspaces[0];
+	assert(workspace);
 	await assertJson(
 		"createWorkspace",
 		await localFetch(`${running.url}/projects/${project.id}/workspaces`, {
@@ -45,6 +63,16 @@ test("daemon responses conform to the route table", async (t) => {
 			body: JSON.stringify({ path: process.cwd() } satisfies Protocol.WorkspaceRequest),
 		}),
 		200,
+	);
+	await assertJson(
+		"createWorkspaceSession",
+		await localFetch(`${running.url}/workspaces/${workspace.id}/sessions`, { method: "POST" }),
+		201,
+	);
+	await assertJson(
+		"createWorkspaceSession",
+		await localFetch(`${running.url}/workspaces/missing/sessions`, { method: "POST" }),
+		404,
 	);
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/${project.id}/sessions`), 200);
 	await assertJson("listProjectSessions", await localFetch(`${running.url}/projects/missing/sessions`), 404);
@@ -180,6 +208,8 @@ test("daemon responses conform to the route table", async (t) => {
 	const unknown = await localFetch(`${running.url}/missing`);
 	assert.equal(unknown.status, 404);
 	assert(Value.Check(Protocol.ErrorBody, await readJson(unknown.body)));
+	await assertJson("revokeNode", await localFetch(`${running.url}/nodes/missing/revoke`, { method: "POST" }), 404);
+	await assertJson("revokeNode", await localFetch(`${running.url}/nodes/${node.id}/revoke`, { method: "POST" }), 200);
 });
 
 async function assertJson<T = unknown>(key: RouteKey, response: TestResponse, status: number): Promise<T> {
@@ -193,7 +223,7 @@ async function assertJson<T = unknown>(key: RouteKey, response: TestResponse, st
 
 async function startServer(t: TestContext): Promise<{ url: string }> {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-daemon-contract-"));
-	const server = createDaemon({
+	const running = await startTestRuntime({
 		sessionDir,
 		catalogPath: join(sessionDir, "catalog.db"),
 		nodePath: join(sessionDir, "node.json"),
@@ -210,19 +240,11 @@ async function startServer(t: TestContext): Promise<{ url: string }> {
 		recoveryWindowMinutes: Number.MAX_SAFE_INTEGER,
 		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(0, "127.0.0.1", resolve);
-	});
 	t.after(async () => {
-		await server.shutdown();
-		server.closeAllConnections();
-		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+		await running.stop();
 		await rm(sessionDir, { recursive: true, force: true });
 	});
-	const address = server.address();
-	assert(address && typeof address !== "string");
-	return { url: `http://127.0.0.1:${(address as AddressInfo).port}` };
+	return { url: running.url };
 }
 
 function immediateFactory(): NonNullable<DaemonOptions["harnessFactory"]> {

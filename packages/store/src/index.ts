@@ -1,15 +1,12 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
-import { appendFile, mkdir, open, opendir, readFile, realpath, stat } from "node:fs/promises";
+import { appendFile, mkdir, open, opendir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, parse } from "node:path";
-import type * as Engine from "@ker-ai/engine";
-import type * as Llm from "@ker-ai/llm";
-import type * as Protocol from "@ker-ai/protocol";
+import { dirname, join } from "node:path";
+import * as Protocol from "@ker-ai/protocol";
 
-export const STORE_VERSION = 5 as const;
+export const STORE_VERSION = 6 as const;
 export const SESSION_FILE = "session.jsonl";
-export const PROJECT_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const HEADER_SCAN_BYTES = 8_192;
 const TAIL_SCAN_BYTES = 8_192;
 
@@ -26,12 +23,53 @@ export interface SessionRecord extends RecordBase {
 	session: Protocol.SessionDescriptor;
 }
 
+export interface Tool {
+	name: string;
+	description: string;
+	parameters: Record<string, unknown>;
+}
+
+export interface ToolCall {
+	callId: string;
+	itemId?: string;
+	name: string;
+	arguments: string;
+}
+
+export type Message =
+	| { role: "user"; content: string }
+	| { role: "developer"; content: string }
+	| {
+			role: "assistant";
+			content: string;
+			toolCalls?: ToolCall[];
+			reasoning?: unknown[];
+			reasoningSummary?: string;
+			provider?: Protocol.Provider;
+			model?: string;
+			usage?: Protocol.Usage;
+			reasoningEffort?: Protocol.ReasoningEffort;
+	  }
+	| {
+			role: "tool";
+			toolCallId: string;
+			content: string;
+			status: "ok" | "error";
+			details?: Protocol.ToolDetails;
+	  };
+
+export interface CompactionTemplate {
+	systemPrompt: string;
+	initialInstructions: string;
+	updateInstructions: string;
+}
+
 // The model-visible prompts and tool schemas. Stored definitions preserve what later turns used
 // when the executable definition differs.
 export interface Definition {
 	systemPrompt: string;
-	tools: Llm.Tool[];
-	compaction: Engine.CompactionTemplate;
+	tools: Tool[];
+	compaction: CompactionTemplate;
 }
 
 export interface DefinitionRecord extends RecordBase, Definition {
@@ -49,7 +87,7 @@ export interface ConversationRecord extends RecordBase {
 	parentId: string | null;
 	turnId: Protocol.TurnId;
 	messageId?: Protocol.MessageId;
-	message: Engine.HarnessState["messages"][number];
+	message: Message;
 }
 
 export interface IdentityRecord extends RecordBase {
@@ -80,6 +118,12 @@ export interface PruneRecord extends RecordBase {
 	tokensAfter: number;
 }
 
+export interface StatsRecord extends RecordBase {
+	type: "stats";
+	contextTokens: number;
+	model: Protocol.Model | null;
+}
+
 export type StoredRecord =
 	| SessionRecord
 	| DefinitionRecord
@@ -88,7 +132,8 @@ export type StoredRecord =
 	| IdentityRecord
 	| AssistantRecord
 	| CompactionRecord
-	| PruneRecord;
+	| PruneRecord
+	| StatsRecord;
 
 export type Payload =
 	| { type: "session"; session: Protocol.SessionDescriptor }
@@ -100,7 +145,7 @@ export type Payload =
 			parentId: string | null;
 			turnId: Protocol.TurnId;
 			messageId?: Protocol.MessageId;
-			message: Engine.HarnessState["messages"][number];
+			message: Message;
 	  }
 	| { type: "identity"; identity: Protocol.Identity }
 	| { type: "assistant"; message: Protocol.AssistantMessage }
@@ -119,7 +164,8 @@ export type Payload =
 			toolCallIds: string[];
 			tokensBefore: number;
 			tokensAfter: number;
-	  };
+	  }
+	| { type: "stats"; contextTokens: number; model: Protocol.Model | null };
 
 export interface StoredSession {
 	log: SessionLog;
@@ -144,11 +190,17 @@ export interface StoreOptions {
 export class SessionLog {
 	readonly path: string;
 	#lastRecordId: string | null;
+	readonly #recordIds: Set<string>;
 	#pending = Promise.resolve();
 
-	constructor(path: string, lastRecordId: string | null) {
+	constructor(path: string, lastRecordId: string | null, recordIds: Iterable<string> = []) {
 		this.path = path;
 		this.#lastRecordId = lastRecordId;
+		this.#recordIds = new Set(recordIds);
+	}
+
+	get lastRecordId(): string | null {
+		return this.#lastRecordId;
 	}
 
 	append(payloads: Payload[]): Promise<StoredRecord[]> {
@@ -173,7 +225,44 @@ export class SessionLog {
 				});
 			}
 			this.#lastRecordId = lastRecordId;
+			for (const record of records) this.#recordIds.add(record.recordId);
 			return records;
+		});
+		this.#pending = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation;
+	}
+
+	appendRecords(records: StoredRecord[]): Promise<{ written: StoredRecord[]; skipped: StoredRecord[] }> {
+		const operation = this.#pending.then(async () => {
+			const written: StoredRecord[] = [];
+			const skipped: StoredRecord[] = [];
+			let lastRecordId = this.#lastRecordId;
+			for (const record of records) {
+				validateRecord(record, this.path);
+				if (this.#recordIds.has(record.recordId)) {
+					skipped.push(record);
+					continue;
+				}
+				if (record.previousRecordId !== lastRecordId) {
+					throw new Error(
+						`Broken record chain in ${this.path}: expected ${lastRecordId ?? "null"}, got ${record.previousRecordId ?? "null"}`,
+					);
+				}
+				written.push(record);
+				lastRecordId = record.recordId;
+			}
+			if (written.length > 0) {
+				await appendFile(this.path, `${written.map((record) => JSON.stringify(record)).join("\n")}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+			}
+			this.#lastRecordId = lastRecordId;
+			for (const record of written) this.#recordIds.add(record.recordId);
+			return { written, skipped };
 		});
 		this.#pending = operation.then(
 			() => undefined,
@@ -190,25 +279,10 @@ export class SessionStore {
 		this.baseDir = options.baseDir ?? defaultSessionDir();
 	}
 
-	async create(cwd: string, definition: Definition): Promise<StoredSession> {
-		const canonicalCwd = await canonicalDirectory(cwd);
-		const projectRoot = await canonicalProjectRoot(canonicalCwd);
-		const now = new Date().toISOString();
-		const session: Protocol.SessionDescriptor = {
-			id: randomUUID(),
-			cwd: canonicalCwd,
-			projectRoot,
-			createdAt: now,
-			updatedAt: now,
-		};
-		const directory = join(this.baseDir, projectKey(projectRoot), session.id);
+	async createLog(projectRoot: string, sessionId: Protocol.SessionId): Promise<SessionLog> {
+		const directory = join(this.baseDir, Protocol.projectKey(projectRoot), sessionId);
 		await mkdir(directory, { recursive: true, mode: 0o700 });
-		const log = new SessionLog(join(directory, SESSION_FILE), null);
-		const records = await log.append([
-			{ type: "session", session },
-			{ type: "definition", ...definition },
-		]);
-		return { log, records, session };
+		return new SessionLog(join(directory, SESSION_FILE), null);
 	}
 
 	logPath(key: string, sessionId: Protocol.SessionId): string {
@@ -249,7 +323,7 @@ export class SessionStore {
 		await mkdir(this.baseDir, { recursive: true, mode: 0o700 });
 		const projects = [];
 		for await (const entry of await opendir(this.baseDir)) {
-			if (entry.isDirectory() && PROJECT_KEY_PATTERN.test(entry.name)) projects.push(entry);
+			if (entry.isDirectory() && Protocol.PROJECT_KEY_PATTERN.test(entry.name)) projects.push(entry);
 		}
 		const sessions: CatalogedSession[] = [];
 		const unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }> = [];
@@ -286,29 +360,15 @@ export class SessionStore {
 		if (!first || first.type !== "session") throw new Error(`Session log ${path} has no session record`);
 		const updatedAt = records.at(-1)?.at ?? first.session.updatedAt;
 		const session = { ...first.session, updatedAt };
-		return { log: new SessionLog(path, records.at(-1)?.recordId ?? null), records, session };
-	}
-}
-
-export async function canonicalDirectory(cwd: string): Promise<string> {
-	if (!isAbsolute(cwd)) throw new Error("Session cwd must be absolute");
-	const canonicalCwd = await realpath(cwd);
-	if (!(await stat(canonicalCwd)).isDirectory()) throw new Error("Session cwd must be a directory");
-	return canonicalCwd;
-}
-
-// Walks up from an already-canonical directory to the nearest ancestor containing
-// .git; returns the directory itself when no repository is found.
-export async function canonicalProjectRoot(canonicalCwd: string): Promise<string> {
-	const root = parse(canonicalCwd).root;
-	for (let candidate = canonicalCwd; ; candidate = dirname(candidate)) {
-		try {
-			await stat(join(candidate, ".git"));
-			return candidate;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		if (candidate === root) return canonicalCwd;
+		return {
+			log: new SessionLog(
+				path,
+				records.at(-1)?.recordId ?? null,
+				records.map((record) => record.recordId),
+			),
+			records,
+			session,
+		};
 	}
 }
 
@@ -316,10 +376,6 @@ export function defaultSessionDir(): string {
 	const override = process.env.KER_SESSION_DIR;
 	if (override) return override;
 	return join(homedir(), ".ker", "sessions");
-}
-
-export function projectKey(projectRoot: string): string {
-	return createHash("sha256").update(projectRoot).digest("hex");
 }
 
 // Reads the header line for the descriptor and a bounded tail for idle classification; the
@@ -375,16 +431,28 @@ function isIdleTail(tail: Buffer, tailOffset: number, path: string): boolean {
 	return false;
 }
 
-// A torn final JSON fragment in a v5 log is discarded. Every complete malformed line invalidates the session.
-async function readRecords(path: string): Promise<StoredRecord[]> {
+// A torn final JSON fragment is discarded. Every complete malformed line invalidates the session.
+export async function readRecords(path: string): Promise<StoredRecord[]> {
+	return readRecordsWithInitial(path, null);
+}
+
+export async function readRecordFragment(path: string): Promise<StoredRecord[]> {
+	return readRecordsWithInitial(path, undefined);
+}
+
+async function readRecordsWithInitial(
+	path: string,
+	initialPreviousId: string | null | undefined,
+): Promise<StoredRecord[]> {
 	const contents = await readFile(path);
 	const records: StoredRecord[] = [];
 	let offset = 0;
-	let previousId: string | null = null;
+	let previousId: string | null | undefined = initialPreviousId;
 	for (let newline = contents.indexOf(10, offset); newline !== -1; newline = contents.indexOf(10, offset)) {
 		const line = contents.subarray(offset, newline).toString("utf8");
 		if (!line) throw new Error(`Malformed blank record in ${path}`);
 		const record = parseRecord(line, path);
+		if (previousId === undefined) previousId = record.previousRecordId;
 		if (record.previousRecordId !== previousId) throw new Error(`Broken record chain in ${path}`);
 		records.push(record);
 		previousId = record.recordId;
@@ -409,6 +477,21 @@ async function readRecords(path: string): Promise<StoredRecord[]> {
 	if (record.previousRecordId !== previousId) throw new Error(`Broken record chain in ${path}`);
 	records.push(record);
 	await appendFile(path, "\n", "utf8");
+	return records;
+}
+
+export function parseRecords(contents: string, path = "<memory>"): StoredRecord[] {
+	const records: StoredRecord[] = [];
+	let previousId: string | null = null;
+	const lines = contents.endsWith("\n") ? contents.slice(0, -1).split("\n") : contents.split("\n");
+	if (lines.length === 1 && lines[0] === "") return records;
+	for (const line of lines) {
+		if (!line) throw new Error(`Malformed blank record in ${path}`);
+		const record = parseRecord(line, path);
+		if (record.previousRecordId !== previousId) throw new Error(`Broken record chain in ${path}`);
+		records.push(record);
+		previousId = record.recordId;
+	}
 	return records;
 }
 

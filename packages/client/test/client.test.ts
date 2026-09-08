@@ -23,12 +23,19 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const health = await client.health();
 	assert(health.ok);
 	assert.deepEqual(health.value, { name: "ker", protocol: PROTOCOL_VERSION });
+	const nodes = await client.listNodes();
+	assert(nodes.ok);
+	const nodeId = nodes.value.nodes[0]?.id;
+	assert(nodeId);
+	const enrollment = await client.createEnrollment();
+	assert(enrollment.ok);
+	assert.match(enrollment.value.command, /ker node --server/);
 
 	const document = await client.openapi();
 	assert(document.ok);
 	assert.equal(document.value.openapi, "3.1.0");
 
-	const created = await client.createSession(process.cwd());
+	const created = await client.createSession(process.cwd(), nodeId);
 	assert(created.ok);
 	const session = created.value;
 	const projects = await client.listProjects();
@@ -41,7 +48,7 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const workspaces = await client.listWorkspaces(projectId);
 	assert(workspaces.ok);
 	assert.equal(workspaces.value.workspaces.length, 1);
-	const existingWorkspace = await client.createWorkspace(projectId, { path: process.cwd() });
+	const existingWorkspace = await client.createWorkspace(projectId, { path: process.cwd(), nodeId });
 	assert(existingWorkspace.ok);
 	assert.equal(existingWorkspace.status, 200);
 	assert.equal(existingWorkspace.value.exists, true);
@@ -53,7 +60,7 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 		[session.id],
 	);
 
-	const listed = await client.listSessions({ cwd: process.cwd() });
+	const listed = await client.listSessions({ cwd: process.cwd(), nodeId });
 	assert(listed.ok);
 	assert.deepEqual(
 		listed.value.sessions.map((candidate) => candidate.id),
@@ -62,6 +69,9 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const createdForProject = await client.createProjectSession(projectId);
 	assert(createdForProject.ok);
 	assert.equal(createdForProject.value.projectId, projectId);
+	const createdForWorkspace = await client.createWorkspaceSession(workspaces.value.workspaces[0]?.id ?? "missing");
+	assert(createdForWorkspace.ok);
+	assert.equal(createdForWorkspace.value.workspaceId, workspaces.value.workspaces[0]?.id);
 	const missingProject = await client.createProjectSession("missing");
 	assert.equal(missingProject.ok, false);
 	if (!missingProject.ok) {
@@ -85,7 +95,9 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	const archive = await client.exportProject(projectId);
 	assert(archive.ok);
 	assert.equal(archive.value.type, "application/zip");
-	const imported = await targetClient.importProject(archive.value);
+	const targetNodes = await targetClient.listNodes();
+	assert(targetNodes.ok);
+	const imported = await targetClient.importProject(archive.value, targetNodes.value.nodes[0]?.id);
 	assert(imported.ok);
 	assert.equal(imported.value.created, true);
 	assert.deepEqual(imported.value.documents, { imported: 1, skipped: 0 });
@@ -149,6 +161,9 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 		assert.equal(missingStream.status, 404);
 		assert.equal(missingStream.error.code, "session_not_found");
 	}
+	const revoked = await client.revokeNode(nodeId);
+	assert(revoked.ok);
+	assert(revoked.value.revokedAt);
 });
 
 test("attach yields a snapshot and a live streamed turn", async (t) => {

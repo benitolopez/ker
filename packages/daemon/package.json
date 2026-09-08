@@ -14,20 +14,16 @@
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@ker-ai/agent": "^0.0.0",
-    "@ker-ai/auth": "^0.0.0",
-    "@ker-ai/config": "^0.0.0",
-    "@ker-ai/engine": "^0.0.0",
-    "@ker-ai/gui": "^0.0.0",
-    "@ker-ai/llm": "^0.0.0",
-    "@ker-ai/protocol": "^0.0.0",
-    "@sinclair/typebox": "0.34.41",
-    "drizzle-orm": "1.0.0-rc.4",
-    "fflate": "0.8.3"
+	"@ker-ai/node": "^0.0.0",
+	"@ker-ai/server": "^0.0.0"
   },
+	"devDependencies": {
+		"@ker-ai/protocol": "^0.0.0",
+		"@ker-ai/store": "^0.0.0"
+	},
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
     "clean": "shx rm -rf dist",
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts && KER_TEST_MODE=remote node --test test/server.test.ts test/contract.test.ts test/export-import.test.ts"
   }
 }

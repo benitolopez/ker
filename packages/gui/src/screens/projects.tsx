@@ -77,6 +77,12 @@ export function ProjectsScreen({
 					<h1 className="text-4xl font-semibold tracking-[-0.04em] text-[var(--text)] sm:text-5xl">Projects</h1>
 				</div>
 				<div className="flex items-center gap-3">
+					<a
+						className="rounded-xl border border-[var(--line)] bg-[var(--surface)] px-4 py-2.5 text-sm font-semibold text-[var(--text)] shadow-[var(--shadow)]"
+						href={formatRoute({ screen: "nodes" })}
+					>
+						Nodes
+					</a>
 					<label className="cursor-pointer rounded-xl border border-[var(--line)] bg-[var(--surface)] px-4 py-2.5 text-sm font-semibold text-[var(--text)] shadow-[var(--shadow)]">
 						{importing ? "Importing…" : "Import"}
 						<input

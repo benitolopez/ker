@@ -1,30 +1,23 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
-import { join } from "node:path";
 import * as Agent from "@ker-ai/agent";
 import * as Auth from "@ker-ai/auth";
 import type * as Config from "@ker-ai/config";
 import * as Engine from "@ker-ai/engine";
 import * as Llm from "@ker-ai/llm";
 import type * as Protocol from "@ker-ai/protocol";
-import { loadNodeIdentity, type NodeIdentity } from "./identity.ts";
-import {
-	type AssistantRecord,
-	type CompactionRecord,
-	type ConversationRecord,
-	canonicalDirectory,
-	canonicalProjectRoot,
-	type Definition,
-	type DefinitionRecord,
-	type EventRecord,
-	type IdentityRecord,
-	type Payload,
-	SESSION_FILE,
-	type SessionStore,
-	type StoredRecord,
-	type StoredSession,
-} from "./store.ts";
+import type {
+	CompactionRecord,
+	ConversationRecord,
+	Definition,
+	DefinitionRecord,
+	EventRecord,
+	IdentityRecord,
+	Payload,
+	StoredRecord,
+} from "@ker-ai/store";
+import type { NodeIdentity } from "./identity.ts";
+import { canonicalDirectory, canonicalProjectRoot, observeGitRemote } from "./paths.ts";
 
 const INTERRUPTED_HISTORY_MARKER =
 	"The previous turn was interrupted by a daemon restart. Tools may have partially executed.";
@@ -42,38 +35,35 @@ export interface Harness {
 	snapshot(): Engine.HarnessState;
 }
 
-export interface SessionChange {
-	sessionId: Protocol.SessionId;
-	updatedAt: string;
-	status: "idle" | "busy";
-	firstUserText?: string;
+export interface NodePlane {
+	load(sessionId: Protocol.SessionId): Promise<StoredRecord[]>;
+	append(sessionId: Protocol.SessionId, payloads: Payload[]): Promise<StoredRecord[]>;
+	publish(sessionId: Protocol.SessionId, event: Protocol.TurnEvent): void;
 }
 
 export interface NodeOptions {
-	store: SessionStore;
-	nodePath: string;
+	plane: NodePlane;
+	identity: NodeIdentity;
 	harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	definition: (cwd: string) => Definition;
-	eventTailSize: number;
 	recoveryWindowMinutes: number;
 	compaction: Config.CompactionSettings;
-	onSessionChange: (change: SessionChange) => void;
 }
 
-export interface Scan {
-	sessions: Array<{ session: Protocol.SessionDescriptor; projectKey: string; idle: boolean }>;
-	unreadable: Array<{ id: Protocol.SessionId; projectKey: string; error: string }>;
+export class UnknownSessionError extends Error {
+	readonly name = "UnknownSessionError";
 }
 
-export class UnknownSessionError extends Error {}
-
-export class InvalidCwdError extends Error {}
+export class InvalidCwdError extends Error {
+	readonly name = "InvalidCwdError";
+}
 
 export class SessionUnreadableError extends Error {
 	readonly sessionId: Protocol.SessionId;
 
 	constructor(sessionId: Protocol.SessionId, message: string) {
 		super(message);
+		this.name = "SessionUnreadableError";
 		this.sessionId = sessionId;
 	}
 }
@@ -90,87 +80,49 @@ interface ActiveTurn {
 }
 
 interface SessionState {
-	stored: StoredSession;
+	stored: { records: StoredRecord[]; session: Protocol.SessionDescriptor };
 	harness: Harness;
 	persistedMessageCount: number;
 	lastConversationEntryId: string | null;
 	identity?: Protocol.Identity;
 	model?: Protocol.Model;
-	cumulativeUsage: Protocol.Usage;
-	messages: Protocol.AssistantMessage[];
 	active?: Protocol.ActiveAssistantMessage;
 	turns: Map<Protocol.TurnId, Protocol.TurnTerminalReason>;
-	epoch: string;
-	sequence: number;
-	tail: Protocol.EventEnvelope[];
-	subscribers: Set<(envelope: Protocol.EventEnvelope) => void>;
 	items: Map<Protocol.QueueItemId, Protocol.QueueItem>;
 	queue: Protocol.QueueSnapshot;
 	queueLock: Promise<void>;
 	activeTurn?: ActiveTurn;
 	compactionAttempted: boolean;
 	compactionBackoffTokens?: number;
-	compactionFailure?: { turnId: Protocol.TurnId; message: string };
 }
 
 export class Node {
-	readonly #store: SessionStore;
+	readonly #plane: NodePlane;
 	readonly #harnessFactory: (state: Engine.HarnessState, cwd: string) => Harness;
 	readonly #definition: (cwd: string) => Definition;
-	readonly #eventTailSize: number;
 	readonly #recoveryWindowMinutes: number;
 	readonly #compaction: Config.CompactionSettings;
-	readonly #onSessionChange: (change: SessionChange) => void;
 	readonly identity: NodeIdentity;
 	readonly #states = new Map<Protocol.SessionId, Promise<SessionState>>();
-	readonly #paths = new Map<Protocol.SessionId, string>();
-	#recoverySessionIds: Protocol.SessionId[] = [];
+	readonly #running = new Map<Protocol.SessionId, ActiveTurn>();
 	#stopping = false;
 
 	constructor(options: NodeOptions) {
-		this.#store = options.store;
+		this.#plane = options.plane;
 		this.#harnessFactory = options.harnessFactory;
 		this.#definition = options.definition;
-		this.#eventTailSize = options.eventTailSize;
 		this.#recoveryWindowMinutes = options.recoveryWindowMinutes;
 		this.#compaction = options.compaction;
-		this.#onSessionChange = options.onSessionChange;
-		this.identity = loadNodeIdentity(options.nodePath);
-	}
-
-	async scan(): Promise<Scan> {
-		const scan = await this.#store.scanCatalog();
-		this.#paths.clear();
-		for (const entry of scan.sessions) this.#paths.set(entry.session.id, entry.path);
-		for (const entry of scan.unreadable) {
-			this.#paths.set(entry.id, join(this.#store.baseDir, entry.projectKey, entry.id, SESSION_FILE));
-		}
-		this.#recoverySessionIds = scan.sessions.filter((entry) => !entry.idle).map((entry) => entry.session.id);
-		return {
-			sessions: scan.sessions.map(({ session, projectKey, idle }) => ({ session, projectKey, idle })),
-			unreadable: scan.unreadable,
-		};
+		this.identity = options.identity;
 	}
 
 	// Runs pending sessions independently so one failed load does not prevent the others from recovering.
-	async recover(): Promise<void> {
-		const results = await Promise.allSettled(
-			this.#recoverySessionIds.map((sessionId) => this.#recoverSession(sessionId)),
-		);
+	async recover(sessionIds: Protocol.SessionId[], imported = false): Promise<void> {
+		const results = await Promise.allSettled(sessionIds.map((sessionId) => this.#recoverSession(sessionId, imported)));
 		const failures: unknown[] = results.flatMap((result) =>
 			result.status === "rejected" ? [result.reason as unknown] : [],
 		);
 		if (failures.length > 0) throw new AggregateError(failures, "Session recovery failed");
-	}
-
-	logPath(sessionId: Protocol.SessionId): string | undefined {
-		return this.#paths.get(sessionId);
-	}
-
-	async registerSession(sessionId: Protocol.SessionId, path: string, options: { recover: boolean }): Promise<void> {
-		if (this.#states.has(sessionId)) return;
-		this.#paths.set(sessionId, path);
-		if (options.recover) await this.#recoverSession(sessionId, true);
 	}
 
 	async folderExists(rootPath: string): Promise<boolean> {
@@ -202,9 +154,22 @@ export class Node {
 		const canonicalCwd = await canonicalDirectory(cwd).catch((error: unknown) => {
 			throw new InvalidCwdError(error instanceof Error ? error.message : String(error));
 		});
-		const stored = await this.#store.create(canonicalCwd, this.#definition(canonicalCwd));
-		this.#paths.set(stored.session.id, stored.log.path);
-		this.#states.set(stored.session.id, Promise.resolve(this.#loadState(stored)));
+		const projectRoot = await canonicalProjectRoot(canonicalCwd);
+		const now = new Date().toISOString();
+		const session: Protocol.SessionDescriptor = {
+			id: randomUUID(),
+			nodeId: this.identity.id,
+			cwd: canonicalCwd,
+			projectRoot,
+			createdAt: now,
+			updatedAt: now,
+		};
+		const records = await this.#plane.append(session.id, [
+			{ type: "session", session },
+			{ type: "definition", ...this.#definition(canonicalCwd) },
+		]);
+		const stored = { records, session: { ...session, updatedAt: records.at(-1)?.at ?? now } };
+		this.#states.set(session.id, Promise.resolve(this.#loadState(stored)));
 		return stored.session;
 	}
 
@@ -220,65 +185,12 @@ export class Node {
 		return observeGitRemote(root);
 	}
 
-	async snapshot(sessionId: Protocol.SessionId): Promise<Protocol.SessionSnapshot> {
-		const state = await this.#state(sessionId);
-		return this.#withQueueLock(state, async () => {
-			const turns = new Map<Protocol.TurnId, Protocol.TurnSnapshot>();
-			for (const [id, status] of state.turns) turns.set(id, { id, status });
-			if (state.queue.running) {
-				turns.set(state.queue.running.turnId, {
-					id: state.queue.running.turnId,
-					status: state.queue.running.state === "cancelling" ? "cancelling" : "running",
-				});
-			}
-			for (const item of state.queue.waiting) turns.set(item.turnId, { id: item.turnId, status: "waiting" });
-			return {
-				session: { ...state.stored.session },
-				identity: state.identity,
-				model: state.model ? { ...state.model } : undefined,
-				usage: {
-					contextTokens: Engine.estimateContextTokens(state.harness.snapshot().messages),
-					cumulative: { ...state.cumulativeUsage },
-				},
-				compactionFailure: state.compactionFailure ? { ...state.compactionFailure } : undefined,
-				entries: state.stored.records.flatMap((record) => {
-					if (record.type === "conversation") return [toConversationEntry(record)];
-					if (record.type === "compaction") return [toCompactionEntry(record)];
-					return [];
-				}),
-				messages: state.messages.map((message) => ({ ...message })),
-				active: state.active ? { ...state.active } : undefined,
-				turns: [...turns.values()],
-				queue: cloneQueue(state.queue),
-				cursor: { epoch: state.epoch, sequence: state.sequence },
-			};
-		});
-	}
-
-	async subscribe(
-		sessionId: Protocol.SessionId,
-		cursor: Protocol.Cursor,
-		listener: (envelope: Protocol.EventEnvelope) => void,
-	): Promise<{ replay: Protocol.EventEnvelope[]; unsubscribe: () => void } | "resync"> {
-		const state = await this.#state(sessionId);
-		const firstSequence = state.tail[0]?.sequence ?? state.sequence + 1;
-		if (cursor.epoch !== state.epoch || cursor.sequence > state.sequence || cursor.sequence < firstSequence - 1) {
-			return "resync";
-		}
-		state.subscribers.add(listener);
-		return {
-			replay: state.tail.filter((envelope) => envelope.sequence > cursor.sequence),
-			unsubscribe: () => state.subscribers.delete(listener),
-		};
-	}
-
+	// Refuses prompts that would exceed the provider window when no queued compaction can shrink it.
 	async admit(sessionId: Protocol.SessionId, text: string): Promise<Protocol.PromptAdmission | "context_exhausted"> {
 		const state = await this.#state(sessionId);
 		return this.#withQueueLock(state, async () => {
 			await this.#maybePrune(state);
 			const compaction = this.#maybeCompactionItem(state);
-			// The provider would reject a request this large, and nothing queued can shrink it, so the
-			// refusal names a way out instead of leaving the turn to fail against the model.
 			const rescued =
 				compaction !== undefined || [state.queue.running, ...state.queue.waiting].some((i) => i?.kind === "compaction");
 			const contextWindow = state.model?.contextWindow;
@@ -448,47 +360,54 @@ export class Node {
 		);
 	}
 
+	running(): Protocol.SessionId[] {
+		return [...this.#running.keys()];
+	}
+
+	async abortSession(sessionId: Protocol.SessionId): Promise<void> {
+		const state = await this.#states.get(sessionId)?.catch(() => undefined);
+		state?.activeTurn?.controller.abort();
+	}
+
 	#state(sessionId: Protocol.SessionId): Promise<SessionState> {
 		const existing = this.#states.get(sessionId);
 		if (existing) return existing;
-		const path = this.#paths.get(sessionId);
-		if (!path) throw new UnknownSessionError(`Unknown session ${sessionId}`);
-		const loading = this.#openState(sessionId, path);
+		const loading = this.#openState(sessionId);
 		this.#states.set(sessionId, loading);
 		return loading;
 	}
 
-	// Replays a session on first attach and leaves failed loads available for later repair.
-	async #openState(sessionId: Protocol.SessionId, path: string): Promise<SessionState> {
+	// Replays a session on first attach; queue snapshots preserve submission times used by recovery expiry.
+	async #openState(sessionId: Protocol.SessionId): Promise<SessionState> {
 		try {
-			const stored = await this.#store.loadSession(path);
+			const records = await this.#plane.load(sessionId);
+			const first = records[0];
+			if (!first || first.type !== "session") throw new UnknownSessionError(`Unknown session ${sessionId}`);
+			const stored = {
+				records: [...records],
+				session: { ...first.session, updatedAt: records.at(-1)?.at ?? first.session.updatedAt },
+			};
 			const current = this.#definition(stored.session.cwd);
 			const last = stored.records.findLast((record): record is DefinitionRecord => record.type === "definition");
 			if (!last || definitionKey(last) !== definitionKey(current)) {
-				const records = await stored.log.append([{ type: "definition", ...current }]);
-				stored.records.push(...records);
-				const updatedAt = records.at(-1)?.at;
+				const appended = await this.#plane.append(sessionId, [{ type: "definition", ...current }]);
+				stored.records.push(...appended);
+				const updatedAt = appended.at(-1)?.at;
 				if (updatedAt) stored.session.updatedAt = updatedAt;
 			}
-			const state = this.#loadState(stored);
-			const submitted = stored.records.find(
-				(record): record is EventRecord => record.type === "event" && record.event.type === "message_submitted",
-			);
-			this.#onSessionChange({
-				sessionId,
-				updatedAt: stored.session.updatedAt,
-				status: state.queue.running || state.queue.waiting.length > 0 ? "busy" : "idle",
-				...(submitted?.event.type === "message_submitted" ? { firstUserText: submitted.event.text } : {}),
-			});
-			return state;
+			return this.#loadState(stored);
 		} catch (error) {
+			if (error instanceof UnknownSessionError) {
+				this.#states.delete(sessionId);
+				throw error;
+			}
 			const message = error instanceof Error ? error.message : String(error);
 			this.#states.delete(sessionId);
 			throw new SessionUnreadableError(sessionId, message);
 		}
 	}
 
-	#loadState(stored: StoredSession): SessionState {
+	#loadState(stored: { records: StoredRecord[]; session: Protocol.SessionDescriptor }): SessionState {
 		const conversation = stored.records.filter(
 			(record): record is ConversationRecord => record.type === "conversation",
 		);
@@ -496,20 +415,7 @@ export class Node {
 		const identity = stored.records.findLast(
 			(record): record is IdentityRecord => record.type === "identity",
 		)?.identity;
-		const messages = stored.records
-			.filter((record): record is AssistantRecord => record.type === "assistant")
-			.map((record) => ({ ...record.message }));
-		const usageEvents = stored.records.flatMap((record) =>
-			record.type === "event" && record.event.type === "usage" ? [record.event] : [],
-		);
-		const latestUsage = usageEvents.at(-1);
-		const cumulativeUsage = usageEvents.reduce((total, event) => addUsage(total, event.usage), {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			total: 0,
-		} satisfies Protocol.Usage);
+		const stats = stored.records.findLast((record) => record.type === "stats");
 		const turns = new Map<Protocol.TurnId, Protocol.TurnTerminalReason>();
 		const items = new Map<Protocol.QueueItemId, Protocol.QueueItem>();
 		let queue: Protocol.QueueSnapshot = { revision: 0, waiting: [] };
@@ -543,8 +449,6 @@ export class Node {
 				queue = normalizeQueue(event.queue);
 			}
 		}
-		// Queue items restore from the queue snapshot, not the submission records: the snapshot
-		// carries each item's original submittedAt, which recovery expiry depends on.
 		const restoredRunning: Protocol.QueueItem | undefined =
 			queue.running && items.has(queue.running.id)
 				? { ...queue.running, state: queue.running.state === "cancelling" ? "cancelling" : "running" }
@@ -566,14 +470,8 @@ export class Node {
 			persistedMessageCount: state.messages.length,
 			lastConversationEntryId: conversation.at(-1)?.id ?? null,
 			identity,
-			model: latestUsage ? Llm.getModel(latestUsage.provider, latestUsage.model) : undefined,
-			cumulativeUsage,
-			messages,
+			model: stats?.type === "stats" ? (stats.model ?? undefined) : undefined,
 			turns,
-			epoch: randomUUID(),
-			sequence: 0,
-			tail: [],
-			subscribers: new Set(),
 			items,
 			queue: { revision: queue.revision, running: restoredRunning, waiting },
 			queueLock: Promise.resolve(),
@@ -591,6 +489,7 @@ export class Node {
 			cancellationRequested: false,
 		};
 		state.activeTurn = turn;
+		this.#running.set(state.stored.session.id, turn);
 		if (item.kind === "compaction") {
 			void this.#runCompaction(state, turn);
 			return;
@@ -647,6 +546,9 @@ export class Node {
 			try {
 				if (!turn.terminal) await this.#completeTurn(state, turn, failureReason ?? "error");
 			} finally {
+				if (this.#running.get(state.stored.session.id) === turn) {
+					this.#running.delete(state.stored.session.id);
+				}
 				turn.done.resolve();
 			}
 		}
@@ -705,7 +607,7 @@ export class Node {
 				if (failure !== undefined) {
 					const message = failure.error instanceof Error ? failure.error.message : String(failure.error);
 					await this.#recordHarnessEvent(state, { actor: "process", ...scope, type: "error", message });
-					this.#backOffCompaction(state, item, message);
+					this.#backOffCompaction(state, item);
 					await this.#finishTurn(state, turn, "error");
 					state.activeTurn = undefined;
 					await this.#advanceQueue(state, item.id);
@@ -753,7 +655,7 @@ export class Node {
 						type: "error",
 						message: gateError,
 					});
-					this.#backOffCompaction(state, item, gateError);
+					this.#backOffCompaction(state, item);
 					await this.#finishTurn(state, turn, "error");
 					state.activeTurn = undefined;
 					await this.#advanceQueue(state, item.id);
@@ -799,6 +701,7 @@ export class Node {
 							firstKeptEntryId: firstKept.id,
 						},
 					},
+					{ type: "stats", contextTokens: outcome.tokensAfter, model: state.model ?? null },
 				]);
 				state.harness = this.#harnessFactory(
 					{ messages: outcome.messages, identity: state.identity },
@@ -806,12 +709,14 @@ export class Node {
 				);
 				state.persistedMessageCount = outcome.messages.length;
 				state.compactionBackoffTokens = undefined;
-				state.compactionFailure = undefined;
 				await this.#finishTurn(state, turn);
 				state.activeTurn = undefined;
 				await this.#advanceQueue(state, item.id);
 			});
 		} finally {
+			if (this.#running.get(state.stored.session.id) === turn) {
+				this.#running.delete(state.stored.session.id);
+			}
 			turn.done.resolve();
 		}
 	}
@@ -867,11 +772,19 @@ export class Node {
 
 	async #recordHarnessEvent(state: SessionState, event: Protocol.TurnEvent): Promise<void> {
 		if (event.type === "message_delta" || event.type === "reasoning_delta") {
-			this.#publishEvent(state, event);
+			this.#applyEvent(state, event);
+			this.#plane.publish(state.stored.session.id, event);
 			return;
 		}
 		const snapshot = state.harness.snapshot();
 		const payloads: Payload[] = [{ type: "event", event }];
+		if (event.type === "usage") {
+			payloads.push({
+				type: "stats",
+				contextTokens: Engine.estimateContextTokens(snapshot.messages),
+				model: Llm.getModel(event.provider, event.model),
+			});
+		}
 		const identityChanged = snapshot.identity && !sameIdentity(snapshot.identity, state.identity);
 		if (identityChanged && snapshot.identity) payloads.push({ type: "identity", identity: snapshot.identity });
 		const addedMessages = snapshot.messages.slice(state.persistedMessageCount);
@@ -904,37 +817,18 @@ export class Node {
 	}
 
 	async #appendAndPublish(state: SessionState, payloads: Payload[]): Promise<void> {
-		const records = await state.stored.log.append(payloads);
+		const records = await this.#plane.append(state.stored.session.id, payloads);
 		state.stored.records.push(...records);
 		const updatedAt = records.at(-1)?.at;
 		if (updatedAt) state.stored.session.updatedAt = updatedAt;
-		if (updatedAt) {
-			this.#onSessionChange({
-				sessionId: state.stored.session.id,
-				updatedAt,
-				status: state.queue.running || state.queue.waiting.length > 0 ? "busy" : "idle",
-			});
-		}
 		for (const record of records) {
 			if (record.type === "assistant") {
-				state.messages.push({ ...record.message });
 				if (state.active?.id === record.message.id) state.active = undefined;
 			}
+			if (record.type === "stats") state.model = record.model ?? undefined;
 			if (record.type !== "event") continue;
-			this.#publishEvent(state, record.event);
+			this.#applyEvent(state, record.event);
 		}
-	}
-
-	#publishEvent(state: SessionState, event: Protocol.Event): void {
-		this.#applyEvent(state, event);
-		const envelope: Protocol.EventEnvelope = {
-			epoch: state.epoch,
-			sequence: ++state.sequence,
-			event,
-		};
-		state.tail.push(envelope);
-		if (state.tail.length > this.#eventTailSize) state.tail.shift();
-		for (const listener of state.subscribers) listener(envelope);
 	}
 
 	#applyEvent(state: SessionState, event: Protocol.Event): void {
@@ -949,7 +843,6 @@ export class Node {
 		}
 		if (event.type === "usage") {
 			state.model = Llm.getModel(event.provider, event.model);
-			state.cumulativeUsage = addUsage(state.cumulativeUsage, event.usage);
 			const compactionPending = [state.queue.running, ...state.queue.waiting].some(
 				(item) => item?.kind === "compaction",
 			);
@@ -1246,6 +1139,7 @@ export class Node {
 					tokensAfter: outcome.tokensAfter,
 				},
 			},
+			{ type: "stats", contextTokens: outcome.tokensAfter, model: state.model ?? null },
 			this.#queueChangedPayload(state),
 		]);
 		state.harness = replacement;
@@ -1279,10 +1173,9 @@ export class Node {
 	// A compaction that failed for a reason the conversation controls repeats identically, so the next
 	// automatic attempt waits until the context has grown halfway to the window. Transient provider
 	// failures skip this and retry on the next turn, paced by compactionAttempted alone.
-	#backOffCompaction(state: SessionState, item: Protocol.CompactionQueueItem, message?: string): void {
+	#backOffCompaction(state: SessionState, item: Protocol.CompactionQueueItem): void {
 		if (item.source !== "auto") return;
 		state.compactionBackoffTokens = Engine.estimateContextTokens(state.harness.snapshot().messages);
-		if (message !== undefined) state.compactionFailure = { turnId: item.turnId, message };
 	}
 
 	#createCompactionItem(
@@ -1387,52 +1280,6 @@ function assistantTerminalPayload(
 	return undefined;
 }
 
-function toConversationEntry(record: ConversationRecord): Protocol.ConversationEntry {
-	const base = {
-		id: record.id,
-		parentId: record.parentId,
-		turnId: record.turnId,
-		messageId: record.messageId,
-	};
-	if (record.message.role === "user" || record.message.role === "developer") {
-		return { ...base, role: record.message.role, content: record.message.content };
-	}
-	if (record.message.role === "tool") {
-		return {
-			...base,
-			role: "tool",
-			toolCallId: record.message.toolCallId,
-			content: record.message.content,
-			status: record.message.status,
-			...(record.message.details === undefined ? {} : { details: record.message.details }),
-		};
-	}
-	return {
-		...base,
-		role: "assistant",
-		content: record.message.content,
-		...(record.message.reasoningSummary === undefined ? {} : { reasoningSummary: record.message.reasoningSummary }),
-		toolCalls: (record.message.toolCalls ?? []).map((call) => ({
-			id: call.callId,
-			name: call.name,
-			arguments: call.arguments,
-		})),
-	};
-}
-
-function toCompactionEntry(record: CompactionRecord): Protocol.ConversationEntry {
-	return {
-		id: record.recordId,
-		parentId: null,
-		turnId: record.turnId,
-		role: "compaction",
-		summary: record.summary,
-		tokensBefore: record.tokensBefore,
-		tokensAfter: record.tokensAfter,
-		firstKeptEntryId: record.firstKeptEntryId,
-	};
-}
-
 // Compares only model-visible definition fields so record ids and timestamps cannot cause a mismatch.
 function definitionKey(definition: Definition): string {
 	return JSON.stringify([
@@ -1460,24 +1307,6 @@ export function createConfiguredHarness(state: Engine.HarnessState, cwd: string,
 	);
 }
 
-async function observeGitRemote(root: string): Promise<string | null> {
-	return new Promise((resolve) => {
-		execFile(
-			"git",
-			["-C", root, "config", "--local", "--get", "remote.origin.url"],
-			{ encoding: "utf8" },
-			(error, stdout) => {
-				if (error) {
-					resolve(null);
-					return;
-				}
-				const remote = stdout.trim();
-				resolve(remote || null);
-			},
-		);
-	});
-}
-
 function normalizeQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {
 	return {
 		revision: queue.revision,
@@ -1497,21 +1326,6 @@ function cloneQueue(queue: Protocol.QueueSnapshot): Protocol.QueueSnapshot {
 		revision: queue.revision,
 		running: queue.running ? { ...queue.running } : undefined,
 		waiting: queue.waiting.map((item) => ({ ...item })),
-	};
-}
-
-function addUsage(left: Protocol.Usage, right: Protocol.Usage): Protocol.Usage {
-	const reasoning =
-		left.reasoning === undefined && right.reasoning === undefined
-			? undefined
-			: (left.reasoning ?? 0) + (right.reasoning ?? 0);
-	return {
-		input: left.input + right.input,
-		output: left.output + right.output,
-		cacheRead: left.cacheRead + right.cacheRead,
-		cacheWrite: left.cacheWrite + right.cacheWrite,
-		...(reasoning === undefined ? {} : { reasoning }),
-		total: left.total + right.total,
 	};
 }
 

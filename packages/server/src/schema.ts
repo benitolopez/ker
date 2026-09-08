@@ -4,6 +4,18 @@ export const node = sqliteTable("node", {
 	id: text().primaryKey(),
 	name: text().notNull(),
 	created_at: text().notNull(),
+	secret_hash: text(),
+	enrolled_at: text(),
+	revoked_at: text(),
+	last_seen_at: text(),
+});
+
+export const enrollment_token = sqliteTable("enrollment_token", {
+	id: text().primaryKey(),
+	token_hash: text().notNull().unique(),
+	created_at: text().notNull(),
+	expires_at: text().notNull(),
+	used_at: text(),
 });
 
 export const project = sqliteTable("project", {
@@ -54,13 +66,24 @@ export const document = sqliteTable("document", {
 	updated_at: text().notNull(),
 });
 
-export const CATALOG_VERSION = 3;
+export const CATALOG_VERSION = 4;
 
 export const DDL = `
 CREATE TABLE node (
 	id TEXT PRIMARY KEY,
 	name TEXT NOT NULL,
-	created_at TEXT NOT NULL
+	created_at TEXT NOT NULL,
+	secret_hash TEXT,
+	enrolled_at TEXT,
+	revoked_at TEXT,
+	last_seen_at TEXT
+) STRICT;
+CREATE TABLE enrollment_token (
+	id TEXT PRIMARY KEY,
+	token_hash TEXT NOT NULL UNIQUE,
+	created_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	used_at TEXT
 ) STRICT;
 CREATE TABLE project (
 	id TEXT PRIMARY KEY,
@@ -133,6 +156,19 @@ CREATE TABLE document (
 	body TEXT NOT NULL,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
+) STRICT;
+`,
+	4: `
+ALTER TABLE node ADD COLUMN secret_hash TEXT;
+ALTER TABLE node ADD COLUMN enrolled_at TEXT;
+ALTER TABLE node ADD COLUMN revoked_at TEXT;
+ALTER TABLE node ADD COLUMN last_seen_at TEXT;
+CREATE TABLE enrollment_token (
+	id TEXT PRIMARY KEY,
+	token_hash TEXT NOT NULL UNIQUE,
+	created_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	used_at TEXT
 ) STRICT;
 `,
 };

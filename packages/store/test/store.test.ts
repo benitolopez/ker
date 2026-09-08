@@ -1,10 +1,51 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, parse } from "node:path";
 import { test } from "node:test";
-import { type Definition, defaultSessionDir, SessionStore } from "../src/store.ts";
+import type * as Protocol from "@ker-ai/protocol";
+import {
+	SessionStore as BaseSessionStore,
+	type Definition,
+	defaultSessionDir,
+	SessionLog,
+	type StoredRecord,
+	type StoredSession,
+} from "../src/index.ts";
+
+class SessionStore extends BaseSessionStore {
+	async create(cwd: string, definition: Definition): Promise<StoredSession> {
+		const canonicalCwd = await realpath(cwd);
+		const root = parse(canonicalCwd).root;
+		let projectRoot = canonicalCwd;
+		for (let candidate = canonicalCwd; ; candidate = dirname(candidate)) {
+			try {
+				await stat(join(candidate, ".git"));
+				projectRoot = candidate;
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (candidate === root) break;
+		}
+		const now = new Date().toISOString();
+		const session: Protocol.SessionDescriptor = {
+			id: randomUUID(),
+			nodeId: "node-1",
+			cwd: canonicalCwd,
+			projectRoot,
+			createdAt: now,
+			updatedAt: now,
+		};
+		const log = await this.createLog(projectRoot, session.id);
+		const records = await log.append([
+			{ type: "session", session },
+			{ type: "definition", ...definition },
+		]);
+		return { log, records, session: { ...session, updatedAt: records.at(-1)?.at ?? now } };
+	}
+}
 
 const DEFINITION: Definition = {
 	systemPrompt: "System prompt",
@@ -15,6 +56,21 @@ const DEFINITION: Definition = {
 		updateInstructions: "Update summary instructions",
 	},
 };
+
+test("appends received records verbatim, skips duplicates, and rejects forks", async (t) => {
+	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-records-"));
+	t.after(() => rm(baseDir, { recursive: true, force: true }));
+	const path = join(baseDir, "session.jsonl");
+	const first = record("record-1", null);
+	const second = record("record-2", first.recordId);
+	const log = new SessionLog(path, null);
+
+	assert.deepEqual(await log.appendRecords([first, second]), { written: [first, second], skipped: [] });
+	assert.equal(log.lastRecordId, second.recordId);
+	assert.deepEqual(await log.appendRecords([first, second]), { written: [], skipped: [first, second] });
+	assert.equal(await readFile(path, "utf8"), `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`);
+	await assert.rejects(() => log.appendRecords([record("fork", first.recordId)]), /Broken record chain/);
+});
 
 test("writes chained versioned records and keeps conversation ancestry explicit", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-"));
@@ -55,7 +111,7 @@ test("writes chained versioned records and keeps conversation ancestry explicit"
 		session.records.map((record) => record.type),
 		["session", "definition"],
 	);
-	assert.equal(session.records[0].version, 5);
+	assert.equal(session.records[0].version, 6);
 	const definition = session.records[1];
 	assert.equal(definition.type, "definition");
 	if (definition.type === "definition") {
@@ -127,7 +183,7 @@ test("truncates only a malformed final partial line", async (t) => {
 	const store = new SessionStore({ baseDir });
 	const session = await store.create(baseDir, DEFINITION);
 	const completeSize = (await stat(session.log.path)).size;
-	await appendFile(session.log.path, '{"version":5,"id":"torn"');
+	await appendFile(session.log.path, '{"version":6,"id":"torn"');
 	const tornSize = (await stat(session.log.path)).size;
 
 	const [entry] = (await store.scanCatalog()).sessions;
@@ -137,26 +193,26 @@ test("truncates only a malformed final partial line", async (t) => {
 	assert.equal((await stat(session.log.path)).size, completeSize);
 });
 
-test("keeps v4 sessions unreadable without changing their bytes", async (t) => {
+test("keeps v5 sessions unreadable without changing their bytes", async (t) => {
 	const baseDir = await mkdtemp(join(tmpdir(), "ker-store-v4-"));
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
 	const session = await store.create(baseDir, DEFINITION);
-	const v4 = `${JSON.stringify({
-		version: 4,
+	const v5 = `${JSON.stringify({
+		version: 5,
 		recordId: "record-1",
 		previousRecordId: null,
 		at: "2026-01-01T00:00:00.000Z",
 		type: "session",
 		session: session.session,
 	})}\n`;
-	await writeFile(session.log.path, v4);
+	await writeFile(session.log.path, v5);
 
 	const scan = await store.scanCatalog();
 	assert.deepEqual(scan.sessions, []);
 	assert.equal(scan.unreadable[0]?.id, session.session.id);
-	assert.match(scan.unreadable[0]?.error ?? "", /Unsupported store version 4/);
-	assert.equal(await readFile(session.log.path, "utf8"), v4);
+	assert.match(scan.unreadable[0]?.error ?? "", /Unsupported store version 5/);
+	assert.equal(await readFile(session.log.path, "utf8"), v5);
 });
 
 test("rejects a malformed complete tail at load without repairing it", async (t) => {
@@ -164,7 +220,7 @@ test("rejects a malformed complete tail at load without repairing it", async (t)
 	t.after(() => rm(baseDir, { recursive: true, force: true }));
 	const store = new SessionStore({ baseDir });
 	const session = await store.create(baseDir, DEFINITION);
-	await appendFile(session.log.path, '{"version":5,}');
+	await appendFile(session.log.path, '{"version":6,}');
 	const before = await readFile(session.log.path);
 
 	const [entry] = (await store.scanCatalog()).sessions;
@@ -344,7 +400,7 @@ test("classifies idle sessions from the final complete record", async (t) => {
 	const midTurn = await store.create(baseDir, DEFINITION);
 	await midTurn.log.append([{ type: "identity", identity: { kind: "apikey" } }]);
 	const torn = await store.create(baseDir, DEFINITION);
-	await appendFile(torn.log.path, '{"version":5');
+	await appendFile(torn.log.path, '{"version":6');
 	const bare = await store.create(baseDir, DEFINITION);
 
 	const idleById = new Map((await store.scanCatalog()).sessions.map((entry) => [entry.session.id, entry.idle]));
@@ -414,3 +470,19 @@ test("uses KER_SESSION_DIR before the user-owned default", (t) => {
 	process.env.KER_SESSION_DIR = join(tmpdir(), "ker-custom-sessions");
 	assert.equal(defaultSessionDir(), join(tmpdir(), "ker-custom-sessions"));
 });
+
+function record(recordId: string, previousRecordId: string | null): StoredRecord {
+	return {
+		version: 6,
+		recordId,
+		previousRecordId,
+		at: "2026-09-08T00:00:00.000Z",
+		type: "event",
+		event: {
+			actor: "process",
+			sessionId: "session-1",
+			type: "queue_changed",
+			queue: { revision: 1, waiting: [] },
+		},
+	};
+}

@@ -329,6 +329,7 @@ function controlPrompt(
 function descriptor(id: Protocol.SessionId, updatedAt = "2026-01-01T00:00:00.000Z"): Protocol.SessionDescriptor {
 	return {
 		id,
+		nodeId: "node-1",
 		cwd: process.cwd(),
 		projectRoot: process.cwd(),
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -349,6 +350,7 @@ function catalogSession(
 		projectName: "project",
 		workspaceId: "workspace-1",
 		nodeId: "node-1",
+		nodeName: "test-node",
 		title: null,
 		createdAt: session.createdAt,
 		updatedAt: session.updatedAt,

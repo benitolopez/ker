@@ -1,8 +1,10 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { createClient, type Result, type Subscription } from "@ker-ai/client";
 import * as Daemon from "@ker-ai/daemon";
+import * as NodeRuntime from "@ker-ai/node";
 import type * as Protocol from "@ker-ai/protocol";
 import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
+import * as Server from "@ker-ai/server";
 import { identityChangeRemediation } from "./error.ts";
 import { runLogin, runLogout } from "./login.ts";
 
@@ -27,6 +29,20 @@ export async function run(): Promise<void> {
 	const json = args.includes("--json");
 	const all = args.includes("--all");
 	const positional = args.filter((arg) => arg !== "--json" && arg !== "--all");
+	if (args.length === 1 && args[0] === "server") {
+		runServer();
+		return;
+	}
+	if (args[0] === "node") {
+		const nodeOptions = parseNodeOptions(args.slice(1));
+		if (!nodeOptions) {
+			writeUsage();
+			process.exitCode = 1;
+			return;
+		}
+		await runNode(nodeOptions);
+		return;
+	}
 	if (all && !(positional.length === 1 && positional[0] === "sessions")) {
 		writeUsage();
 		process.exitCode = 1;
@@ -76,7 +92,19 @@ export async function run(): Promise<void> {
 		await runCompact(sessionId, json);
 		return;
 	}
-	const commands = ["daemon", "login", "logout", "new", "sessions", "stats", "cancel", "compact", "monitor"];
+	const commands = [
+		"daemon",
+		"server",
+		"node",
+		"login",
+		"logout",
+		"new",
+		"sessions",
+		"stats",
+		"cancel",
+		"compact",
+		"monitor",
+	];
 	if (positional[0] !== undefined && commands.includes(positional[0])) {
 		writeUsage();
 		process.exitCode = 1;
@@ -424,6 +452,62 @@ function runDaemon(): void {
 	};
 	process.once("SIGINT", shutdown);
 	process.once("SIGTERM", shutdown);
+}
+
+function runServer(): void {
+	const server = Server.createServer();
+	listen(server, "server");
+}
+
+async function runNode(options: { serverUrl?: string; token?: string }): Promise<void> {
+	const running = await NodeRuntime.runNode({
+		...options,
+		onStatus: (message) => process.stderr.write(`ker: ${message}\n`),
+	});
+	let shuttingDown = false;
+	const shutdown = () => {
+		if (shuttingDown) return;
+		shuttingDown = true;
+		void running.shutdown();
+	};
+	process.once("SIGINT", shutdown);
+	process.once("SIGTERM", shutdown);
+}
+
+function listen(server: Server.KerServer, mode: "server"): void {
+	server.once("error", (error) => {
+		if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+		process.stderr.write(`ker: port ${DEFAULT_PORT} is in use — is another ker process running?\n`);
+		process.exitCode = 1;
+	});
+	server.listen(DEFAULT_PORT, "127.0.0.1", () => {
+		process.stderr.write(`ker ${mode} listening on http://127.0.0.1:${DEFAULT_PORT}\n`);
+	});
+	let shuttingDown = false;
+	const shutdown = () => {
+		if (shuttingDown) return;
+		shuttingDown = true;
+		void (async () => {
+			await server.shutdown();
+			server.closeAllConnections();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		})();
+	};
+	process.once("SIGINT", shutdown);
+	process.once("SIGTERM", shutdown);
+}
+
+function parseNodeOptions(args: string[]): { serverUrl?: string; token?: string } | undefined {
+	const options: { serverUrl?: string; token?: string } = {};
+	for (let index = 0; index < args.length; index += 2) {
+		const name = args[index];
+		const value = args[index + 1];
+		if (!value) return undefined;
+		if (name === "--server") options.serverUrl = value;
+		if (name === "--token") options.token = value;
+		if (name !== "--server" && name !== "--token") return undefined;
+	}
+	return options;
 }
 
 async function runMonitor(sessionId: Protocol.SessionId, json: boolean): Promise<void> {
@@ -959,6 +1043,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions [--all] | stats [id] | cancel [id] | compact [id] | monitor [id]\n       ker [--json] [--session <id> | -c|--continue] <prompt>\n       ker daemon | login | logout\n",
+		"usage: ker [--json] new | sessions [--all] | stats [id] | cancel [id] | compact [id] | monitor [id]\n       ker [--json] [--session <id> | -c|--continue] <prompt>\n       ker daemon | server | node [--server <url>] [--token <token>] | login | logout\n",
 	);
 }

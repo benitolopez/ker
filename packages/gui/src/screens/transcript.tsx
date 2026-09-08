@@ -1,9 +1,10 @@
 import { AttachError, type Result } from "@ker-ai/client";
 import type * as Protocol from "@ker-ai/protocol";
-import { type KeyboardEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { type KeyboardEvent, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { api, attach } from "../api.ts";
 import { parsePatch } from "../diff.ts";
 import { formatTokens } from "../format.ts";
+import { useVisiblePoll } from "../hooks/use-visible-poll.ts";
 import { Markdown } from "../markdown.tsx";
 import { formatRoute } from "../router.ts";
 import { type Block, TranscriptStore } from "../store/transcript.ts";
@@ -12,6 +13,7 @@ export function TranscriptScreen({ projectId, sessionId }: { projectId: string; 
 	const [store] = useState(() => new TranscriptStore());
 	const view = useSyncExternalStore(store.subscribe, store.getSnapshot);
 	const [error, setError] = useState<string>();
+	const [offlineMessage, setOfflineMessage] = useState<string>();
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const pinned = useRef(true);
 	const animation = useRef<number | undefined>(undefined);
@@ -52,6 +54,25 @@ export function TranscriptScreen({ projectId, sessionId }: { projectId: string; 
 	);
 
 	const header = view.header;
+	const nodeId = header?.session.nodeId;
+	const pollNode = useCallback(async () => {
+		if (!nodeId) return;
+		try {
+			const result = await api.listNodes();
+			if (!result.ok) return;
+			const node = result.value.nodes.find((candidate) => candidate.id === nodeId);
+			setOfflineMessage(node?.connected ? undefined : offlineNotice(node?.name ?? "This session's node"));
+		} catch {
+			return;
+		}
+	}, [nodeId]);
+	useVisiblePoll(pollNode);
+	const trackAvailability = <T,>(result: Result<T>): Result<T> => {
+		if (!result.ok && result.status === 503 && result.error.code === "node_unavailable") {
+			setOfflineMessage(offlineNotice(result.error.message ?? "This session's node"));
+		}
+		return result;
+	};
 	return (
 		<div className="flex h-screen min-h-0 flex-col bg-[var(--background)]">
 			<header className="z-10 border-b border-[var(--line)] bg-[color-mix(in_srgb,var(--background)_88%,transparent)] px-5 py-4 backdrop-blur-xl sm:px-8">
@@ -63,7 +84,12 @@ export function TranscriptScreen({ projectId, sessionId }: { projectId: string; 
 						<h1 className="mt-1 truncate font-mono text-sm font-semibold text-[var(--text)]">{sessionId}</h1>
 					</div>
 					{header ? (
-						<SessionHeader header={header} queue={view.queue} onCompact={() => api.compact(sessionId)} />
+						<SessionHeader
+							header={header}
+							nodeConnected={offlineMessage === undefined ? undefined : false}
+							onCompact={() => api.compact(sessionId).then(trackAvailability)}
+							queue={view.queue}
+						/>
 					) : (
 						<span className="status-pill">Connecting…</span>
 					)}
@@ -95,9 +121,10 @@ export function TranscriptScreen({ projectId, sessionId }: { projectId: string; 
 				<div className="mx-auto w-full max-w-3xl">
 					<QueueStack queue={view.queue} onRemove={(turnId) => api.cancel(sessionId, turnId)} />
 					<Composer
+						offlineMessage={offlineMessage}
 						queue={view.queue}
-						onSend={(text) => api.prompt(sessionId, text)}
-						onStop={(turnId) => api.cancel(sessionId, turnId)}
+						onSend={(text) => api.prompt(sessionId, text).then(trackAvailability)}
+						onStop={(turnId) => api.cancel(sessionId, turnId).then(trackAvailability)}
 					/>
 				</div>
 			</footer>
@@ -109,10 +136,12 @@ export function SessionHeader({
 	header,
 	queue,
 	onCompact,
+	nodeConnected,
 }: {
 	header: NonNullable<ReturnType<TranscriptStore["getSnapshot"]>["header"]>;
 	queue: Protocol.QueueSnapshot;
 	onCompact: () => Promise<Result<Protocol.CompactionAdmission>>;
+	nodeConnected?: boolean;
 }) {
 	const [compacting, setCompacting] = useState(false);
 	const [error, setError] = useState<string>();
@@ -150,7 +179,7 @@ export function SessionHeader({
 			<div>
 				<button
 					className="rounded-full border border-[var(--line)] px-3 py-2 text-xs font-semibold text-[var(--muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-45"
-					disabled={compactionQueued || compacting}
+					disabled={nodeConnected === false || compactionQueued || compacting}
 					onClick={() => void compact()}
 					type="button"
 				>
@@ -343,10 +372,12 @@ export function Composer({
 	queue,
 	onSend,
 	onStop,
+	offlineMessage,
 }: {
 	queue: Protocol.QueueSnapshot;
 	onSend: (text: string) => Promise<Result<Protocol.PromptAdmission>>;
 	onStop: (turnId: Protocol.TurnId) => Promise<Result<Protocol.TurnCancellationResult>>;
+	offlineMessage?: string;
 }) {
 	const [text, setText] = useState("");
 	const [pending, setPending] = useState<"send" | "stop">();
@@ -356,7 +387,7 @@ export function Composer({
 	const hasText = text.trim().length > 0;
 	const stopMode = queue.running !== undefined && !hasText;
 	const cancelling = stopMode && queue.running?.state === "cancelling";
-	const disabled = pending !== undefined || (stopMode ? cancelling : !hasText);
+	const disabled = offlineMessage !== undefined || pending !== undefined || (stopMode ? cancelling : !hasText);
 	const label = stopMode
 		? cancelling || pending === "stop"
 			? "Cancelling…"
@@ -420,6 +451,7 @@ export function Composer({
 				void submit();
 			}}
 		>
+			{offlineMessage ? <p className="px-3 pt-2 text-xs font-semibold text-amber-600">{offlineMessage}</p> : null}
 			<div className="flex items-end gap-2">
 				<textarea
 					aria-label="Prompt"
@@ -450,4 +482,9 @@ export function Composer({
 
 function failureMessage(failure: unknown): string {
 	return failure instanceof Error ? failure.message : String(failure);
+}
+
+function offlineNotice(node: string): string {
+	const label = node.replace(/\.?$/, "");
+	return `${label}${label.endsWith("offline") ? "" : " is offline"}. Reading works; sending resumes when it reconnects.`;
 }

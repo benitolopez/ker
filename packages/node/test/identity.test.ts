@@ -3,7 +3,7 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defaultNodePath, loadNodeIdentity } from "../src/identity.ts";
+import { defaultNodePath, loadNodeIdentity, saveNodeServer } from "../src/identity.ts";
 
 test("mints a private node identity and reloads it stably", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "ker-node-identity-"));
@@ -30,6 +30,19 @@ test("rejects invalid node identity content and names the file", async (t) => {
 
 	assert.throws(() => loadNodeIdentity(invalidJson), new RegExp(`Invalid node identity in ${invalidJson}`));
 	assert.throws(() => loadNodeIdentity(invalidShape), new RegExp(`Invalid node identity in ${invalidShape}`));
+});
+
+test("persists a server credential without changing the node identity", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-node-server-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const path = join(root, "node.json");
+	const identity = loadNodeIdentity(path);
+	const server = { url: "http://127.0.0.1:5537", secret: "secret" };
+
+	saveNodeServer(path, identity, server);
+
+	assert.deepEqual(loadNodeIdentity(path), { ...identity, server });
+	assert.equal((await stat(path)).mode & 0o777, 0o600);
 });
 
 test("uses KER_NODE_PATH before the user-owned default", (t) => {

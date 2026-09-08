@@ -12,8 +12,10 @@
   "dependencies": {
     "@ker-ai/auth": "^0.0.0",
     "@ker-ai/client": "^0.0.0",
+	"@ker-ai/node": "^0.0.0",
     "@ker-ai/protocol": "^0.0.0",
-    "@ker-ai/daemon": "^0.0.0"
+	"@ker-ai/daemon": "^0.0.0",
+	"@ker-ai/server": "^0.0.0"
   },
   "scripts": {
     "build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",

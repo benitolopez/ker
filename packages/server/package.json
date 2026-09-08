@@ -1,0 +1,26 @@
+{
+  "name": "@ker-ai/server",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "author": "Benito Lopez",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./src/index.ts" },
+  "engines": { "node": ">=24.0.0" },
+  "dependencies": {
+    "@ker-ai/gui": "^0.0.0",
+    "@ker-ai/protocol": "^0.0.0",
+    "@ker-ai/store": "^0.0.0",
+    "@sinclair/typebox": "0.34.41",
+    "drizzle-orm": "1.0.0-rc.4",
+    "fflate": "0.8.3",
+    "ws": "8.21.3"
+  },
+  "scripts": {
+    "build": "tsgo -p tsconfig.build.json",
+    "clean": "shx rm -rf dist",
+    "test": "node --test test/*.test.ts"
+  }
+}

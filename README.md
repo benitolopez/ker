@@ -3,14 +3,16 @@
 ker is an open-source coding agent that runs on your own machines and is meant to be driven from
 any screen (desktop, browser, or phone).
 
-It's very early. Right now ker runs a complete coding-agent loop behind a local daemon: you send
-it a prompt, the model can read and change files or run shell commands, and the loop continues
-until the model returns its final answer.
+It's very early. Right now ker runs a complete coding-agent loop either as one local daemon or as a
+control-plane server with nodes on the machines where the code lives. You send it a prompt, the
+model can read and change files or run shell commands, and the loop continues until the model
+returns its final answer.
 
 ## Direction
 
-Today ker lives on one machine. The plan is to split it in two: a server that keeps your projects,
-sessions, and notes, and agents that run wherever the code lives, with a web UI on top.
+ker has a server that keeps projects, session history, and documents, plus nodes that execute where
+the code lives. Bundled mode runs both halves on one machine. The next deployment step adds TLS and
+single-user client authentication so the same server can be exposed directly to browsers and nodes.
 
 ## Contributions
 
@@ -22,14 +24,17 @@ Thank you for your interest and understanding.
 
 ## What works today
 
-- A long-lived **daemon** that holds the conversation, and a thin `ker` client that talks to
-  it over HTTP.
+- Three runtime modes: a bundled **daemon**, a control-plane **server**, and outbound-connecting
+  **nodes**. The thin `ker` client talks to the server over HTTP.
+- One-time node enrollment, per-node secrets and revocation, multi-node workspace routing, and a
+  Nodes screen in the web UI.
 - A streaming tool-call loop using the OpenAI Responses API, with its own retry/backoff on
   transient failures before provider output starts.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
-- Durable sessions stored outside the repository. Restarting the daemon restores completed history
-  and interrupted turns; queued prompts expire by default, or resume when `recoveryWindowMinutes`
-  says they are recent enough.
+- Durable session history in the control plane, outside the repository. A remote node writes through
+  a transient acknowledged spool, so a server restart during an admitted turn loses no records.
+  Restarting restores completed history and interrupted turns; queued prompts expire by default, or
+  resume when `recoveryWindowMinutes` says they are recent enough.
 - Multiple sessions per project, each with its own FIFO queue. One turn runs at a time in a session,
   while different sessions can run concurrently.
 - Session-owned cancellation that every monitoring client can observe. Waiting turns cancel
@@ -42,10 +47,11 @@ Thank you for your interest and understanding.
   the full stream to a private temporary file.
 - Transparent context compaction that summarizes older history near the model ceiling while keeping
   the complete transcript on disk. Compaction can also be requested manually.
-- A web UI served by the daemon: projects, sessions, a live transcript with prompt, cancel, and
+- A web UI served by the control plane: projects, sessions, a live transcript with prompt, cancel, and
   compaction controls, and per-project documents with a Markdown editor.
 
-Not there yet: the split into a server and remote agents, or any provider other than OpenAI.
+Not there yet: a public server bind with TLS and client authentication, or any provider other than
+OpenAI.
 
 ## A note on the web UI
 
@@ -123,6 +129,23 @@ npx ker daemon
 The same address serves the web UI: open `http://127.0.0.1:5537` in a browser once the daemon is
 up.
 
+To run the two halves separately, start the server and use the web UI's Nodes screen to create an
+enrollment command:
+
+```sh
+npx ker server
+npx ker node --server http://127.0.0.1:5537 --token <token>
+```
+
+The secret returned during enrollment is stored in `~/.ker/node.json`; later starts need only
+`npx ker node`. This release keeps the server on loopback. To connect a node from another machine,
+forward that machine's local port to the server host, then enroll against the forwarded URL:
+
+```sh
+ssh -N -L 5537:127.0.0.1:5537 <server-host>
+npx ker node --server http://127.0.0.1:5537 --token <token>
+```
+
 Start a new session with a prompt, then continue the latest session for the exact current directory:
 
 ```sh
@@ -197,11 +220,13 @@ not echo prompt attribution. `--json` prints the full snapshot followed by raw e
 npx ker --json --session "$SESSION_ID" "inspect the raw stream"
 ```
 
-Sessions are stored under `KER_SESSION_DIR` when set, otherwise at `~/.ker/sessions`, grouped by
-canonical Git root and session ID. Older session-log store versions are reported as unreadable and
-left byte-for-byte unchanged until manually removed.
+The control plane stores sessions under `KER_SESSION_DIR` when set, otherwise at
+`~/.ker/sessions`, grouped by canonical Git root and session ID. Remote nodes keep only unacknowledged
+records under `~/.ker/spool`. Older session-log store versions are reported as unreadable and left
+byte-for-byte unchanged until manually removed.
 
-Project exports use the documented, versioned [ker archive format](docs/archive-format.md).
+Project exports use the documented, versioned [ker archive format](docs/archive-format.md). The
+server/node connection is specified in the [node protocol](docs/node-protocol.md).
 
 Concurrent sessions intentionally use their recorded working directories without worktree isolation.
 Running two sessions against the same files can therefore conflict. Cooperative cancellation cannot

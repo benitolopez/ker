@@ -37,7 +37,7 @@ The manifest is UTF-8 JSON with this top-level shape:
 | `documents` | Document metadata and the path of each Markdown body. |
 
 Each workspace records `id`, `nodeId`, `rootPath`, nullable `gitRemote`, and `createdAt`. Source node
-metadata is descriptive: imported workspaces are adopted by the importing daemon’s local node.
+metadata also lets a server preserve the machine assignment during import.
 
 Each session records `id`, the 64-character hexadecimal `projectKey`, nullable `workspaceId`,
 nullable `nodeId`, nullable `cwd`, nullable `title`, `status`, nullable `error`, nullable timestamps,
@@ -54,20 +54,26 @@ Import merges by opaque ID. Existing project, document, and session rows win and
 overwritten. Re-importing the same archive is therefore idempotent and reports those rows as
 skipped.
 
-Workspace paths are adopted onto the importing daemon’s local node. A path already attached to the
-same project is reused. A path attached to a different project rejects the whole import with
-`workspace_conflict`; catalog changes and moved logs are rolled back. Source node rows are not
-imported.
+An explicit `nodeId` query binds every imported workspace and session to that node. Without it, an
+archive node is kept when the same node is enrolled in the destination; otherwise the sole enrolled
+node is used. When neither rule selects a node, ker creates an unenrolled placeholder from the
+archive metadata. Its sessions remain readable and exportable, and become drivable when a node with
+that identity enrolls. Bundled mode always has one enrolled local node, so it adopts imported paths
+as before.
+
+A path already attached to the same project and selected node is reused. A path attached to a
+different project rejects the whole import with `workspace_conflict`; catalog changes and moved logs
+are rolled back.
 
 The archive is fully staged and validated before catalog changes begin. Every entry after the
 manifest must be declared exactly once by it, all declared non-null files must be present, entry
 paths must match the format’s fixed document or session path, and CRC and uncompressed-size values
 must match the zip directory. Failed imports remove their staging data.
 
-After import, a source workspace path may not exist on the new machine. Add a local folder from the
+After import, a source workspace path may not exist on its assigned node. Add a folder from the
 project’s Sessions screen before starting a new session. Adding a subdirectory of a Git repository
-records the canonical repository root. If exactly one workspace exists locally, New session uses it;
-multiple existing folders remain ambiguous.
+records the canonical repository root. Each usable folder has its own New session action; the
+project-level action still requires exactly one usable folder.
 
 ## Compatibility and limits
 

@@ -17,6 +17,7 @@ export function SessionsScreen({
 	listProjectSessions = api.listProjectSessions,
 	createProjectSession = api.createProjectSession,
 	listWorkspaces = api.listWorkspaces,
+	listNodes = api.listNodes,
 	createWorkspace = api.createWorkspace,
 	getProject = api.getProject,
 	navigate,
@@ -25,6 +26,7 @@ export function SessionsScreen({
 	listProjectSessions?: typeof api.listProjectSessions;
 	createProjectSession?: typeof api.createProjectSession;
 	listWorkspaces?: typeof api.listWorkspaces;
+	listNodes?: typeof api.listNodes;
 	createWorkspace?: typeof api.createWorkspace;
 	getProject?: typeof api.getProject;
 	navigate?: (route: string) => void;
@@ -98,8 +100,11 @@ export function SessionsScreen({
 			/>
 			<FoldersStrip
 				createWorkspace={createWorkspace}
+				createWorkspaceSession={api.createWorkspaceSession}
 				key={workspaceRefresh}
 				listWorkspaces={listWorkspaces}
+				listNodes={listNodes}
+				navigate={navigate}
 				projectId={projectId}
 			/>
 
@@ -129,6 +134,9 @@ export function SessionsScreen({
 									</h2>
 								</div>
 								<p className="mt-2 truncate pl-5 font-mono text-xs text-[var(--faint)]">{session.id}</p>
+								{"nodeName" in session && session.nodeName ? (
+									<p className="mt-1 pl-5 text-xs text-[var(--muted)]">{session.nodeName}</p>
+								) : null}
 								{session.status === "unreadable" ? (
 									<p className="mt-2 pl-5 text-sm text-red-700 dark:text-red-300">{session.error}</p>
 								) : null}
@@ -166,14 +174,23 @@ export function FoldersStrip({
 	projectId,
 	listWorkspaces,
 	createWorkspace,
+	listNodes = api.listNodes,
+	createWorkspaceSession = api.createWorkspaceSession,
+	navigate,
 }: {
 	projectId: string;
 	listWorkspaces: typeof api.listWorkspaces;
 	createWorkspace: typeof api.createWorkspace;
+	listNodes?: typeof api.listNodes;
+	createWorkspaceSession?: typeof api.createWorkspaceSession;
+	navigate?: (route: string) => void;
 }) {
 	const [workspaces, setWorkspaces] = useState<Protocol.Workspace[]>([]);
+	const [nodes, setNodes] = useState<Protocol.Node[]>([]);
 	const [path, setPath] = useState("");
+	const [nodeId, setNodeId] = useState<Protocol.NodeId>();
 	const [adding, setAdding] = useState(false);
+	const [creating, setCreating] = useState<Protocol.WorkspaceId>();
 	const [error, setError] = useState<string>();
 	const refetch = useCallback(async () => {
 		try {
@@ -189,13 +206,31 @@ export function FoldersStrip({
 		}
 	}, [listWorkspaces, projectId]);
 	useVisiblePoll(refetch);
+	const refetchNodes = useCallback(async () => {
+		try {
+			const result = await listNodes();
+			if (!result.ok) {
+				setError(result.error.message ?? result.error.code);
+				return;
+			}
+			const enrolled = result.value.nodes.filter((node) => node.enrolledAt !== null && node.revokedAt === null);
+			setNodes(enrolled);
+			if (enrolled.length > 1) setNodeId((current) => current ?? enrolled[0]?.id);
+		} catch (reason) {
+			setError(reason instanceof Error ? reason.message : String(reason));
+		}
+	}, [listNodes]);
+	useVisiblePoll(refetchNodes);
 	const add = async (event: FormEvent) => {
 		event.preventDefault();
 		if (!path.trim() || adding) return;
 		setAdding(true);
 		setError(undefined);
 		try {
-			const result = await createWorkspace(projectId, { path: path.trim() });
+			const result = await createWorkspace(projectId, {
+				path: path.trim(),
+				...(nodes.length > 1 && nodeId ? { nodeId } : {}),
+			});
 			if (!result.ok) {
 				setError(workspaceErrorMessage(result.error));
 				return;
@@ -206,6 +241,27 @@ export function FoldersStrip({
 			setError(reason instanceof Error ? reason.message : String(reason));
 		} finally {
 			setAdding(false);
+		}
+	};
+	const create = async (workspace: Protocol.Workspace) => {
+		setCreating(workspace.id);
+		setError(undefined);
+		try {
+			const result = await createWorkspaceSession(workspace.id);
+			if (!result.ok) {
+				setError(sessionErrorMessage(result.error));
+				return;
+			}
+			const route = formatRoute({ screen: "transcript", projectId, sessionId: result.value.id });
+			if (navigate) {
+				navigate(route);
+				return;
+			}
+			window.location.hash = route;
+		} catch (reason) {
+			setError(reason instanceof Error ? reason.message : String(reason));
+		} finally {
+			setCreating(undefined);
 		}
 	};
 	const sorted = [...workspaces].sort((left, right) => {
@@ -219,10 +275,26 @@ export function FoldersStrip({
 			<div className="mt-3 grid gap-2">
 				{sorted.map((workspace) => (
 					<div className="flex flex-wrap items-center justify-between gap-2 text-sm" key={workspace.id}>
-						<span className="break-all font-mono text-xs text-[var(--muted)]">{workspace.rootPath}</span>
-						<span className={workspace.exists ? "text-xs text-[var(--faint)]" : "text-xs font-semibold text-amber-600"}>
-							{workspace.exists ? (workspace.gitRemote ? `git: ${workspace.gitRemote}` : "") : "missing"}
-						</span>
+						<div className="min-w-0">
+							<span className="break-all font-mono text-xs text-[var(--muted)]">{workspace.rootPath}</span>
+							<p className="mt-1 text-xs text-[var(--faint)]">
+								{workspace.nodeName} · {workspace.nodeConnected ? "connected" : "offline"}
+								{workspace.gitRemote ? ` · git: ${workspace.gitRemote}` : ""}
+							</p>
+						</div>
+						<div className="flex items-center gap-3">
+							{workspace.exists === false ? (
+								<span className="text-xs font-semibold text-amber-600">missing</span>
+							) : null}
+							<button
+								className="rounded-lg border border-[var(--line)] px-3 py-1.5 text-xs font-semibold disabled:opacity-45"
+								disabled={!workspace.nodeConnected || workspace.exists !== true || creating !== undefined}
+								onClick={() => void create(workspace)}
+								type="button"
+							>
+								{creating === workspace.id ? "Creating…" : "New session"}
+							</button>
+						</div>
 					</div>
 				))}
 			</div>
@@ -235,6 +307,21 @@ export function FoldersStrip({
 					placeholder="/absolute/path"
 					value={path}
 				/>
+				{nodes.length > 1 ? (
+					<select
+						aria-label="Node"
+						className="rounded-xl border border-[var(--line)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--text)]"
+						disabled={adding}
+						onChange={(event) => setNodeId(event.currentTarget.value)}
+						value={nodeId}
+					>
+						{nodes.map((node) => (
+							<option key={node.id} value={node.id}>
+								{node.name}
+							</option>
+						))}
+					</select>
+				) : null}
 				<button
 					className="rounded-xl border border-[var(--line)] px-4 py-2 text-sm font-semibold text-[var(--text)] disabled:opacity-45"
 					disabled={adding || !path.trim()}
@@ -253,6 +340,8 @@ export function FoldersStrip({
 }
 
 function sessionErrorMessage(error: Protocol.ErrorBody): string {
+	if (error.code === "node_unavailable") return error.message ?? "The folder's node is offline.";
+	if (error.code === "node_ambiguous") return "Choose a folder or node before creating a session.";
 	if (error.code === "workspace_missing") {
 		return "None of this project's folders exist on this node. Add one below.";
 	}

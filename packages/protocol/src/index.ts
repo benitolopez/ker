@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { type Static, Type } from "@sinclair/typebox";
 
 // Wire contract between the daemon and its clients.
@@ -16,6 +17,12 @@ export type ProjectId = string;
 export type DocumentId = string;
 export type WorkspaceId = string;
 export type NodeId = string;
+
+export const PROJECT_KEY_PATTERN = /^[a-f0-9]{64}$/;
+
+export function projectKey(projectRoot: string): string {
+	return createHash("sha256").update(projectRoot).digest("hex");
+}
 
 export const AdmissionStatus = Type.Union([Type.Literal("running"), Type.Literal("waiting")]);
 export type AdmissionStatus = Static<typeof AdmissionStatus>;
@@ -110,6 +117,7 @@ export type SessionUsage = Static<typeof SessionUsage>;
 export const SessionDescriptor = Type.Object(
 	{
 		id: Type.String(),
+		nodeId: Type.String(),
 		cwd: Type.String(),
 		projectRoot: Type.String(),
 		createdAt: Type.String(),
@@ -119,8 +127,38 @@ export const SessionDescriptor = Type.Object(
 );
 export type SessionDescriptor = Static<typeof SessionDescriptor>;
 
-export const CreateSessionRequest = Type.Object({ cwd: Type.String() }, { additionalProperties: false });
+export const CreateSessionRequest = Type.Object(
+	{ cwd: Type.String(), nodeId: Type.Optional(Type.String()) },
+	{ additionalProperties: false },
+);
 export type CreateSessionRequest = Static<typeof CreateSessionRequest>;
+
+export const Node = Type.Object(
+	{
+		id: Type.String(),
+		name: Type.String(),
+		createdAt: Type.String(),
+		enrolledAt: Type.Union([Type.String(), Type.Null()]),
+		revokedAt: Type.Union([Type.String(), Type.Null()]),
+		lastSeenAt: Type.Union([Type.String(), Type.Null()]),
+		connected: Type.Boolean(),
+	},
+	{ additionalProperties: false },
+);
+export type Node = Static<typeof Node>;
+
+export const ListNodesResponse = Type.Object({ nodes: Type.Array(Node) }, { additionalProperties: false });
+export type ListNodesResponse = Static<typeof ListNodesResponse>;
+
+export const Enrollment = Type.Object(
+	{
+		token: Type.String(),
+		expiresAt: Type.String(),
+		command: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+export type Enrollment = Static<typeof Enrollment>;
 
 export const ReadableCatalogSession = Type.Object(
 	{
@@ -131,6 +169,7 @@ export const ReadableCatalogSession = Type.Object(
 		projectName: Type.String(),
 		workspaceId: Type.String(),
 		nodeId: Type.String(),
+		nodeName: Type.String(),
 		title: Type.Union([Type.String(), Type.Null()]),
 		createdAt: Type.String(),
 		updatedAt: Type.String(),
@@ -150,6 +189,7 @@ export const UnreadableCatalogSession = Type.Object(
 		projectName: Type.Optional(Type.String()),
 		workspaceId: Type.Optional(Type.String()),
 		nodeId: Type.Optional(Type.String()),
+		nodeName: Type.Optional(Type.String()),
 		title: Type.Optional(Type.String()),
 		createdAt: Type.Optional(Type.String()),
 		updatedAt: Type.Optional(Type.String()),
@@ -187,10 +227,12 @@ export const Workspace = Type.Object(
 		id: Type.String(),
 		projectId: Type.String(),
 		nodeId: Type.String(),
+		nodeName: Type.String(),
+		nodeConnected: Type.Boolean(),
 		rootPath: Type.String(),
 		gitRemote: Type.Union([Type.String(), Type.Null()]),
 		createdAt: Type.String(),
-		exists: Type.Boolean(),
+		exists: Type.Union([Type.Boolean(), Type.Null()]),
 	},
 	{ additionalProperties: false },
 );
@@ -202,7 +244,10 @@ export const ListWorkspacesResponse = Type.Object(
 );
 export type ListWorkspacesResponse = Static<typeof ListWorkspacesResponse>;
 
-export const WorkspaceRequest = Type.Object({ path: Type.String({ minLength: 1 }) }, { additionalProperties: false });
+export const WorkspaceRequest = Type.Object(
+	{ path: Type.String({ minLength: 1 }), nodeId: Type.Optional(Type.String()) },
+	{ additionalProperties: false },
+);
 export type WorkspaceRequest = Static<typeof WorkspaceRequest>;
 
 export const Document = Type.Object(
@@ -918,7 +963,7 @@ export const ErrorBody = Type.Object(
 );
 export type ErrorBody = Static<typeof ErrorBody>;
 
-export const PROTOCOL_VERSION = "24" as const;
+export const PROTOCOL_VERSION = "25" as const;
 
 // Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
 export const DEFAULT_PORT = 5537;

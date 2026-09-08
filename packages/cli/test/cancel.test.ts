@@ -156,6 +156,7 @@ function snapshot(queueSnapshot: Protocol.QueueSnapshot): Protocol.SessionSnapsh
 	return {
 		session: {
 			id: "session-1",
+			nodeId: "node-1",
 			cwd: "/project",
 			projectRoot: "/project",
 			createdAt: "2026-01-01T00:00:00.000Z",

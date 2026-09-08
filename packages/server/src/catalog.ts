@@ -1,18 +1,26 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type * as Protocol from "@ker-ai/protocol";
+import * as Protocol from "@ker-ai/protocol";
 import { and, asc, count, desc, eq, getTableColumns, inArray, isNull, max, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-sqlite";
-import type { NodeIdentity } from "./identity.ts";
-import { CATALOG_VERSION, DDL, document, MIGRATIONS, node, project, session, workspace } from "./schema.ts";
-import { projectKey } from "./store.ts";
+import {
+	CATALOG_VERSION,
+	DDL,
+	document,
+	enrollment_token,
+	MIGRATIONS,
+	node,
+	project,
+	session,
+	workspace,
+} from "./schema.ts";
 
 const SQLITE_CORRUPT = 11;
 const SQLITE_NOTADB = 26;
-const SALVAGE_TABLES = ["node", "project", "workspace", "session", "document"] as const;
+const SALVAGE_TABLES = ["node", "project", "workspace", "session", "document", "enrollment_token"] as const;
 
 export interface CatalogRow {
 	id: Protocol.SessionId;
@@ -28,7 +36,7 @@ export interface CatalogRow {
 	node_id: Protocol.NodeId | null;
 }
 
-export type CatalogListRow = CatalogRow & { project_name: string | null };
+export type CatalogListRow = CatalogRow & { project_name: string | null; node_name: string | null };
 
 export interface WorkspaceBinding {
 	projectId: Protocol.ProjectId;
@@ -124,12 +132,95 @@ export class Catalog {
 		}
 	}
 
-	upsertNode(identity: NodeIdentity): void {
+	upsertNode(identity: { id: Protocol.NodeId; name: string; createdAt: string }): void {
 		this.#db
 			.insert(node)
-			.values({ id: identity.id, name: identity.name, created_at: identity.createdAt })
-			.onConflictDoUpdate({ target: node.id, set: { name: identity.name } })
+			.values({ id: identity.id, name: identity.name, created_at: identity.createdAt, enrolled_at: identity.createdAt })
+			.onConflictDoUpdate({ target: node.id, set: { name: identity.name, enrolled_at: identity.createdAt } })
 			.run();
+	}
+
+	createEnrollmentToken(): { token: string; expiresAt: string } {
+		const token = randomBytes(32).toString("hex");
+		const now = new Date();
+		const expiresAt = new Date(now.getTime() + 15 * 60_000).toISOString();
+		this.#db
+			.insert(enrollment_token)
+			.values({
+				id: randomUUID(),
+				token_hash: hashSecret(token),
+				created_at: now.toISOString(),
+				expires_at: expiresAt,
+			})
+			.run();
+		return { token, expiresAt };
+	}
+
+	consumeEnrollmentToken(token: string): "ok" | "expired" | "used" | "invalid" {
+		return this.#db.transaction((tx) => {
+			const row = tx
+				.select()
+				.from(enrollment_token)
+				.where(eq(enrollment_token.token_hash, hashSecret(token)))
+				.get();
+			if (!row) return "invalid";
+			if (row.used_at !== null) return "used";
+			const now = new Date().toISOString();
+			if (row.expires_at <= now) return "expired";
+			tx.update(enrollment_token).set({ used_at: now }).where(eq(enrollment_token.id, row.id)).run();
+			return "ok";
+		});
+	}
+
+	enrollNode(identity: { id: Protocol.NodeId; name: string; createdAt: string }, secretHash: string): void {
+		const now = new Date().toISOString();
+		this.#db
+			.insert(node)
+			.values({
+				id: identity.id,
+				name: identity.name,
+				created_at: identity.createdAt,
+				secret_hash: secretHash,
+				enrolled_at: now,
+				revoked_at: null,
+				last_seen_at: now,
+			})
+			.onConflictDoUpdate({
+				target: node.id,
+				set: {
+					name: identity.name,
+					secret_hash: secretHash,
+					enrolled_at: now,
+					revoked_at: null,
+					last_seen_at: now,
+				},
+			})
+			.run();
+	}
+
+	verifyNodeSecret(id: Protocol.NodeId, secret: string): "ok" | "missing" | "revoked" | "invalid" {
+		const row = this.#db.select().from(node).where(eq(node.id, id)).get();
+		if (!row || row.secret_hash === null) return row ? "invalid" : "missing";
+		if (row.revoked_at !== null) return "revoked";
+		const actual = Buffer.from(hashSecret(secret), "hex");
+		const expected = Buffer.from(row.secret_hash, "hex");
+		return actual.length === expected.length && timingSafeEqual(actual, expected) ? "ok" : "invalid";
+	}
+
+	revokeNode(id: Protocol.NodeId): typeof node.$inferSelect | undefined {
+		return this.#db.update(node).set({ revoked_at: new Date().toISOString() }).where(eq(node.id, id)).returning().get();
+	}
+
+	touchNode(id: Protocol.NodeId, lastSeenAt = new Date().toISOString()): void {
+		this.#db.update(node).set({ last_seen_at: lastSeenAt }).where(eq(node.id, id)).run();
+	}
+
+	listNodes(): Array<typeof node.$inferSelect> {
+		return this.#db.select().from(node).orderBy(asc(node.created_at)).all();
+	}
+
+	nodeExists(id: Protocol.NodeId): boolean {
+		return this.#db.select({ id: node.id }).from(node).where(eq(node.id, id)).get() !== undefined;
 	}
 
 	findWorkspaceByRoot(nodeId: Protocol.NodeId, rootPath: string): WorkspaceBinding | undefined {
@@ -209,6 +300,23 @@ export class Catalog {
 		return this.projectWorkspaces(projectId);
 	}
 
+	getWorkspace(workspaceId: Protocol.WorkspaceId): WorkspaceBinding | undefined {
+		return this.#db
+			.select({
+				projectId: project.id,
+				projectName: project.name,
+				workspaceId: workspace.id,
+				nodeId: workspace.node_id,
+				rootPath: workspace.root_path,
+				gitRemote: workspace.git_remote,
+				createdAt: workspace.created_at,
+			})
+			.from(workspace)
+			.innerJoin(project, eq(workspace.project_id, project.id))
+			.where(eq(workspace.id, workspaceId))
+			.get();
+	}
+
 	addWorkspace(
 		projectId: Protocol.ProjectId,
 		input: { nodeId: Protocol.NodeId; rootPath: string; gitRemote: string | null },
@@ -253,10 +361,11 @@ export class Catalog {
 	}
 
 	// Startup reconciliation refreshes log-derived fields without deleting logical entities.
-	reconcile(scan: CatalogScan, nodeId: Protocol.NodeId): void {
+	reconcile(scan: CatalogScan): void {
 		this.#db.transaction((tx) => {
 			const bindingsByRoot = new Map<string, WorkspaceBinding>();
 			const bindingsByKey = new Map<string, WorkspaceBinding>();
+			const bindingsById = new Map<Protocol.WorkspaceId, WorkspaceBinding>();
 			const existingBindings = tx
 				.select({
 					projectId: project.id,
@@ -269,18 +378,25 @@ export class Catalog {
 				})
 				.from(workspace)
 				.innerJoin(project, eq(workspace.project_id, project.id))
-				.where(eq(workspace.node_id, nodeId))
 				.all();
 			for (const binding of existingBindings) {
-				bindingsByRoot.set(binding.rootPath, binding);
-				bindingsByKey.set(projectKey(binding.rootPath), binding);
+				bindingsByRoot.set(`${binding.nodeId}\0${binding.rootPath}`, binding);
+				bindingsByKey.set(`${binding.nodeId}\0${Protocol.projectKey(binding.rootPath)}`, binding);
+				bindingsById.set(binding.workspaceId, binding);
 			}
 
 			const scannedIds = new Set<Protocol.SessionId>();
 			for (const entry of scan.sessions) {
 				const descriptor = entry.session;
 				scannedIds.add(descriptor.id);
-				const existing = bindingsByRoot.get(descriptor.projectRoot);
+				const existingRow = tx.select().from(session).where(eq(session.id, descriptor.id)).get();
+				const existingBinding = existingRow?.workspace_id ? bindingsById.get(existingRow.workspace_id) : undefined;
+				const nodeId = existingBinding?.nodeId ?? descriptor.nodeId;
+				tx.insert(node)
+					.values({ id: nodeId, name: nodeId, created_at: descriptor.createdAt })
+					.onConflictDoNothing()
+					.run();
+				const existing = existingBinding ?? bindingsByRoot.get(`${nodeId}\0${descriptor.projectRoot}`);
 				const binding =
 					existing ??
 					(() => {
@@ -309,8 +425,9 @@ export class Catalog {
 							createdAt: now,
 						};
 					})();
-				bindingsByRoot.set(binding.rootPath, binding);
-				bindingsByKey.set(entry.projectKey, binding);
+				bindingsByRoot.set(`${binding.nodeId}\0${binding.rootPath}`, binding);
+				bindingsByKey.set(`${binding.nodeId}\0${entry.projectKey}`, binding);
+				bindingsById.set(binding.workspaceId, binding);
 				tx.insert(session)
 					.values({
 						id: descriptor.id,
@@ -342,7 +459,10 @@ export class Catalog {
 			}
 			for (const entry of scan.unreadable) {
 				scannedIds.add(entry.id);
-				const binding = bindingsByKey.get(entry.projectKey);
+				const existingRow = tx.select().from(session).where(eq(session.id, entry.id)).get();
+				const binding = existingRow?.node_id
+					? bindingsByKey.get(`${existingRow.node_id}\0${entry.projectKey}`)
+					: undefined;
 				tx.insert(session)
 					.values({
 						id: entry.id,
@@ -381,7 +501,7 @@ export class Catalog {
 	}
 
 	upsertCreated(descriptor: Protocol.SessionDescriptor, binding: WorkspaceBinding): void {
-		const key = projectKey(descriptor.projectRoot);
+		const key = Protocol.projectKey(descriptor.projectRoot);
 		this.#db
 			.insert(session)
 			.values({
@@ -437,13 +557,23 @@ export class Catalog {
 		return this.#db.select().from(session).where(eq(session.id, id)).get();
 	}
 
+	busySessions(nodeId: Protocol.NodeId): Protocol.SessionId[] {
+		return this.#db
+			.select({ id: session.id })
+			.from(session)
+			.where(and(eq(session.node_id, nodeId), eq(session.status, "busy")))
+			.all()
+			.map((row) => row.id);
+	}
+
 	list(scope?: { nodeId: Protocol.NodeId; rootPath: string } | { projectId: Protocol.ProjectId }): CatalogListRow[] {
-		const selection = { ...getTableColumns(session), project_name: project.name };
+		const selection = { ...getTableColumns(session), project_name: project.name, node_name: node.name };
 		if (!scope) {
 			return this.#db
 				.select(selection)
 				.from(session)
 				.leftJoin(project, eq(session.project_id, project.id))
+				.leftJoin(node, eq(session.node_id, node.id))
 				.orderBy(asc(session.created_at))
 				.all();
 		}
@@ -452,16 +582,21 @@ export class Catalog {
 				.select(selection)
 				.from(session)
 				.leftJoin(project, eq(session.project_id, project.id))
+				.leftJoin(node, eq(session.node_id, node.id))
 				.where(eq(session.project_id, scope.projectId))
 				.orderBy(asc(session.created_at))
 				.all();
 		}
 		const binding = this.findWorkspaceByRoot(scope.nodeId, scope.rootPath);
-		const unreadableMatch = and(eq(session.status, "unreadable"), eq(session.project_key, projectKey(scope.rootPath)));
+		const unreadableMatch = and(
+			eq(session.status, "unreadable"),
+			eq(session.project_key, Protocol.projectKey(scope.rootPath)),
+		);
 		return this.#db
 			.select(selection)
 			.from(session)
 			.leftJoin(project, eq(session.project_id, project.id))
+			.leftJoin(node, eq(session.node_id, node.id))
 			.where(binding ? or(eq(session.project_id, binding.projectId), unreadableMatch) : unreadableMatch)
 			.orderBy(asc(session.created_at))
 			.all();
@@ -541,7 +676,7 @@ export class Catalog {
 
 	importRows(
 		manifest: Protocol.ArchiveManifest,
-		localNodeId: Protocol.NodeId,
+		explicitNodeId: Protocol.NodeId | undefined,
 		bodies: Map<string, string>,
 		logs: Map<Protocol.SessionId, string>,
 		logExists: (projectKey: string, sessionId: Protocol.SessionId) => string | undefined,
@@ -551,6 +686,16 @@ export class Catalog {
 			stagedPath: string,
 		) => { placed: true; path: string } | { placed: false },
 	): { counts: ImportCounts; logs: ImportedLog[] } {
+		const enrolled = this.listNodes().filter((item) => item.enrolled_at !== null && item.revoked_at === null);
+		const soleNodeId = enrolled.length === 1 ? enrolled[0]?.id : undefined;
+		const enrolledIds = new Set(enrolled.map((item) => item.id));
+		const archiveNodes = new Map(manifest.nodes.map((item) => [item.id, item]));
+		const bindNode = (archiveNodeId: Protocol.NodeId | null): Protocol.NodeId => {
+			if (explicitNodeId !== undefined) return explicitNodeId;
+			if (archiveNodeId !== null && enrolledIds.has(archiveNodeId)) return archiveNodeId;
+			if (soleNodeId !== undefined) return soleNodeId;
+			return archiveNodeId ?? `placeholder-${manifest.project.id}`;
+		};
 		return this.#db.transaction((tx) => {
 			const moved: string[] = [];
 			try {
@@ -567,9 +712,20 @@ export class Catalog {
 							.run().changes,
 					) === 1;
 				const workspaceIds = new Map<string, string>();
+				const workspaceNodeIds = new Map<string, Protocol.NodeId>();
 				let workspacesCreated = 0;
 				let workspacesReused = 0;
 				for (const item of manifest.workspaces) {
+					const nodeId = bindNode(item.nodeId);
+					const archiveNode = archiveNodes.get(item.nodeId);
+					tx.insert(node)
+						.values({
+							id: nodeId,
+							name: archiveNode?.name ?? nodeId,
+							created_at: archiveNode?.createdAt ?? item.createdAt,
+						})
+						.onConflictDoNothing()
+						.run();
 					const existing = tx
 						.select({
 							id: workspace.id,
@@ -578,13 +734,14 @@ export class Catalog {
 						})
 						.from(workspace)
 						.innerJoin(project, eq(workspace.project_id, project.id))
-						.where(and(eq(workspace.node_id, localNodeId), eq(workspace.root_path, item.rootPath)))
+						.where(and(eq(workspace.node_id, nodeId), eq(workspace.root_path, item.rootPath)))
 						.get();
 					if (existing && existing.projectId !== manifest.project.id) {
 						throw new WorkspaceConflictError(item.rootPath, existing.projectId, existing.projectName);
 					}
 					if (existing) {
 						workspaceIds.set(item.id, existing.id);
+						workspaceNodeIds.set(item.id, nodeId);
 						workspacesReused++;
 						continue;
 					}
@@ -592,13 +749,14 @@ export class Catalog {
 						.values({
 							id: item.id,
 							project_id: manifest.project.id,
-							node_id: localNodeId,
+							node_id: nodeId,
 							root_path: item.rootPath,
 							git_remote: item.gitRemote,
 							created_at: item.createdAt,
 						})
 						.run();
 					workspaceIds.set(item.id, item.id);
+					workspaceNodeIds.set(item.id, nodeId);
 					workspacesCreated++;
 				}
 
@@ -637,6 +795,21 @@ export class Catalog {
 						sessionsMissing++;
 						continue;
 					}
+					const nodeId =
+						item.workspaceId === null
+							? bindNode(item.nodeId)
+							: (workspaceNodeIds.get(item.workspaceId) ?? bindNode(item.nodeId));
+					if (!tx.select({ id: node.id }).from(node).where(eq(node.id, nodeId)).get()) {
+						const archiveNode = item.nodeId === null ? undefined : archiveNodes.get(item.nodeId);
+						tx.insert(node)
+							.values({
+								id: nodeId,
+								name: archiveNode?.name ?? nodeId,
+								created_at: archiveNode?.createdAt ?? item.createdAt ?? manifest.exportedAt,
+							})
+							.onConflictDoNothing()
+							.run();
+					}
 					const changes = Number(
 						tx
 							.insert(session)
@@ -651,7 +824,7 @@ export class Catalog {
 								updated_at: item.updatedAt,
 								project_id: manifest.project.id,
 								workspace_id: item.workspaceId === null ? null : (workspaceIds.get(item.workspaceId) ?? null),
-								node_id: localNodeId,
+								node_id: nodeId,
 							})
 							.onConflictDoNothing()
 							.run().changes,
@@ -750,6 +923,10 @@ export class Catalog {
 
 export function defaultCatalogPath(): string {
 	return process.env.KER_CATALOG_PATH ?? join(homedir(), ".ker", "catalog.db");
+}
+
+export function hashSecret(secret: string): string {
+	return createHash("sha256").update(secret).digest("hex");
 }
 
 function openDatabase(path: string): { client: DatabaseSync; version: number } {

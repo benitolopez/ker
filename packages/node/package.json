@@ -1,0 +1,30 @@
+{
+  "name": "@ker-ai/node",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "author": "Benito Lopez",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./src/index.ts" },
+  "engines": { "node": ">=24.0.0" },
+  "dependencies": {
+    "@ker-ai/agent": "^0.0.0",
+    "@ker-ai/auth": "^0.0.0",
+    "@ker-ai/config": "^0.0.0",
+    "@ker-ai/engine": "^0.0.0",
+    "@ker-ai/llm": "^0.0.0",
+    "@ker-ai/protocol": "^0.0.0",
+    "@ker-ai/store": "^0.0.0",
+    "@sinclair/typebox": "0.34.41"
+  },
+  "devDependencies": {
+    "ws": "8.21.3"
+  },
+  "scripts": {
+    "build": "tsgo -p tsconfig.build.json",
+    "clean": "shx rm -rf dist",
+    "test": "node --test test/*.test.ts"
+  }
+}

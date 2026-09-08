@@ -4,14 +4,13 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import type * as Protocol from "@ker-ai/protocol";
+import * as Protocol from "@ker-ai/protocol";
+import type { CatalogedSession } from "@ker-ai/store";
 import { drizzle } from "drizzle-orm/node-sqlite";
-import { Catalog, defaultCatalogPath } from "../src/catalog.ts";
-import type { NodeIdentity } from "../src/node.ts";
+import { Catalog, defaultCatalogPath, hashSecret } from "../src/catalog.ts";
 import { CATALOG_VERSION, DDL, document, MIGRATIONS, node, project, session, workspace } from "../src/schema.ts";
-import { type CatalogedSession, projectKey } from "../src/store.ts";
 
-const IDENTITY: NodeIdentity = {
+const IDENTITY = {
 	id: "node-1",
 	name: "test-node",
 	createdAt: "2026-01-01T00:00:00.000Z",
@@ -418,7 +417,7 @@ test("reconcile binds sessions, preserves metadata, and keeps empty projects", a
 	const first = catalogedSession("session-1", "/project-a", "/project-a/one", true);
 	const second = catalogedSession("session-2", "/project-a", "/project-a/two", false);
 	const third = catalogedSession("session-3", "/project-b", "/project-b", true);
-	catalog.reconcile({ sessions: [first, second, third], unreadable: [] }, IDENTITY.id);
+	catalog.reconcile({ sessions: [first, second, third], unreadable: [] });
 	catalog.setTitleIfEmpty(first.session.id, "Saved title");
 	const firstBinding = catalog.findWorkspaceByRoot(IDENTITY.id, "/project-a");
 	const thirdBinding = catalog.findWorkspaceByRoot(IDENTITY.id, "/project-b");
@@ -433,23 +432,20 @@ test("reconcile binds sessions, preserves metadata, and keeps empty projects", a
 		idle: false,
 		session: { ...first.session, updatedAt: "2026-02-01T00:00:00.000Z" },
 	};
-	catalog.reconcile(
-		{
-			sessions: [updatedFirst, third],
-			unreadable: [
-				{ id: second.session.id, projectKey: second.projectKey, error: "broken tail" },
-				{ id: "never-readable", projectKey: "unknown-project", error: "bad header" },
-			],
-		},
-		IDENTITY.id,
-	);
+	catalog.reconcile({
+		sessions: [updatedFirst, third],
+		unreadable: [
+			{ id: second.session.id, projectKey: second.projectKey, error: "broken tail" },
+			{ id: "never-readable", projectKey: "unknown-project", error: "bad header" },
+		],
+	});
 	assert.equal(catalog.get(first.session.id)?.title, "Saved title");
 	assert.equal(catalog.get(first.session.id)?.status, "busy");
 	assert.equal(catalog.get(second.session.id)?.project_id, firstBinding.projectId);
 	assert.equal(catalog.get(second.session.id)?.status, "unreadable");
 	assert.equal(catalog.get("never-readable")?.project_id, null);
 
-	catalog.reconcile({ sessions: [], unreadable: [] }, IDENTITY.id);
+	catalog.reconcile({ sessions: [], unreadable: [] });
 	assert.deepEqual(catalog.list(), []);
 	const client = new DatabaseSync(path);
 	assert.equal((client.prepare("SELECT count(*) AS count FROM project").get() as { count: number }).count, 2);
@@ -470,16 +466,13 @@ test("catalog queries preserve order and use project-anchored scope", async (t) 
 	second.session.updatedAt = second.session.createdAt;
 	third.session.createdAt = "2026-01-03T00:00:00.000Z";
 	third.session.updatedAt = third.session.createdAt;
-	catalog.reconcile(
-		{
-			sessions: [third, second, first],
-			unreadable: [
-				{ id: "unreadable-a", projectKey: first.projectKey, error: "broken" },
-				{ id: "unreadable-missing", projectKey: projectKey("/missing"), error: "missing" },
-			],
-		},
-		IDENTITY.id,
-	);
+	catalog.reconcile({
+		sessions: [third, second, first],
+		unreadable: [
+			{ id: "unreadable-a", projectKey: first.projectKey, error: "broken" },
+			{ id: "unreadable-missing", projectKey: Protocol.projectKey("/missing"), error: "missing" },
+		],
+	});
 	catalog.setTitleIfEmpty(first.session.id, "Original");
 	catalog.setTitleIfEmpty(first.session.id, "Replacement");
 	catalog.touch(first.session.id, { updatedAt: "2026-03-01T00:00:00.000Z", status: "busy" });
@@ -510,7 +503,7 @@ test("project queries compute session activity and keep empty projects", async (
 	const first = catalogedSession("session-1", "/project-a", "/project-a/one", true);
 	const second = catalogedSession("session-2", "/project-a", "/project-a/two", true);
 	second.session.updatedAt = "2026-02-01T00:00:00.000Z";
-	catalog.reconcile({ sessions: [first, second], unreadable: [] }, IDENTITY.id);
+	catalog.reconcile({ sessions: [first, second], unreadable: [] });
 	const binding = catalog.findWorkspaceByRoot(IDENTITY.id, "/project-a");
 	assert(binding);
 	catalog.markUnreadable(second.session.id, "broken");
@@ -579,6 +572,70 @@ test("uses KER_CATALOG_PATH before the user-owned default", (t) => {
 	assert.equal(defaultCatalogPath(), join(tmpdir(), "ker-custom-catalog.db"));
 });
 
+test("enrollment tokens are single-use and expire", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-enrollment-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const path = join(root, "catalog.db");
+	const catalog = Catalog.open(path);
+	const first = catalog.createEnrollmentToken();
+	assert.equal(catalog.consumeEnrollmentToken(first.token), "ok");
+	assert.equal(catalog.consumeEnrollmentToken(first.token), "used");
+	assert.equal(catalog.consumeEnrollmentToken("missing"), "invalid");
+	const expired = catalog.createEnrollmentToken();
+	const client = new DatabaseSync(path);
+	client.prepare("UPDATE enrollment_token SET expires_at = ? WHERE used_at IS NULL").run("2020-01-01T00:00:00.000Z");
+	client.close();
+	assert.equal(catalog.consumeEnrollmentToken(expired.token), "expired");
+	catalog.close();
+});
+
+test("node secrets rotate and revoked credentials stay refused", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-credentials-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const catalog = Catalog.open(join(root, "catalog.db"));
+	catalog.enrollNode(IDENTITY, hashSecret("first"));
+	assert.equal(catalog.verifyNodeSecret(IDENTITY.id, "first"), "ok");
+	assert.equal(catalog.verifyNodeSecret(IDENTITY.id, "not-the-secret"), "invalid");
+	catalog.enrollNode(IDENTITY, hashSecret("second"));
+	assert.equal(catalog.verifyNodeSecret(IDENTITY.id, "first"), "invalid");
+	assert.equal(catalog.verifyNodeSecret(IDENTITY.id, "second"), "ok");
+	assert(catalog.revokeNode(IDENTITY.id));
+	assert.equal(catalog.verifyNodeSecret(IDENTITY.id, "not-the-secret"), "revoked");
+	catalog.close();
+});
+
+test("import binds to the archive node, sole enrolled node, or a placeholder", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ker-catalog-import-nodes-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const archiveNode = { id: "archive-node", name: "Archive laptop", createdAt: IDENTITY.createdAt };
+
+	const matching = Catalog.open(join(root, "matching.db"));
+	matching.enrollNode(archiveNode, hashSecret("matching"));
+	const matchingManifest = importManifest("00000000-0000-4000-8000-000000000001", archiveNode);
+	importManifestRows(matching, matchingManifest);
+	assert.equal(matching.get(matchingManifest.sessions[0]?.id ?? "")?.node_id, archiveNode.id);
+	matching.close();
+
+	const sole = Catalog.open(join(root, "sole.db"));
+	sole.enrollNode(IDENTITY, hashSecret("sole"));
+	const soleManifest = importManifest("00000000-0000-4000-8000-000000000002", archiveNode);
+	importManifestRows(sole, soleManifest);
+	assert.equal(sole.get(soleManifest.sessions[0]?.id ?? "")?.node_id, IDENTITY.id);
+	sole.close();
+
+	const placeholder = Catalog.open(join(root, "placeholder.db"));
+	placeholder.enrollNode(IDENTITY, hashSecret("first"));
+	placeholder.enrollNode({ id: "node-2", name: "second", createdAt: IDENTITY.createdAt }, hashSecret("second"));
+	const placeholderManifest = importManifest("00000000-0000-4000-8000-000000000003", archiveNode);
+	importManifestRows(placeholder, placeholderManifest);
+	assert.equal(placeholder.get(placeholderManifest.sessions[0]?.id ?? "")?.node_id, archiveNode.id);
+	assert.equal(placeholder.listNodes().find((item) => item.id === archiveNode.id)?.enrolled_at, null);
+	assert.equal(placeholder.listNodes().find((item) => item.id === archiveNode.id)?.name, archiveNode.name);
+	placeholder.enrollNode(archiveNode, hashSecret("later"));
+	assert.equal(placeholder.verifyNodeSecret(archiveNode.id, "later"), "ok");
+	placeholder.close();
+});
+
 function createV1Catalog(path: string): void {
 	const client = new DatabaseSync(path);
 	client.exec(V1_DDL);
@@ -598,6 +655,54 @@ function createV1Catalog(path: string): void {
 		);
 	client.exec("PRAGMA user_version = 1");
 	client.close();
+}
+
+function importManifest(sessionId: string, archiveNode: Protocol.ArchiveNode): Protocol.ArchiveManifest {
+	return {
+		format: 1,
+		exportedAt: "2026-09-08T00:00:00.000Z",
+		versions: { protocol: "25", store: 6, catalog: 4 },
+		project: { id: `project-${sessionId}`, name: "Imported", createdAt: archiveNode.createdAt },
+		nodes: [archiveNode],
+		workspaces: [
+			{
+				id: `workspace-${sessionId}`,
+				nodeId: archiveNode.id,
+				rootPath: `/work/${sessionId}`,
+				gitRemote: null,
+				createdAt: archiveNode.createdAt,
+			},
+		],
+		sessions: [
+			{
+				id: sessionId,
+				projectKey: Protocol.projectKey(`/work/${sessionId}`),
+				workspaceId: `workspace-${sessionId}`,
+				nodeId: archiveNode.id,
+				cwd: `/work/${sessionId}`,
+				title: null,
+				status: "idle",
+				error: null,
+				createdAt: archiveNode.createdAt,
+				updatedAt: archiveNode.createdAt,
+				file: `sessions/${sessionId}/session.jsonl`,
+			},
+		],
+		documents: [],
+	};
+}
+
+function importManifestRows(catalog: Catalog, manifest: Protocol.ArchiveManifest): void {
+	const session = manifest.sessions[0];
+	assert(session);
+	catalog.importRows(
+		manifest,
+		undefined,
+		new Map(),
+		new Map([[session.id, `/staging/${session.id}`]]),
+		() => undefined,
+		(sessionId) => ({ placed: true, path: `/sessions/${sessionId}` }),
+	);
 }
 
 function createV2Catalog(path: string): void {
@@ -626,6 +731,7 @@ async function corruptLeafPage(path: string, table: string): Promise<void> {
 function sessionDescriptor(id: string, projectRoot: string, cwd: string): Protocol.SessionDescriptor {
 	return {
 		id,
+		nodeId: IDENTITY.id,
 		projectRoot,
 		cwd,
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -634,7 +740,7 @@ function sessionDescriptor(id: string, projectRoot: string, cwd: string): Protoc
 }
 
 function catalogedSession(id: string, projectRoot: string, cwd: string, idle: boolean): CatalogedSession {
-	const key = projectKey(projectRoot);
+	const key = Protocol.projectKey(projectRoot);
 	return {
 		session: sessionDescriptor(id, projectRoot, cwd),
 		path: join("/sessions", key, id, "session.jsonl"),

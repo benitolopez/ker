@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, assert, test, vi } from "vitest";
 import { DocumentScreen } from "../src/screens/document.tsx";
 import { DocumentsScreen } from "../src/screens/documents.tsx";
+import { NodesScreen } from "../src/screens/nodes.tsx";
 import { ProjectHeader } from "../src/screens/project-header.tsx";
 import { ProjectsScreen } from "../src/screens/projects.tsx";
 import { FoldersStrip, SessionsScreen } from "../src/screens/sessions.tsx";
@@ -48,6 +49,23 @@ test("the composer morphs between disabled Send, Send, and Stop", async () => {
 	await waitFor(() => assert.deepEqual(stop.mock.calls, [["turn-running"]]));
 	view.rerender(<Composer queue={runningQueue("cancelling")} onSend={async () => promptAdmission()} onStop={stop} />);
 	assert.equal((screen.getByRole("button", { name: "Cancelling…" }) as HTMLButtonElement).disabled, true);
+});
+
+test("the composer keeps the transcript readable while its node is offline", () => {
+	render(
+		<Composer
+			offlineMessage="Laptop is offline. Reading works; sending resumes when it reconnects."
+			onSend={async () => promptAdmission()}
+			onStop={async (turnId) => cancellation(turnId)}
+			queue={emptyQueue()}
+		/>,
+	);
+	fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "send later" } });
+	assert.equal(
+		screen.getByText(/Reading works/).textContent,
+		"Laptop is offline. Reading works; sending resumes when it reconnects.",
+	);
+	assert.equal((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled, true);
 });
 
 test("the composer clears accepted text and keeps rejected text with guidance", async () => {
@@ -211,6 +229,7 @@ test("new session creation navigates to the empty transcript", async () => {
 			createWorkspace={async () => ({ ok: false, status: 500, error: { code: "unused" } })}
 			getProject={async () => projectResult()}
 			listProjectSessions={listProjectSessions}
+			listNodes={async () => nodeListResult()}
 			listWorkspaces={async () => ({ ok: true, status: 200, value: { workspaces: [] } })}
 			navigate={navigate}
 			projectId="project/one"
@@ -284,6 +303,87 @@ test("project import shows workspace conflicts", async () => {
 	await screen.findByText("/work/ker already belongs to project Existing");
 });
 
+test("nodes list connection state, create an enrollment, and revoke with confirmation", async () => {
+	const connected = node("node-connected", "Laptop", { connected: true });
+	const offline = node("node-offline", "Desktop", { lastSeenAt: "2026-01-02T00:00:00.000Z" });
+	const placeholder = node("node-placeholder", "Old machine");
+	const listNodes = vi.fn(async () => nodeListResult(connected, offline, placeholder));
+	const createEnrollment = vi.fn(
+		async () =>
+			({
+				ok: true,
+				status: 201,
+				value: {
+					token: "enrollment-token",
+					expiresAt: "2026-01-01T00:15:00.000Z",
+					command: "ker node --server http://127.0.0.1:5537 --token enrollment-token",
+				},
+			}) satisfies Result<Protocol.Enrollment>,
+	);
+	const revokeNode = vi.fn(
+		async (_nodeId: string) => ({ ok: true, status: 200, value: connected }) satisfies Result<Protocol.Node>,
+	);
+	render(<NodesScreen createEnrollment={createEnrollment} listNodes={listNodes} revokeNode={revokeNode} />);
+
+	await screen.findByText("Laptop");
+	assert.equal(screen.getByText("Connected").textContent, "Connected");
+	assert.match(screen.getByText(/Offline · last seen/).textContent ?? "", /Offline/);
+	assert.equal(screen.getByText("Never connected").textContent, "Never connected");
+	fireEvent.click(screen.getByRole("button", { name: "Enroll node" }));
+	await screen.findByText(/expires in 15 minutes/);
+	assert.equal(
+		screen.getByText(/ker node --server/).textContent,
+		"ker node --server http://127.0.0.1:5537 --token enrollment-token",
+	);
+	fireEvent.click(screen.getByRole("button", { name: "Copy command" }));
+	await screen.findByText(/Copied|Command selected/);
+
+	fireEvent.click(screen.getAllByRole("button", { name: "Revoke" })[0]);
+	await screen.findByText("Revoke Laptop?");
+	fireEvent.click(screen.getByRole("button", { name: "Confirm revoke" }));
+	await waitFor(() => assert.deepEqual(revokeNode.mock.calls, [[connected.id]]));
+});
+
+test("folders select a node and create a session in a named folder", async () => {
+	const firstNode = node("node-one", "Laptop", { connected: true, enrolledAt: "2026-01-01T00:00:00.000Z" });
+	const secondNode = node("node-two", "Desktop", { connected: true, enrolledAt: "2026-01-01T00:00:00.000Z" });
+	const createWorkspace = vi.fn(
+		async (_projectId: string, input: Protocol.WorkspaceRequest) =>
+			({ ok: true, status: 201, value: workspace("new", input.path, true) }) satisfies Result<Protocol.Workspace>,
+	);
+	const createWorkspaceSession = vi.fn(
+		async (_workspaceId: string) =>
+			({ ok: true, status: 201, value: catalogSession() }) satisfies Result<Protocol.ReadableCatalogSession>,
+	);
+	const navigate = vi.fn<(route: string) => void>();
+	render(
+		<FoldersStrip
+			createWorkspace={createWorkspace}
+			createWorkspaceSession={createWorkspaceSession}
+			listNodes={async () => nodeListResult(firstNode, secondNode)}
+			listWorkspaces={async () => ({
+				ok: true,
+				status: 200,
+				value: { workspaces: [workspace("workspace-two", "/work/ker", true)] },
+			})}
+			navigate={navigate}
+			projectId="project/one"
+		/>,
+	);
+
+	await screen.findByText("/work/ker");
+	const select = await screen.findByLabelText("Node");
+	fireEvent.change(select, { target: { value: secondNode.id } });
+	fireEvent.change(screen.getByLabelText("Folder path"), { target: { value: "/clone/ker" } });
+	fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+	await waitFor(() =>
+		assert.deepEqual(createWorkspace.mock.calls[0], ["project/one", { path: "/clone/ker", nodeId: secondNode.id }]),
+	);
+	fireEvent.click(screen.getByRole("button", { name: "New session" }));
+	await waitFor(() => assert.deepEqual(createWorkspaceSession.mock.calls, [["workspace-two"]]));
+	assert.deepEqual(navigate.mock.calls, [["#/projects/project%2Fone/sessions/session%20one"]]);
+});
+
 test("folders list existing paths first and refreshes after adding one", async () => {
 	const listWorkspaces = vi
 		.fn<() => Promise<Result<Protocol.ListWorkspacesResponse>>>()
@@ -303,7 +403,14 @@ test("folders list existing paths first and refreshes after adding one", async (
 		async (_projectId: string, input: Protocol.WorkspaceRequest) =>
 			({ ok: true, status: 201, value: workspace("new", input.path, true) }) satisfies Result<Protocol.Workspace>,
 	);
-	render(<FoldersStrip createWorkspace={createWorkspace} listWorkspaces={listWorkspaces} projectId="project/one" />);
+	render(
+		<FoldersStrip
+			createWorkspace={createWorkspace}
+			listNodes={async () => nodeListResult()}
+			listWorkspaces={listWorkspaces}
+			projectId="project/one"
+		/>,
+	);
 	await screen.findByText("/old/ker");
 	assert.deepEqual(
 		screen.getAllByText(/^\/(work|old)\/ker$/).map((item) => item.textContent),
@@ -333,6 +440,7 @@ test("folders explain invalid paths and project conflicts", async () => {
 		const view = render(
 			<FoldersStrip
 				createWorkspace={async () => ({ ok: false, status: 409, error: item.error })}
+				listNodes={async () => nodeListResult()}
 				listWorkspaces={async () => ({ ok: true, status: 200, value: { workspaces: [] } })}
 				projectId="project/one"
 			/>,
@@ -356,6 +464,7 @@ test("new session explains when no project folder exists", async () => {
 			createWorkspace={async () => ({ ok: false, status: 500, error: { code: "unused" } })}
 			getProject={async () => projectResult()}
 			listProjectSessions={async () => ({ ok: true, status: 200, value: { sessions: [] } })}
+			listNodes={async () => nodeListResult()}
 			listWorkspaces={listWorkspaces}
 			projectId="project/one"
 		/>,
@@ -656,6 +765,7 @@ function header() {
 	return {
 		session: {
 			id: "session-one",
+			nodeId: "node-one",
 			cwd: "/project",
 			projectRoot: "/project",
 			createdAt: "2026-01-01T00:00:00.000Z",
@@ -679,6 +789,7 @@ function catalogSession(): Protocol.ReadableCatalogSession {
 		projectName: "Project",
 		workspaceId: "workspace-one",
 		nodeId: "node-one",
+		nodeName: "Test node",
 		title: null,
 		createdAt: "2026-01-01T00:00:00.000Z",
 		updatedAt: "2026-01-01T00:00:00.000Z",
@@ -715,11 +826,30 @@ function importResult(): Protocol.ImportResult {
 	};
 }
 
+function node(id: string, name: string, overrides: Partial<Protocol.Node> = {}): Protocol.Node {
+	return {
+		id,
+		name,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		enrolledAt: null,
+		revokedAt: null,
+		lastSeenAt: null,
+		connected: false,
+		...overrides,
+	};
+}
+
+function nodeListResult(...nodes: Protocol.Node[]): Result<Protocol.ListNodesResponse> {
+	return { ok: true, status: 200, value: { nodes } };
+}
+
 function workspace(id: string, rootPath: string, exists: boolean): Protocol.Workspace {
 	return {
 		id,
 		projectId: "project/one",
 		nodeId: "node-one",
+		nodeName: "Test node",
+		nodeConnected: true,
 		rootPath,
 		gitRemote: "git@example.com:ker.git",
 		createdAt: "2026-01-01T00:00:00.000Z",

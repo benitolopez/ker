@@ -150,6 +150,7 @@ function controlCli(
 function descriptor(id: string): Protocol.SessionDescriptor {
 	return {
 		id,
+		nodeId: "node-1",
 		cwd: process.cwd(),
 		projectRoot: process.cwd(),
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -171,6 +172,7 @@ function catalogSession(
 		projectName,
 		workspaceId: "workspace-1",
 		nodeId: "node-1",
+		nodeName: "test-node",
 		title,
 		createdAt: session.createdAt,
 		updatedAt: session.updatedAt,

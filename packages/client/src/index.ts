@@ -12,12 +12,15 @@ export type Subscription =
 	| { kind: "error"; status: number; error: Protocol.ErrorBody };
 
 export interface Client {
+	listNodes(signal?: AbortSignal): Promise<Result<Protocol.ListNodesResponse>>;
+	createEnrollment(signal?: AbortSignal): Promise<Result<Protocol.Enrollment>>;
+	revokeNode(nodeId: Protocol.NodeId, signal?: AbortSignal): Promise<Result<Protocol.Node>>;
 	health(signal?: AbortSignal): Promise<Result<Protocol.Health>>;
 	openapi(signal?: AbortSignal): Promise<Result<Record<string, unknown>>>;
 	listProjects(signal?: AbortSignal): Promise<Result<Protocol.ListProjectsResponse>>;
 	getProject(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Protocol.Project>>;
 	exportProject(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Blob>>;
-	importProject(archive: Blob, signal?: AbortSignal): Promise<Result<Protocol.ImportResult>>;
+	importProject(archive: Blob, nodeId?: Protocol.NodeId, signal?: AbortSignal): Promise<Result<Protocol.ImportResult>>;
 	listWorkspaces(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Protocol.ListWorkspacesResponse>>;
 	createWorkspace(
 		projectId: Protocol.ProjectId,
@@ -33,6 +36,10 @@ export interface Client {
 		projectId: Protocol.ProjectId,
 		signal?: AbortSignal,
 	): Promise<Result<Protocol.ReadableCatalogSession>>;
+	createWorkspaceSession(
+		workspaceId: Protocol.WorkspaceId,
+		signal?: AbortSignal,
+	): Promise<Result<Protocol.ReadableCatalogSession>>;
 	listDocuments(projectId: Protocol.ProjectId, signal?: AbortSignal): Promise<Result<Protocol.ListDocumentsResponse>>;
 	createDocument(
 		projectId: Protocol.ProjectId,
@@ -46,9 +53,13 @@ export interface Client {
 		signal?: AbortSignal,
 	): Promise<Result<Protocol.Document>>;
 	deleteDocument(documentId: Protocol.DocumentId, signal?: AbortSignal): Promise<Result<Protocol.Document>>;
-	createSession(cwd: string, signal?: AbortSignal): Promise<Result<Protocol.SessionDescriptor>>;
+	createSession(
+		cwd: string,
+		nodeId?: Protocol.NodeId,
+		signal?: AbortSignal,
+	): Promise<Result<Protocol.SessionDescriptor>>;
 	listSessions(
-		scope: { cwd: string } | { all: true },
+		scope: { cwd: string; nodeId?: Protocol.NodeId } | { all: true },
 		signal?: AbortSignal,
 	): Promise<Result<Protocol.ListSessionsResponse>>;
 	snapshot(id: Protocol.SessionId, signal?: AbortSignal): Promise<Result<Protocol.SessionSnapshot>>;
@@ -91,18 +102,31 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 	};
 
 	return {
+		listNodes: (signal) => request(routes.listNodes.path, { signal }),
+		createEnrollment: (signal) =>
+			request(routes.createEnrollment.path, { method: routes.createEnrollment.method, signal }),
+		revokeNode: (nodeId, signal) =>
+			request(routes.revokeNode.path, { method: routes.revokeNode.method, signal }, { nodeId }),
 		health: (signal) => request(routes.health.path, { signal }),
 		openapi: (signal) => request(routes.openapi.path, { signal }),
 		listProjects: (signal) => request(routes.listProjects.path, { signal }),
 		getProject: (projectId, signal) => request(routes.getProject.path, { signal }, { projectId }),
 		exportProject: (projectId, signal) => requestBlob(routes.exportProject.path, { signal }, { projectId }),
-		importProject: (archive, signal) =>
-			request(routes.importProject.path, {
-				method: routes.importProject.method,
-				headers: { "content-type": "application/zip" },
-				body: archive,
-				signal,
-			}),
+		importProject: (archive, nodeId, signal) => {
+			const query = new URLSearchParams();
+			if (nodeId !== undefined) query.set("nodeId", nodeId);
+			return request(
+				routes.importProject.path,
+				{
+					method: routes.importProject.method,
+					headers: { "content-type": "application/zip" },
+					body: archive,
+					signal,
+				},
+				{},
+				query.size > 0 ? query : undefined,
+			);
+		},
 		listWorkspaces: (projectId, signal) => request(routes.listWorkspaces.path, { signal }, { projectId }),
 		createWorkspace: (projectId, input, signal) =>
 			request(
@@ -119,6 +143,12 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 		listProjectSessions: (projectId, signal) => request(routes.listProjectSessions.path, { signal }, { projectId }),
 		createProjectSession: (projectId, signal) =>
 			request(routes.createProjectSession.path, { method: routes.createProjectSession.method, signal }, { projectId }),
+		createWorkspaceSession: (workspaceId, signal) =>
+			request(
+				routes.createWorkspaceSession.path,
+				{ method: routes.createWorkspaceSession.method, signal },
+				{ workspaceId },
+			),
 		listDocuments: (projectId, signal) => request(routes.listDocuments.path, { signal }, { projectId }),
 		createDocument: (projectId, input, signal) =>
 			request(
@@ -145,11 +175,14 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 			),
 		deleteDocument: (documentId, signal) =>
 			request(routes.deleteDocument.path, { method: routes.deleteDocument.method, signal }, { documentId }),
-		createSession: (cwd, signal) =>
+		createSession: (cwd, nodeId, signal) =>
 			request(routes.createSession.path, {
 				method: routes.createSession.method,
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ cwd } satisfies Protocol.CreateSessionRequest),
+				body: JSON.stringify({
+					cwd,
+					...(nodeId === undefined ? {} : { nodeId }),
+				} satisfies Protocol.CreateSessionRequest),
 				signal,
 			}),
 		listSessions: (scope, signal) =>
@@ -157,7 +190,9 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 				routes.listSessions.path,
 				{ signal },
 				{},
-				"all" in scope ? new URLSearchParams({ scope: "all" }) : new URLSearchParams({ cwd: scope.cwd }),
+				"all" in scope
+					? new URLSearchParams({ scope: "all" })
+					: new URLSearchParams({ cwd: scope.cwd, ...(scope.nodeId === undefined ? {} : { nodeId: scope.nodeId }) }),
 			),
 		snapshot: (id, signal) => request(routes.snapshot.path, { signal }, { sessionId: id }),
 		prompt: (id, text, signal) =>

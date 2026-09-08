@@ -8,6 +8,7 @@ export interface NodeIdentity {
 	id: Protocol.NodeId;
 	name: string;
 	createdAt: string;
+	server?: { url: string; secret: string };
 }
 
 export function loadNodeIdentity(path: string): NodeIdentity {
@@ -30,6 +31,13 @@ export function loadNodeIdentity(path: string): NodeIdentity {
 
 export function defaultNodePath(): string {
 	return process.env.KER_NODE_PATH ?? join(homedir(), ".ker", "node.json");
+}
+
+export function saveNodeServer(path: string, identity: NodeIdentity, server: { url: string; secret: string }): void {
+	const next: NodeIdentity = { ...identity, server };
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	writeFileSync(path, `${JSON.stringify(next)}\n`, { encoding: "utf8", mode: 0o600 });
+	chmodSync(path, 0o600);
 }
 
 function parseNodeIdentity(contents: string, path: string): NodeIdentity {
@@ -55,5 +63,24 @@ function parseNodeIdentity(contents: string, path: string): NodeIdentity {
 	) {
 		throw new Error(`Invalid node identity in ${path}`);
 	}
-	return { id: parsed.id, name: parsed.name, createdAt: parsed.createdAt };
+	const server = "server" in parsed ? parsed.server : undefined;
+	if (
+		server !== undefined &&
+		(typeof server !== "object" ||
+			server === null ||
+			Array.isArray(server) ||
+			!("url" in server) ||
+			typeof server.url !== "string" ||
+			!("secret" in server) ||
+			typeof server.secret !== "string")
+	) {
+		throw new Error(`Invalid node identity in ${path}`);
+	}
+	const parsedServer = server as { url: string; secret: string } | undefined;
+	return {
+		id: parsed.id,
+		name: parsed.name,
+		createdAt: parsed.createdAt,
+		...(parsedServer === undefined ? {} : { server: parsedServer }),
+	};
 }

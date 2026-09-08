@@ -9,7 +9,7 @@
   "engines": { "node": ">=24.0.0" },
   "scripts": {
     "clean": "npm run clean --workspaces --if-present",
-    "build": "cd packages/protocol && npm run build && cd ../config && npm run build && cd ../llm && npm run build && cd ../auth && npm run build && cd ../engine && npm run build && cd ../agent && npm run build && cd ../daemon && npm run build && cd ../client && npm run build && cd ../gui && npm run build && cd ../cli && npm run build",
+    "build": "cd packages/protocol && npm run build && cd ../config && npm run build && cd ../llm && npm run build && cd ../auth && npm run build && cd ../engine && npm run build && cd ../agent && npm run build && cd ../store && npm run build && cd ../node && npm run build && cd ../server && npm run build && cd ../daemon && npm run build && cd ../client && npm run build && cd ../gui && npm run build && cd ../cli && npm run build",
     "check": "biome check --error-on-warnings packages && tsgo --noEmit && tsgo --noEmit -p packages/gui/tsconfig.json",
     "fix": "biome check --write packages",
     "test": "npm run test --workspaces --if-present"
@@ -17,6 +17,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.3.5",
     "@types/node": "22.19.19",
+	"@types/ws": "8.18.1",
     "@typescript/native-preview": "7.0.0-dev.20260120.1",
     "shx": "0.4.0",
     "typescript": "5.9.3"

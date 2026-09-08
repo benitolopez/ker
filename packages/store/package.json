@@ -1,0 +1,18 @@
+{
+  "name": "@ker-ai/store",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "author": "Benito Lopez",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./src/index.ts" },
+  "engines": { "node": ">=24.0.0" },
+  "dependencies": { "@ker-ai/protocol": "^0.0.0" },
+  "scripts": {
+    "build": "tsgo -p tsconfig.build.json",
+    "clean": "shx rm -rf dist",
+    "test": "node --test test/*.test.ts"
+  }
+}
