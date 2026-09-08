@@ -303,11 +303,12 @@ test("project import shows workspace conflicts", async () => {
 	await screen.findByText("/work/ker already belongs to project Existing");
 });
 
-test("nodes list connection state, create an enrollment, and revoke with confirmation", async () => {
+test("nodes mark this machine, list connection state, create an enrollment, and revoke with confirmation", async () => {
+	const local = node("node-local", "Local", { connected: true, local: true });
 	const connected = node("node-connected", "Laptop", { connected: true });
 	const offline = node("node-offline", "Desktop", { lastSeenAt: "2026-01-02T00:00:00.000Z" });
 	const placeholder = node("node-placeholder", "Old machine");
-	const listNodes = vi.fn(async () => nodeListResult(connected, offline, placeholder));
+	const listNodes = vi.fn(async () => nodeListResult(local, connected, offline, placeholder));
 	const createEnrollment = vi.fn(
 		async () =>
 			({
@@ -326,7 +327,9 @@ test("nodes list connection state, create an enrollment, and revoke with confirm
 	render(<NodesScreen createEnrollment={createEnrollment} listNodes={listNodes} revokeNode={revokeNode} />);
 
 	await screen.findByText("Laptop");
-	assert.equal(screen.getByText("Connected").textContent, "Connected");
+	assert.equal(screen.getByText("This machine").textContent, "This machine");
+	assert.equal(screen.getAllByText("Connected").length, 2);
+	assert.equal(screen.getAllByRole("button", { name: "Revoke" }).length, 3);
 	assert.match(screen.getByText(/Offline · last seen/).textContent ?? "", /Offline/);
 	assert.equal(screen.getByText("Never connected").textContent, "Never connected");
 	fireEvent.click(screen.getByRole("button", { name: "Enroll node" }));
@@ -834,6 +837,7 @@ function node(id: string, name: string, overrides: Partial<Protocol.Node> = {}):
 		enrolledAt: null,
 		revokedAt: null,
 		lastSeenAt: null,
+		local: false,
 		connected: false,
 		...overrides,
 	};

@@ -24,6 +24,7 @@ test("daemon responses conform to the route table", async (t) => {
 	);
 	const node = nodes.nodes[0];
 	assert(node);
+	assert.equal(node.local, process.env.KER_TEST_MODE !== "remote");
 	await assertJson<Protocol.Enrollment>(
 		"createEnrollment",
 		await localFetch(`${running.url}/nodes/enrollments`, { method: "POST" }),
@@ -209,7 +210,20 @@ test("daemon responses conform to the route table", async (t) => {
 	assert.equal(unknown.status, 404);
 	assert(Value.Check(Protocol.ErrorBody, await readJson(unknown.body)));
 	await assertJson("revokeNode", await localFetch(`${running.url}/nodes/missing/revoke`, { method: "POST" }), 404);
-	await assertJson("revokeNode", await localFetch(`${running.url}/nodes/${node.id}/revoke`, { method: "POST" }), 200);
+	await assertJson(
+		"revokeNode",
+		await localFetch(`${running.url}/nodes/${node.id}/revoke`, { method: "POST" }),
+		node.local ? 409 : 200,
+	);
+	if (node.local) {
+		const afterRevoke = await assertJson<Protocol.ListNodesResponse>(
+			"listNodes",
+			await localFetch(`${running.url}/nodes`),
+			200,
+		);
+		assert.equal(afterRevoke.nodes[0]?.connected, true);
+		assert.equal(afterRevoke.nodes[0]?.revokedAt, null);
+	}
 });
 
 async function assertJson<T = unknown>(key: RouteKey, response: TestResponse, status: number): Promise<T> {

@@ -77,6 +77,7 @@ export const routes = {
 			200: Node,
 			403: errorBody("forbidden"),
 			404: errorBody("node_not_found"),
+			409: errorBody("node_local"),
 			500: errorBody("internal"),
 		},
 	},

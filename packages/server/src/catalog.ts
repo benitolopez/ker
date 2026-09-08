@@ -136,7 +136,10 @@ export class Catalog {
 		this.#db
 			.insert(node)
 			.values({ id: identity.id, name: identity.name, created_at: identity.createdAt, enrolled_at: identity.createdAt })
-			.onConflictDoUpdate({ target: node.id, set: { name: identity.name, enrolled_at: identity.createdAt } })
+			.onConflictDoUpdate({
+				target: node.id,
+				set: { name: identity.name, enrolled_at: identity.createdAt, revoked_at: null },
+			})
 			.run();
 	}
 

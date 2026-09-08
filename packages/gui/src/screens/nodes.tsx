@@ -141,7 +141,9 @@ export function NodesScreen({
 										: "Never connected"}
 							</p>
 						</div>
-						{node.revokedAt ? (
+						{node.local ? (
+							<span className="text-xs font-semibold text-[var(--muted)]">This machine</span>
+						) : node.revokedAt ? (
 							<span className="text-xs font-semibold text-red-600">Revoked</span>
 						) : confirming === node.id ? (
 							<div className="flex flex-wrap items-center justify-end gap-2 text-sm">

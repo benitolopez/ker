@@ -47,6 +47,8 @@ export class SessionUnreadableError extends Error {
 
 export class WorkspaceNotFoundError extends Error {}
 
+export class LocalNodeError extends Error {}
+
 export class ControlPlane {
 	readonly nodes: NodeRegistry;
 	readonly #store: SessionStore;
@@ -458,6 +460,7 @@ export class ControlPlane {
 			enrolledAt: node.enrolled_at,
 			revokedAt: node.revoked_at,
 			lastSeenAt: node.last_seen_at,
+			local: node.id === this.#localIdentity?.id,
 			connected: this.nodes.get(node.id) !== undefined,
 		}));
 	}
@@ -473,6 +476,7 @@ export class ControlPlane {
 	}
 
 	revokeNode(nodeId: Protocol.NodeId): Protocol.Node | undefined {
+		if (nodeId === this.#localIdentity?.id) throw new LocalNodeError();
 		const row = this.#catalog.revokeNode(nodeId);
 		if (!row) return undefined;
 		const handle = this.nodes.get(nodeId);
@@ -485,6 +489,7 @@ export class ControlPlane {
 			enrolledAt: row.enrolled_at,
 			revokedAt: row.revoked_at,
 			lastSeenAt: row.last_seen_at,
+			local: false,
 			connected: false,
 		};
 	}

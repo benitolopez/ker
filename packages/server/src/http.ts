@@ -19,7 +19,7 @@ import {
 	NodeUnavailableError,
 	RemoteCallError,
 } from "./nodes.ts";
-import { ControlPlane, SessionUnreadableError, WorkspaceNotFoundError } from "./plane.ts";
+import { ControlPlane, LocalNodeError, SessionUnreadableError, WorkspaceNotFoundError } from "./plane.ts";
 import { attachNodeSocket } from "./socket.ts";
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -190,6 +190,10 @@ async function handleRequest(
 			}
 			if (error instanceof NodeNotFoundError) {
 				writeJson(res, 404, { code: "node_not_found" });
+				return;
+			}
+			if (error instanceof LocalNodeError) {
+				writeJson(res, 409, { code: "node_local" });
 				return;
 			}
 			if (error instanceof WorkspaceNotFoundError) {

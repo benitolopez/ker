@@ -205,6 +205,29 @@
               }
             }
           },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "const": "node_local",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code"
+                  ]
+                }
+              }
+            }
+          },
           "500": {
             "description": "Error",
             "content": {
@@ -4136,6 +4159,9 @@
               }
             ]
           },
+          "local": {
+            "type": "boolean"
+          },
           "connected": {
             "type": "boolean"
           }
@@ -4147,6 +4173,7 @@
           "enrolledAt",
           "revokedAt",
           "lastSeenAt",
+          "local",
           "connected"
         ]
       },

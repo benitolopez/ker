@@ -25,6 +25,7 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	assert.deepEqual(health.value, { name: "ker", protocol: PROTOCOL_VERSION });
 	const nodes = await client.listNodes();
 	assert(nodes.ok);
+	assert.equal(nodes.value.nodes[0]?.local, true);
 	const nodeId = nodes.value.nodes[0]?.id;
 	assert(nodeId);
 	const enrollment = await client.createEnrollment();
@@ -162,8 +163,15 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 		assert.equal(missingStream.error.code, "session_not_found");
 	}
 	const revoked = await client.revokeNode(nodeId);
-	assert(revoked.ok);
-	assert(revoked.value.revokedAt);
+	assert.equal(revoked.ok, false);
+	if (!revoked.ok) {
+		assert.equal(revoked.status, 409);
+		assert.equal(revoked.error.code, "node_local");
+	}
+	const nodesAfterRevoke = await client.listNodes();
+	assert(nodesAfterRevoke.ok);
+	assert.equal(nodesAfterRevoke.value.nodes[0]?.connected, true);
+	assert.equal(nodesAfterRevoke.value.nodes[0]?.revokedAt, null);
 });
 
 test("attach yields a snapshot and a live streamed turn", async (t) => {

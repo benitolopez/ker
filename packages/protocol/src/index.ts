@@ -141,6 +141,7 @@ export const Node = Type.Object(
 		enrolledAt: Type.Union([Type.String(), Type.Null()]),
 		revokedAt: Type.Union([Type.String(), Type.Null()]),
 		lastSeenAt: Type.Union([Type.String(), Type.Null()]),
+		local: Type.Boolean(),
 		connected: Type.Boolean(),
 	},
 	{ additionalProperties: false },

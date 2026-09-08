@@ -375,13 +375,14 @@ test("migrates a v2 catalog to v3 with session rows intact", async (t) => {
 	client.close();
 });
 
-test("upserts node names and returns the existing workspace after a duplicate create", async (t) => {
+test("upserts and heals the local node and returns the existing workspace after a duplicate create", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "ker-catalog-binding-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const path = join(root, "catalog.db");
 	const catalog = Catalog.open(path);
 	t.after(() => catalog.close());
 	catalog.upsertNode(IDENTITY);
+	assert(catalog.revokeNode(IDENTITY.id));
 	catalog.upsertNode({ ...IDENTITY, name: "renamed" });
 	const first = catalog.createWorkspace({
 		nodeId: IDENTITY.id,
@@ -399,10 +400,12 @@ test("upserts node names and returns the existing workspace after a duplicate cr
 	assert.deepEqual(second, first);
 	assert.deepEqual(catalog.findWorkspaceByRoot(IDENTITY.id, "/project"), first);
 	const client = new DatabaseSync(path);
-	assert.equal(
-		(client.prepare("SELECT name FROM node WHERE id = ?").get(IDENTITY.id) as { name: string }).name,
-		"renamed",
-	);
+	const localNode = client.prepare("SELECT name, revoked_at FROM node WHERE id = ?").get(IDENTITY.id) as {
+		name: string;
+		revoked_at: string | null;
+	};
+	assert.equal(localNode.name, "renamed");
+	assert.equal(localNode.revoked_at, null);
 	assert.equal((client.prepare("SELECT count(*) AS count FROM project").get() as { count: number }).count, 1);
 	client.close();
 });

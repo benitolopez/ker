@@ -18,7 +18,8 @@ only that secret's hash, and returns the secret once in `welcome`.
 The node writes the server URL and secret to `~/.ker/node.json` with mode `0600`. Later connections
 send `auth` with the node ID and secret. Enrolling the same node identity again rotates its secret.
 Revocation disconnects the active socket and prevents later authentication without deleting the
-node's catalog rows or session logs.
+node's catalog rows or session logs. The bundled daemon marks its in-process node as local and
+refuses to revoke it.
 
 The first frame must be `enroll` or `auth` and must arrive within five seconds. Invalid, expired, or
 spent tokens, invalid credentials, revoked nodes, and incompatible versions receive `refused` and
