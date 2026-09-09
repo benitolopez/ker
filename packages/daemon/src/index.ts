@@ -22,6 +22,7 @@ export interface DaemonOptions {
 	recoveryWindowMinutes?: number;
 	compaction?: NodeOptions["compaction"];
 	guiDir?: string;
+	publicUrl?: string;
 }
 
 export type Daemon = KerServer;
@@ -34,6 +35,7 @@ export function createDaemon(options: DaemonOptions = {}): Daemon {
 		catalogPath: options.catalogPath,
 		eventTailSize: options.eventTailSize,
 		guiDir: options.guiDir,
+		publicUrl: options.publicUrl,
 		nodes,
 		localIdentity: identity,
 	});

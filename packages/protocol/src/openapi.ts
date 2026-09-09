@@ -4,6 +4,12 @@ import { type RouteDefinition, type RouteKey, routes } from "./routes.ts";
 
 export const components = {
 	Actor: Protocol.Actor,
+	AuthMode: Protocol.AuthMode,
+	Device: Protocol.Device,
+	ListDevicesResponse: Protocol.ListDevicesResponse,
+	Pairing: Protocol.Pairing,
+	ClaimPairingRequest: Protocol.ClaimPairingRequest,
+
 	ModelRole: Protocol.ModelRole,
 	AdmissionStatus: Protocol.AdmissionStatus,
 	CancellationStatus: Protocol.CancellationStatus,

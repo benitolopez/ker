@@ -1,6 +1,8 @@
 export type Route =
 	| { screen: "projects" }
 	| { screen: "nodes" }
+	| { screen: "devices" }
+	| { screen: "pair"; code: string }
 	| { screen: "sessions"; projectId: string }
 	| { screen: "transcript"; projectId: string; sessionId: string }
 	| { screen: "documents"; projectId: string }
@@ -9,9 +11,11 @@ export type Route =
 export function parseHash(hash: string): Route {
 	const path = hash.replace(/^#\/?/, "").replace(/\/$/, "");
 	if (!path || path === "projects") return { screen: "projects" };
+	if (path === "devices") return { screen: "devices" };
 	if (path === "nodes") return { screen: "nodes" };
 	try {
 		const segments = path.split("/").map(decodeURIComponent);
+		if (segments.length === 2 && segments[0] === "pair" && segments[1]) return { screen: "pair", code: segments[1] };
 		if (segments.length === 3 && segments[0] === "projects" && segments[2] === "sessions") {
 			return { screen: "sessions", projectId: segments[1] };
 		}
@@ -30,6 +34,8 @@ export function parseHash(hash: string): Route {
 
 export function formatRoute(route: Route): string {
 	if (route.screen === "projects") return "#/projects";
+	if (route.screen === "devices") return "#/devices";
+	if (route.screen === "pair") return `#/pair/${encodeURIComponent(route.code)}`;
 	if (route.screen === "nodes") return "#/nodes";
 	const project = encodeURIComponent(route.projectId);
 	if (route.screen === "sessions") return `#/projects/${project}/sessions`;

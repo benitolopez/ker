@@ -4,6 +4,7 @@ import { api } from "../api.ts";
 import { formatDate } from "../format.ts";
 import { useVisiblePoll } from "../hooks/use-visible-poll.ts";
 import { formatRoute } from "../router.ts";
+import { useAuth } from "../store/auth.ts";
 
 interface ProjectsState {
 	projects: Protocol.Project[];
@@ -20,6 +21,7 @@ export function ProjectsScreen({
 	listProjects?: typeof api.listProjects;
 	importProject?: typeof api.importProject;
 } = {}) {
+	const auth = useAuth();
 	const [state, setState] = useState<ProjectsState>({ projects: [], loaded: false });
 	const [importing, setImporting] = useState(false);
 	const [importState, setImportState] = useState<ImportState>();
@@ -69,20 +71,28 @@ export function ProjectsScreen({
 
 	return (
 		<main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-5 py-10 sm:px-8 lg:px-12">
-			<header className="mb-10 flex items-end justify-between gap-6">
+			<header className="mb-10 flex flex-wrap items-end justify-between gap-6">
 				<div>
 					<p className="mb-2 font-mono text-xs font-semibold tracking-[0.22em] text-[var(--muted)] uppercase">
 						Control plane
 					</p>
 					<h1 className="text-4xl font-semibold tracking-[-0.04em] text-[var(--text)] sm:text-5xl">Projects</h1>
 				</div>
-				<div className="flex items-center gap-3">
+				<div className="flex flex-wrap items-center gap-3">
 					<a
 						className="rounded-xl border border-[var(--line)] bg-[var(--surface)] px-4 py-2.5 text-sm font-semibold text-[var(--text)] shadow-[var(--shadow)]"
 						href={formatRoute({ screen: "nodes" })}
 					>
 						Nodes
 					</a>
+					{auth.mode === "device" ? (
+						<a
+							className="rounded-xl border border-[var(--line)] bg-[var(--surface)] px-4 py-2.5 text-sm font-semibold text-[var(--text)] shadow-[var(--shadow)]"
+							href={formatRoute({ screen: "devices" })}
+						>
+							Devices
+						</a>
+					) : null}
 					<label className="cursor-pointer rounded-xl border border-[var(--line)] bg-[var(--surface)] px-4 py-2.5 text-sm font-semibold text-[var(--text)] shadow-[var(--shadow)]">
 						{importing ? "Importing…" : "Import"}
 						<input

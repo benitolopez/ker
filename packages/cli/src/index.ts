@@ -3,8 +3,9 @@ import { createClient, type Result, type Subscription } from "@ker-ai/client";
 import * as Daemon from "@ker-ai/daemon";
 import * as NodeRuntime from "@ker-ai/node";
 import type * as Protocol from "@ker-ai/protocol";
-import { DEFAULT_PORT, PROTOCOL_VERSION } from "@ker-ai/protocol";
+import { PROTOCOL_VERSION } from "@ker-ai/protocol";
 import * as Server from "@ker-ai/server";
+import QRCode from "qrcode";
 import { identityChangeRemediation } from "./error.ts";
 import { runLogin, runLogout } from "./login.ts";
 
@@ -29,8 +30,23 @@ export async function run(): Promise<void> {
 	const json = args.includes("--json");
 	const all = args.includes("--all");
 	const positional = args.filter((arg) => arg !== "--json" && arg !== "--all");
-	if (args.length === 1 && args[0] === "server") {
-		runServer();
+	if (args[0] === "server" || args[0] === "daemon") {
+		try {
+			const options = Server.resolveListenOptions(parseListenFlags(args.slice(1)));
+			const server =
+				args[0] === "server"
+					? Server.createServer({ publicUrl: options.publicUrl?.origin })
+					: Daemon.createDaemon({ publicUrl: options.publicUrl?.origin });
+			listen(server, args[0], options);
+		} catch (error) {
+			if (!(error instanceof Server.ListenOptionsError)) throw error;
+			process.stderr.write(`ker: ${error.message}\n`);
+			process.exitCode = 1;
+		}
+		return;
+	}
+	if (args.length === 1 && args[0] === "pair") {
+		await runPair();
 		return;
 	}
 	if (args[0] === "node") {
@@ -46,10 +62,6 @@ export async function run(): Promise<void> {
 	if (all && !(positional.length === 1 && positional[0] === "sessions")) {
 		writeUsage();
 		process.exitCode = 1;
-		return;
-	}
-	if (positional.length === 1 && positional[0] === "daemon") {
-		runDaemon();
 		return;
 	}
 	if (positional.length === 1 && positional[0] === "login") {
@@ -96,6 +108,7 @@ export async function run(): Promise<void> {
 		"daemon",
 		"server",
 		"node",
+		"pair",
 		"login",
 		"logout",
 		"new",
@@ -429,34 +442,20 @@ async function runCompact(sessionId: Protocol.SessionId, json: boolean): Promise
 	}
 }
 
-// Signals stop new connections, abort the active turn cleanly, and leave waiting work persisted.
-function runDaemon(): void {
-	const server = Daemon.createDaemon();
-	server.once("error", (error) => {
-		if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-		process.stderr.write(`ker: port ${DEFAULT_PORT} is in use — is another ker daemon running?\n`);
+async function runPair(): Promise<void> {
+	const catalogPath = Server.defaultCatalogPath();
+	const pairing = Server.createPairingLink(catalogPath);
+	if (typeof pairing === "string") {
+		process.stderr.write(
+			pairing === "missing"
+				? `ker: no catalog at ${catalogPath}; start the server first\n`
+				: "ker: pairing needs a server started with --public-url\n",
+		);
 		process.exitCode = 1;
-	});
-	server.listen(DEFAULT_PORT, "127.0.0.1", () => {
-		process.stderr.write(`ker daemon listening on http://127.0.0.1:${DEFAULT_PORT}\n`);
-	});
-	let shuttingDown = false;
-	const shutdown = () => {
-		if (shuttingDown) return;
-		shuttingDown = true;
-		void (async () => {
-			await server.shutdown();
-			server.closeAllConnections();
-			await new Promise<void>((resolve) => server.close(() => resolve()));
-		})();
-	};
-	process.once("SIGINT", shutdown);
-	process.once("SIGTERM", shutdown);
-}
-
-function runServer(): void {
-	const server = Server.createServer();
-	listen(server, "server");
+		return;
+	}
+	process.stdout.write(`${pairing.url}\nexpires ${pairing.expiresAt}\n`);
+	process.stdout.write(await QRCode.toString(pairing.url, { type: "terminal", small: true }));
 }
 
 async function runNode(options: { serverUrl?: string; token?: string }): Promise<void> {
@@ -474,14 +473,18 @@ async function runNode(options: { serverUrl?: string; token?: string }): Promise
 	process.once("SIGTERM", shutdown);
 }
 
-function listen(server: Server.KerServer, mode: "server"): void {
+// Signals finish runtime shutdown before closing the HTTP listener.
+function listen(server: Server.KerServer, mode: "server" | "daemon", options: Server.ListenOptions): void {
 	server.once("error", (error) => {
 		if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-		process.stderr.write(`ker: port ${DEFAULT_PORT} is in use — is another ker process running?\n`);
+		process.stderr.write(`ker: port ${options.port} is in use — is another ker process running?\n`);
 		process.exitCode = 1;
 	});
-	server.listen(DEFAULT_PORT, "127.0.0.1", () => {
-		process.stderr.write(`ker ${mode} listening on http://127.0.0.1:${DEFAULT_PORT}\n`);
+	server.listen(options.port, options.host, () => {
+		const host = options.host.includes(":") ? `[${options.host}]` : options.host;
+		process.stderr.write(`ker ${mode} listening on http://${host}:${options.port}\n`);
+		if (options.publicUrl)
+			process.stderr.write(`public URL ${options.publicUrl.origin}; expecting a TLS-terminating proxy in front\n`);
 	});
 	let shuttingDown = false;
 	const shutdown = () => {
@@ -495,6 +498,21 @@ function listen(server: Server.KerServer, mode: "server"): void {
 	};
 	process.once("SIGINT", shutdown);
 	process.once("SIGTERM", shutdown);
+}
+
+function parseListenFlags(args: string[]): { host?: string; port?: string; publicUrl?: string } {
+	const flags: { host?: string; port?: string; publicUrl?: string } = {};
+	for (let index = 0; index < args.length; index += 2) {
+		const name = args[index];
+		const value = args[index + 1];
+		if (!["--host", "--port", "--public-url"].includes(name))
+			throw new Server.ListenOptionsError(`Unknown listen option ${name}`);
+		if (!value || value.startsWith("--")) throw new Server.ListenOptionsError(`Missing value for ${name}`);
+		if (name === "--host") flags.host = value;
+		if (name === "--port") flags.port = value;
+		if (name === "--public-url") flags.publicUrl = value;
+	}
+	return flags;
 }
 
 function parseNodeOptions(args: string[]): { serverUrl?: string; token?: string } | undefined {
@@ -1043,6 +1061,6 @@ async function checkHealth(signal?: AbortSignal): Promise<boolean> {
 
 function writeUsage(): void {
 	process.stderr.write(
-		"usage: ker [--json] new | sessions [--all] | stats [id] | cancel [id] | compact [id] | monitor [id]\n       ker [--json] [--session <id> | -c|--continue] <prompt>\n       ker daemon | server | node [--server <url>] [--token <token>] | login | logout\n",
+		"usage: ker [--json] new | sessions [--all] | stats [id] | cancel [id] | compact [id] | monitor [id]\n       ker [--json] [--session <id> | -c|--continue] <prompt>\n       ker daemon [--host <addr>] [--port <n>] [--public-url <https-origin>]\n       ker server [--host <addr>] [--port <n>] [--public-url <https-origin>]\n       ker node [--server <url>] [--token <token>]\n       ker pair | login | logout\n",
 	);
 }

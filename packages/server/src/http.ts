@@ -9,9 +9,9 @@ import { createOpenApiJson } from "@ker-ai/protocol/openapi";
 import { type RouteDefinition, type RouteKey, routes } from "@ker-ai/protocol/routes";
 import { SessionStore } from "@ker-ai/store";
 import { Value } from "@sinclair/typebox/value";
+import { type Access, acceptsRequest, parsePublicUrl, requiresOrigin } from "./access.ts";
 import { ArchiveTooLargeError, InvalidArchiveError, MAX_ARCHIVE_BYTES, UnsupportedArchiveError } from "./archive.ts";
 import { defaultCatalogPath, WorkspaceConflictError } from "./catalog.ts";
-import { isLocalRequest } from "./local.ts";
 import {
 	NodeAmbiguousError,
 	NodeNotFoundError,
@@ -19,8 +19,17 @@ import {
 	NodeUnavailableError,
 	RemoteCallError,
 } from "./nodes.ts";
-import { ControlPlane, LocalNodeError, SessionUnreadableError, WorkspaceNotFoundError } from "./plane.ts";
+import {
+	AuthLocalError,
+	ControlPlane,
+	LocalNodeError,
+	SessionUnreadableError,
+	WorkspaceNotFoundError,
+} from "./plane.ts";
 import { attachNodeSocket } from "./socket.ts";
+
+const DEVICE_COOKIE = "ker_device";
+const COOKIE_MAX_AGE_SECONDS = 400 * 24 * 60 * 60;
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const HEARTBEAT_MS = 15_000;
@@ -35,6 +44,7 @@ export interface ServerOptions {
 	catalogPath?: string;
 	eventTailSize?: number;
 	guiDir?: string;
+	publicUrl?: string;
 	nodeHeartbeatMs?: number;
 	plane?: ControlPlane;
 	nodes?: NodeRegistry;
@@ -45,6 +55,8 @@ export type KerServer = Server & { plane: ControlPlane; ready: Promise<void>; sh
 
 interface RequestContext {
 	manager: ControlPlane;
+	device?: Protocol.Device;
+	credential?: { token: string; carrier: "cookie" | "bearer" };
 	subscribers: Map<ServerResponse, Protocol.NodeId | undefined>;
 	req: IncomingMessage;
 	res: ServerResponse;
@@ -59,6 +71,10 @@ type HandlerMap = { [Key in RouteKey]: Handler };
 
 // The HTTP server is synchronous to construct; session discovery and recovery finish before a route responds.
 export function createServer(options: ServerOptions = {}): KerServer {
+	const access: Access =
+		options.publicUrl === undefined
+			? { mode: "local" }
+			: { mode: "device", publicUrl: parsePublicUrl(options.publicUrl) };
 	const subscribers = new Map<ServerResponse, Protocol.NodeId | undefined>();
 	const guiDir = options.guiDir ?? defaultGuiDir();
 	const plane =
@@ -69,16 +85,17 @@ export function createServer(options: ServerOptions = {}): KerServer {
 			eventTailSize: options.eventTailSize ?? DEFAULT_EVENT_TAIL_SIZE,
 			nodes: options.nodes,
 			localIdentity: options.localIdentity,
+			publicUrl: access.mode === "device" ? access.publicUrl : undefined,
 		});
 	const ready = Promise.resolve().then(() => plane.initialize());
 	const manager = ready.then(() => plane);
 
 	const server = createHttpServer((req, res) => {
-		void handleRequest(manager, subscribers, guiDir, req, res);
+		void handleRequest(manager, subscribers, guiDir, access, req, res);
 	}) as KerServer;
 	server.plane = plane;
 	server.ready = ready;
-	const closeNodeSockets = attachNodeSocket(server, plane, ready, options.nodeHeartbeatMs);
+	const closeNodeSockets = attachNodeSocket(server, plane, ready, access, options.nodeHeartbeatMs);
 	server.shutdown = async () => {
 		await ready;
 		await closeNodeSockets();
@@ -108,23 +125,40 @@ async function handleRequest(
 	managerPromise: Promise<ControlPlane>,
 	subscribers: Map<ServerResponse, Protocol.NodeId | undefined>,
 	guiDir: string | undefined,
+	access: Access,
 	req: IncomingMessage,
 	res: ServerResponse,
 ) {
-	if (!isLocalRequest(req)) {
+	if (!acceptsRequest(access, req)) {
 		writeJson(res, 403, { code: "forbidden" });
 		return;
 	}
 	try {
 		const manager = await managerPromise;
 		const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-		const match = matchRoute(req.method, url.pathname);
-		if (!match) {
-			if (req.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/assets/"))) {
-				await serveGui(guiDir, url.pathname, res);
-				return;
-			}
+		if (req.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/assets/"))) {
+			await serveGui(guiDir, url.pathname, res);
+			return;
+		}
+		const match = matchRoute(req.method === "HEAD" ? "GET" : req.method, url.pathname);
+		const credential = access.mode === "device" ? readCredential(req) : undefined;
+		const device = credential ? manager.authenticateDevice(credential.token) : undefined;
+		if (access.mode === "device" && !match?.route.public && !device) {
+			writeJson(res, 401, { code: "unauthorized" });
+			return;
+		}
+		if (!match || (req.method === "HEAD" && !match.route.public)) {
 			writeJson(res, 404, { code: "not_found" });
+			return;
+		}
+		if (
+			access.mode === "device" &&
+			device &&
+			credential &&
+			requiresOrigin(req.method, credential.carrier) &&
+			req.headers.origin !== access.publicUrl.origin
+		) {
+			writeJson(res, 403, { code: "forbidden" });
 			return;
 		}
 		const query = readQuery(match.route, url);
@@ -146,7 +180,18 @@ async function handleRequest(
 			writeJson(res, 400, { code: invalidBodyCode(match.key) });
 			return;
 		}
-		await handlers[match.key]({ manager, subscribers, req, res, url, params: match.params, query, body });
+		await handlers[match.key]({
+			manager,
+			subscribers,
+			device,
+			credential,
+			req,
+			res,
+			url,
+			params: match.params,
+			query,
+			body,
+		});
 	} catch (error) {
 		if (!res.headersSent) {
 			if (error instanceof PayloadTooLargeError) {
@@ -192,6 +237,10 @@ async function handleRequest(
 				writeJson(res, 404, { code: "node_not_found" });
 				return;
 			}
+			if (error instanceof AuthLocalError) {
+				writeJson(res, 409, { code: "auth_local" });
+				return;
+			}
 			if (error instanceof LocalNodeError) {
 				writeJson(res, 409, { code: "node_local" });
 				return;
@@ -219,6 +268,33 @@ async function handleRequest(
 }
 
 const handlers = {
+	listDevices: ({ manager, res, device, credential }) => {
+		if (device && credential?.carrier === "cookie") res.setHeader("set-cookie", deviceCookie(credential.token));
+		writeJson(res, 200, { devices: manager.listDevices(device?.id) } satisfies Protocol.ListDevicesResponse);
+	},
+	createPairing: ({ manager, res }) => {
+		writeJson(res, 201, manager.createPairing());
+	},
+	claimPairing: ({ manager, res, body }) => {
+		const { code, name } = body as Protocol.ClaimPairingRequest;
+		const claimed = manager.claimPairing(code, name);
+		if (typeof claimed === "string") {
+			writeJson(res, 410, { code: "pairing_invalid" });
+			return;
+		}
+		res.setHeader("set-cookie", deviceCookie(claimed.token));
+		writeJson(res, 201, claimed.device);
+	},
+	revokeDevice: ({ manager, res, params, device }) => {
+		const revoked = manager.revokeDevice(params.deviceId);
+		if (!revoked) {
+			writeJson(res, 404, { code: "device_not_found" });
+			return;
+		}
+		const current = revoked.id === device?.id;
+		if (current) res.setHeader("set-cookie", `${DEVICE_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`);
+		writeJson(res, 200, { ...revoked, current });
+	},
 	listNodes: ({ manager, res }) => {
 		const body: Protocol.ListNodesResponse = { nodes: manager.listNodes() };
 		writeJson(res, 200, body);
@@ -234,8 +310,8 @@ const handlers = {
 		}
 		writeJson(res, 200, node);
 	},
-	health: ({ res }) => {
-		writeJson(res, 200, { name: "ker", protocol: Protocol.PROTOCOL_VERSION });
+	health: ({ manager, res }) => {
+		writeJson(res, 200, { name: "ker", protocol: Protocol.PROTOCOL_VERSION, auth: manager.authMode() });
 	},
 	openapi: ({ res }) => {
 		res.writeHead(200, { "content-type": "application/json" });
@@ -489,7 +565,11 @@ function matchRoute(
 			if (!parameter) return template === segment;
 			const schema = route.params?.[parameter];
 			if (!schema) return false;
-			params[parameter] = decodeURIComponent(segment);
+			try {
+				params[parameter] = decodeURIComponent(segment);
+			} catch {
+				return false;
+			}
 			return Value.Check(schema, params[parameter]);
 		});
 		if (matches) return { key, route, params };
@@ -514,6 +594,7 @@ function readQuery(route: RouteDefinition, url: URL): Record<string, string | nu
 }
 
 function invalidBodyCode(key: RouteKey): string {
+	if (key === "claimPairing") return "invalid_pairing";
 	if (key === "createSession") return "invalid_cwd";
 	if (key === "createWorkspace") return "invalid_workspace";
 	if (key === "createDocument" || key === "updateDocument") return "invalid_document";
@@ -660,4 +741,18 @@ function writeEvent(res: ServerResponse, envelope: Protocol.EventEnvelope): void
 function writeJson(res: ServerResponse, status: number, body: object): void {
 	res.writeHead(status, { "content-type": "application/json" });
 	res.end(JSON.stringify(body));
+}
+
+function readCredential(req: IncomingMessage): { token: string; carrier: "cookie" | "bearer" } | undefined {
+	const bearer = req.headers.authorization?.match(/^Bearer\s+([A-Za-z0-9._~+/=-]+)$/i);
+	if (bearer) return { token: bearer[1], carrier: "bearer" };
+	for (const part of (req.headers.cookie ?? "").split(";")) {
+		const [name, ...rest] = part.trim().split("=");
+		if (name === DEVICE_COOKIE && rest.length > 0) return { token: rest.join("="), carrier: "cookie" };
+	}
+	return undefined;
+}
+
+function deviceCookie(token: string): string {
+	return `${DEVICE_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${COOKIE_MAX_AGE_SECONDS}`;
 }

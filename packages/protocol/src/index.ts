@@ -17,6 +17,7 @@ export type ProjectId = string;
 export type DocumentId = string;
 export type WorkspaceId = string;
 export type NodeId = string;
+export type DeviceId = string;
 
 export const PROJECT_KEY_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -132,6 +133,36 @@ export const CreateSessionRequest = Type.Object(
 	{ additionalProperties: false },
 );
 export type CreateSessionRequest = Static<typeof CreateSessionRequest>;
+
+export const AuthMode = Type.Union([Type.Literal("local"), Type.Literal("device")]);
+export type AuthMode = Static<typeof AuthMode>;
+
+export const Device = Type.Object(
+	{
+		id: Type.String(),
+		name: Type.String(),
+		createdAt: Type.String(),
+		lastSeenAt: Type.Union([Type.String(), Type.Null()]),
+		current: Type.Boolean(),
+	},
+	{ additionalProperties: false },
+);
+export type Device = Static<typeof Device>;
+
+export const ListDevicesResponse = Type.Object({ devices: Type.Array(Device) }, { additionalProperties: false });
+export type ListDevicesResponse = Static<typeof ListDevicesResponse>;
+
+export const Pairing = Type.Object(
+	{ code: Type.String(), expiresAt: Type.String(), url: Type.String() },
+	{ additionalProperties: false },
+);
+export type Pairing = Static<typeof Pairing>;
+
+export const ClaimPairingRequest = Type.Object(
+	{ code: Type.String({ minLength: 1 }), name: Type.String({ minLength: 1, maxLength: 80 }) },
+	{ additionalProperties: false },
+);
+export type ClaimPairingRequest = Static<typeof ClaimPairingRequest>;
 
 export const Node = Type.Object(
 	{
@@ -950,6 +981,7 @@ export const Health = Type.Object(
 	{
 		name: Type.Literal("ker"),
 		protocol: Type.String(),
+		auth: AuthMode,
 	},
 	{ additionalProperties: false },
 );
@@ -964,7 +996,7 @@ export const ErrorBody = Type.Object(
 );
 export type ErrorBody = Static<typeof ErrorBody>;
 
-export const PROTOCOL_VERSION = "25" as const;
+export const PROTOCOL_VERSION = "26" as const;
 
-// Fixed localhost port the daemon listens on. Daemon and clients must agree on it.
+// Default loopback port for the server and CLI clients.
 export const DEFAULT_PORT = 5537;

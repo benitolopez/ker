@@ -11,8 +11,8 @@ returns its final answer.
 ## Direction
 
 ker has a server that keeps projects, session history, and documents, plus nodes that execute where
-the code lives. Bundled mode runs both halves on one machine. The next deployment step adds TLS and
-single-user client authentication so the same server can be exposed directly to browsers and nodes.
+the code lives. Bundled mode runs both halves on one machine. Remote deployments use device pairing
+for browsers and a TLS-terminating reverse proxy for encrypted browser and node connections.
 
 ## Contributions
 
@@ -28,6 +28,8 @@ Thank you for your interest and understanding.
   **nodes**. The thin `ker` client talks to the server over HTTP.
 - One-time node enrollment, per-node secrets and revocation, multi-node workspace routing, and a
   Nodes screen in the web UI.
+- Single-user remote access: one-time pairing links and QR codes, a private cookie per browser,
+  and a Devices screen for pairing and revocation. `ker pair` bootstraps the first browser.
 - A streaming tool-call loop using the OpenAI Responses API, with its own retry/backoff on
   transient failures before provider output starts.
 - Four built-in tools: `read`, `write`, `edit`, and `bash`.
@@ -50,8 +52,7 @@ Thank you for your interest and understanding.
 - A web UI served by the control plane: projects, sessions, a live transcript with prompt, cancel, and
   compaction controls, and per-project documents with a Markdown editor.
 
-Not there yet: a public server bind with TLS and client authentication, or any provider other than
-OpenAI.
+Not there yet: multi-user accounts and permissions, managed hosting, or any provider other than OpenAI.
 
 ## A note on the web UI
 
@@ -138,13 +139,32 @@ npx ker node --server http://127.0.0.1:5537 --token <token>
 ```
 
 The secret returned during enrollment is stored in `~/.ker/node.json`; later starts need only
-`npx ker node`. This release keeps the server on loopback. To connect a node from another machine,
-forward that machine's local port to the server host, then enroll against the forwarded URL:
+`npx ker node`. For remote access, put a TLS-terminating proxy in front of the server and configure
+its public HTTPS origin:
 
 ```sh
-ssh -N -L 5537:127.0.0.1:5537 <server-host>
-npx ker node --server http://127.0.0.1:5537 --token <token>
+npx ker server --public-url https://ker.example.com
 ```
+
+In another terminal on the server host, under the same OS user, mint the first pairing link:
+
+```sh
+npx ker pair
+```
+
+Open that link in the browser, then use Devices → Pair device to pair the phone by QR. Nodes →
+Enroll node supplies the laptop command with the public URL. ker never terminates TLS itself;
+follow [the deployment guide](docs/deploy.md) for Caddy, systemd, backups, and a Tailscale laptop
+variant. Open the public HTTPS URL in remote mode; opening the loopback URL returns 403 by design.
+
+Both `server` and `daemon` accept `--host`, `--port`, and `--public-url`, with `KER_HOST`,
+`KER_PORT`, and `KER_PUBLIC_URL` as fallbacks. Flags win over environment variables. The default
+bind is `127.0.0.1:5537`; a non-loopback bind requires a public URL. For example, a container behind
+a proxy can use `ker server --host 0.0.0.0 --port 5537 --public-url https://ker.example.com`.
+The public URL must be an HTTPS origin, with no path, query, fragment, or credentials.
+
+The CLI client commands below work only against a local-trust server at `127.0.0.1:5537`.
+They do not store a device credential or connect to a remote deployment; use the GUI there.
 
 Start a new session with a prompt, then continue the latest session for the exact current directory:
 

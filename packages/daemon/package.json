@@ -24,6 +24,6 @@
   "scripts": {
     "build": "tsgo -p tsconfig.build.json",
     "clean": "shx rm -rf dist",
-    "test": "node --test test/*.test.ts && KER_TEST_MODE=remote node --test test/server.test.ts test/contract.test.ts test/export-import.test.ts"
+    "test": "node --test test/*.test.ts && KER_TEST_MODE=remote node --test test/server.test.ts test/contract.test.ts test/export-import.test.ts && KER_TEST_AUTH=device node --test test/server.test.ts test/contract.test.ts test/export-import.test.ts && KER_TEST_MODE=remote KER_TEST_AUTH=device node --test test/server.test.ts test/contract.test.ts test/export-import.test.ts"
   }
 }

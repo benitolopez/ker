@@ -12,6 +12,10 @@ export type Subscription =
 	| { kind: "error"; status: number; error: Protocol.ErrorBody };
 
 export interface Client {
+	listDevices(signal?: AbortSignal): Promise<Result<Protocol.ListDevicesResponse>>;
+	createPairing(signal?: AbortSignal): Promise<Result<Protocol.Pairing>>;
+	claimPairing(input: Protocol.ClaimPairingRequest, signal?: AbortSignal): Promise<Result<Protocol.Device>>;
+	revokeDevice(deviceId: Protocol.DeviceId, signal?: AbortSignal): Promise<Result<Protocol.Device>>;
 	listNodes(signal?: AbortSignal): Promise<Result<Protocol.ListNodesResponse>>;
 	createEnrollment(signal?: AbortSignal): Promise<Result<Protocol.Enrollment>>;
 	revokeNode(nodeId: Protocol.NodeId, signal?: AbortSignal): Promise<Result<Protocol.Node>>;
@@ -102,6 +106,17 @@ export function createClient(options: { baseUrl?: string } = {}): Client {
 	};
 
 	return {
+		listDevices: (signal) => request(routes.listDevices.path, { signal }),
+		createPairing: (signal) => request(routes.createPairing.path, { method: routes.createPairing.method, signal }),
+		claimPairing: (input, signal) =>
+			request(routes.claimPairing.path, {
+				method: routes.claimPairing.method,
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(input),
+				signal,
+			}),
+		revokeDevice: (deviceId, signal) =>
+			request(routes.revokeDevice.path, { method: routes.revokeDevice.method, signal }, { deviceId }),
 		listNodes: (signal) => request(routes.listNodes.path, { signal }),
 		createEnrollment: (signal) =>
 			request(routes.createEnrollment.path, { method: routes.createEnrollment.method, signal }),

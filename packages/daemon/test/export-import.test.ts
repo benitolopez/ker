@@ -6,10 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 import type * as Engine from "@ker-ai/engine";
-import * as Protocol from "@ker-ai/protocol";
+import type * as Protocol from "@ker-ai/protocol";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 import type { DaemonOptions } from "../src/index.ts";
 import { startTestRuntime } from "./runtime.ts";
+
+const runtimeHeaders = new Map<string, Record<string, string>>();
 
 test("a project archive round-trips through two daemons and re-import skips existing data", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "ker-export-import-"));
@@ -356,6 +358,7 @@ async function startServer(
 		recoveryWindowMinutes: Number.MAX_SAFE_INTEGER,
 		compaction: options.compaction ?? { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
+	runtimeHeaders.set(running.url, running.headers);
 	let stopped = false;
 	const stop = async () => {
 		if (stopped) return;
@@ -468,7 +471,7 @@ function localRequest(
 			`${baseUrl}${path}`,
 			{
 				method: init.method,
-				headers: { ...init.headers, host: `127.0.0.1:${Protocol.DEFAULT_PORT}` },
+				headers: { ...runtimeHeaders.get(new URL(baseUrl).origin), ...init.headers },
 			},
 			(response) => {
 				const chunks: Buffer[] = [];

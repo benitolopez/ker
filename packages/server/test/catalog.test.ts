@@ -171,7 +171,7 @@ test("detects current-version corruption and salvages readable catalog rows", as
 	assert(recovered.list({ projectId: binding.projectId }).some((row) => row.title?.startsWith("Saved title")));
 	assert.deepEqual(recovered.getDocument(savedDocument.id), savedDocument);
 	assert.match(errors.join("\n"), /failed its integrity check/);
-	for (const table of ["node", "project", "workspace", "session", "document"]) {
+	for (const table of ["node", "project", "workspace", "session", "document", "one_time_token", "device", "setting"]) {
 		assert.match(errors.join("\n"), new RegExp(`salvaged \\d+ ${table} rows`));
 	}
 	const preserved = (await readdir(root)).find(
@@ -226,7 +226,7 @@ test("fresh and migrated catalogs have equivalent structures", async (t) => {
 
 	const fresh = new DatabaseSync(freshPath);
 	const migrated = new DatabaseSync(migratedPath);
-	for (const table of ["node", "project", "workspace", "session", "document"]) {
+	for (const table of ["node", "project", "workspace", "session", "document", "one_time_token", "device", "setting"]) {
 		for (const pragma of ["table_info", "foreign_key_list", "index_list"]) {
 			assert.deepEqual(
 				migrated.prepare(`PRAGMA ${pragma}(${table})`).all(),
@@ -580,15 +580,15 @@ test("enrollment tokens are single-use and expire", async (t) => {
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const path = join(root, "catalog.db");
 	const catalog = Catalog.open(path);
-	const first = catalog.createEnrollmentToken();
-	assert.equal(catalog.consumeEnrollmentToken(first.token), "ok");
-	assert.equal(catalog.consumeEnrollmentToken(first.token), "used");
-	assert.equal(catalog.consumeEnrollmentToken("missing"), "invalid");
-	const expired = catalog.createEnrollmentToken();
+	const first = catalog.createOneTimeToken("node");
+	assert.equal(catalog.consumeOneTimeToken("node", first.token), "ok");
+	assert.equal(catalog.consumeOneTimeToken("node", first.token), "used");
+	assert.equal(catalog.consumeOneTimeToken("node", "missing"), "invalid");
+	const expired = catalog.createOneTimeToken("node");
 	const client = new DatabaseSync(path);
-	client.prepare("UPDATE enrollment_token SET expires_at = ? WHERE used_at IS NULL").run("2020-01-01T00:00:00.000Z");
+	client.prepare("UPDATE one_time_token SET expires_at = ? WHERE used_at IS NULL").run("2020-01-01T00:00:00.000Z");
 	client.close();
-	assert.equal(catalog.consumeEnrollmentToken(expired.token), "expired");
+	assert.equal(catalog.consumeOneTimeToken("node", expired.token), "expired");
 	catalog.close();
 });
 

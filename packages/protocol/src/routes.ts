@@ -1,20 +1,24 @@
 import { type TSchema, Type } from "@sinclair/typebox";
 import {
+	ClaimPairingRequest,
 	CompactionAdmission,
 	CompactRequest,
 	CreateSessionRequest,
+	Device,
 	Document,
 	DocumentRequest,
 	Enrollment,
 	EventEnvelope,
 	Health,
 	ImportResult,
+	ListDevicesResponse,
 	ListDocumentsResponse,
 	ListNodesResponse,
 	ListProjectsResponse,
 	ListSessionsResponse,
 	ListWorkspacesResponse,
 	Node,
+	Pairing,
 	Project,
 	PromptAdmission,
 	PromptRequest,
@@ -31,6 +35,7 @@ export interface RouteDefinition {
 	path: string;
 	summary: string;
 	description?: string;
+	public?: true;
 	kind?: "sse" | "download";
 	upload?: "application/zip";
 	params?: Record<string, TSchema>;
@@ -48,12 +53,66 @@ const turnId = { turnId: Type.String({ minLength: 1 }) };
 const nodeId = { nodeId: Type.String({ minLength: 1 }) };
 
 export const routes = {
+	listDevices: {
+		method: "GET",
+		path: "/devices",
+		summary: "List paired devices",
+		responses: {
+			200: ListDevicesResponse,
+			401: errorBody("unauthorized"),
+			403: errorBody("forbidden"),
+			500: errorBody("internal"),
+		},
+	},
+	createPairing: {
+		method: "POST",
+		path: "/devices/pairings",
+		summary: "Create a one-time device pairing",
+		responses: {
+			201: Pairing,
+			401: errorBody("unauthorized"),
+			403: errorBody("forbidden"),
+			409: errorBody("auth_local"),
+			500: errorBody("internal"),
+		},
+	},
+	claimPairing: {
+		method: "POST",
+		path: "/devices/pairings/claim",
+		summary: "Exchange a pairing code for a device credential",
+		public: true,
+		body: ClaimPairingRequest,
+		responses: {
+			201: Device,
+			400: Type.Union([errorBody("invalid_pairing"), errorBody("invalid_json")]),
+			403: errorBody("forbidden"),
+			409: errorBody("auth_local"),
+			410: errorBody("pairing_invalid"),
+			413: errorBody("payload_too_large"),
+			415: errorBody("unsupported_media_type"),
+			500: errorBody("internal"),
+		},
+	},
+	revokeDevice: {
+		method: "DELETE",
+		path: "/devices/{deviceId}",
+		summary: "Revoke a paired device",
+		params: { deviceId: Type.String({ minLength: 1 }) },
+		responses: {
+			200: Device,
+			401: errorBody("unauthorized"),
+			403: errorBody("forbidden"),
+			404: errorBody("device_not_found"),
+			500: errorBody("internal"),
+		},
+	},
 	listNodes: {
 		method: "GET",
 		path: "/nodes",
 		summary: "List nodes",
 		responses: {
 			200: ListNodesResponse,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			500: errorBody("internal"),
 		},
@@ -64,6 +123,7 @@ export const routes = {
 		summary: "Create a one-time node enrollment",
 		responses: {
 			201: Enrollment,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			500: errorBody("internal"),
 		},
@@ -75,6 +135,7 @@ export const routes = {
 		params: nodeId,
 		responses: {
 			200: Node,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("node_not_found"),
 			409: errorBody("node_local"),
@@ -82,6 +143,7 @@ export const routes = {
 		},
 	},
 	health: {
+		public: true,
 		method: "GET",
 		path: "/health",
 		summary: "Inspect daemon health",
@@ -92,6 +154,7 @@ export const routes = {
 		},
 	},
 	openapi: {
+		public: true,
 		method: "GET",
 		path: "/openapi.json",
 		summary: "Read the API description",
@@ -109,6 +172,7 @@ export const routes = {
 			"Every project with read-time aggregates: sessionCount counts all catalog sessions, lastActivityAt is the newest session updatedAt and null when the project has none.",
 		responses: {
 			200: ListProjectsResponse,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			500: errorBody("internal"),
 		},
@@ -120,6 +184,7 @@ export const routes = {
 		params: projectId,
 		responses: {
 			200: Project,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			500: errorBody("internal"),
@@ -135,6 +200,7 @@ export const routes = {
 		params: projectId,
 		responses: {
 			200: binary,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			409: errorBody("archive_too_large"),
@@ -152,6 +218,7 @@ export const routes = {
 		responses: {
 			201: ImportResult,
 			400: Type.Union([errorBody("invalid_archive"), errorBody("unsupported_archive")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("node_not_found"),
 			409: errorBody("workspace_conflict"),
@@ -168,6 +235,7 @@ export const routes = {
 		params: projectId,
 		responses: {
 			200: ListWorkspacesResponse,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: Type.Union([errorBody("project_not_found"), errorBody("node_not_found")]),
 			500: errorBody("internal"),
@@ -185,6 +253,7 @@ export const routes = {
 			200: Workspace,
 			201: Workspace,
 			400: Type.Union([errorBody("invalid_workspace"), errorBody("invalid_json")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			409: Type.Union([errorBody("workspace_conflict"), errorBody("node_ambiguous")]),
@@ -201,6 +270,7 @@ export const routes = {
 		params: projectId,
 		responses: {
 			200: ListSessionsResponse,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			500: errorBody("internal"),
@@ -216,6 +286,7 @@ export const routes = {
 		responses: {
 			201: ReadableCatalogSession,
 			400: errorBody("invalid_cwd"),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			409: Type.Union([errorBody("workspace_ambiguous"), errorBody("workspace_missing")]),
@@ -230,6 +301,7 @@ export const routes = {
 		params: { workspaceId: Type.String({ minLength: 1 }) },
 		responses: {
 			201: ReadableCatalogSession,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("workspace_not_found"),
 			409: errorBody("workspace_missing"),
@@ -245,6 +317,7 @@ export const routes = {
 		params: projectId,
 		responses: {
 			200: ListDocumentsResponse,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			500: errorBody("internal"),
@@ -259,6 +332,7 @@ export const routes = {
 		responses: {
 			201: Document,
 			400: Type.Union([errorBody("invalid_document"), errorBody("invalid_json")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("project_not_found"),
 			413: errorBody("payload_too_large"),
@@ -273,6 +347,7 @@ export const routes = {
 		params: documentId,
 		responses: {
 			200: Document,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("document_not_found"),
 			500: errorBody("internal"),
@@ -288,6 +363,7 @@ export const routes = {
 		responses: {
 			200: Document,
 			400: Type.Union([errorBody("invalid_document"), errorBody("invalid_json")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("document_not_found"),
 			413: errorBody("payload_too_large"),
@@ -303,6 +379,7 @@ export const routes = {
 		params: documentId,
 		responses: {
 			200: Document,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("document_not_found"),
 			500: errorBody("internal"),
@@ -316,6 +393,7 @@ export const routes = {
 		responses: {
 			201: SessionDescriptor,
 			400: Type.Union([errorBody("invalid_cwd"), errorBody("invalid_json")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("node_not_found"),
 			409: errorBody("node_ambiguous"),
@@ -339,6 +417,7 @@ export const routes = {
 		responses: {
 			200: ListSessionsResponse,
 			400: Type.Union([errorBody("invalid_scope"), errorBody("invalid_cwd")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			409: errorBody("node_ambiguous"),
 			503: errorBody("node_unavailable"),
@@ -352,6 +431,7 @@ export const routes = {
 		params: sessionId,
 		responses: {
 			200: SessionSnapshot,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("session_not_found"),
 			500: Type.Union([errorBody("session_unreadable"), errorBody("internal")]),
@@ -376,6 +456,7 @@ export const routes = {
 		responses: {
 			200: EventEnvelope,
 			400: errorBody("invalid_cursor"),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("session_not_found"),
 			410: errorBody("resync_required"),
@@ -391,6 +472,7 @@ export const routes = {
 		responses: {
 			202: PromptAdmission,
 			400: Type.Union([errorBody("invalid_prompt"), errorBody("invalid_json")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("session_not_found"),
 			409: errorBody("context_exhausted"),
@@ -409,6 +491,7 @@ export const routes = {
 		responses: {
 			202: CompactionAdmission,
 			400: Type.Union([errorBody("invalid_compaction"), errorBody("invalid_json")]),
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("session_not_found"),
 			503: errorBody("node_unavailable"),
@@ -425,6 +508,7 @@ export const routes = {
 		responses: {
 			200: TurnCancellationResult,
 			202: TurnCancellationResult,
+			401: errorBody("unauthorized"),
 			403: errorBody("forbidden"),
 			404: errorBody("session_not_found"),
 			409: errorBody("turn_unavailable"),

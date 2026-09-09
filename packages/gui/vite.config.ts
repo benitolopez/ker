@@ -12,6 +12,9 @@ export default defineConfig({
 	server: {
 		proxy: {
 			"/health": proxy,
+			"/devices": proxy,
+			"/nodes": proxy,
+			"/workspaces": proxy,
 			"/sessions": proxy,
 			"/projects": proxy,
 			"/documents": proxy,

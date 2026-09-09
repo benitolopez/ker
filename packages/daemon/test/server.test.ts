@@ -20,7 +20,7 @@ import { Value } from "@sinclair/typebox/value";
 import type { DaemonOptions, Harness } from "../src/index.ts";
 import { startTestRuntime } from "./runtime.ts";
 
-const LOCAL_HOST = "127.0.0.1:5537";
+const runtimeHeaders = new Map<string, Record<string, string>>();
 const NODE_ID = "00000000-0000-4000-8000-000000000001";
 const PRUNED_OUTPUT_PLACEHOLDER =
 	"[Old tool output removed to free context space. Re-read the file or re-run the command if you still need it.]";
@@ -4052,6 +4052,7 @@ async function startServer(
 		},
 		guiDir: options.guiDir,
 	});
+	runtimeHeaders.set(running.url, running.headers);
 	const close = running.stop;
 	if (autoClose) {
 		const closers = runtimeClosers.get(t) ?? new Set<() => Promise<void>>();
@@ -4204,8 +4205,10 @@ function localFetch(
 	init?: { method?: string; headers?: Record<string, string>; body?: string },
 ): Promise<TestResponse> {
 	return new Promise((resolve, reject) => {
-		const req = request(url, { method: init?.method, headers: { ...init?.headers, host: LOCAL_HOST } }, (res) =>
-			resolve({ status: res.statusCode ?? 0, body: res }),
+		const req = request(
+			url,
+			{ method: init?.method, headers: { ...runtimeHeaders.get(new URL(url).origin), ...init?.headers } },
+			(res) => resolve({ status: res.statusCode ?? 0, body: res }),
 		);
 		req.on("error", reject);
 		req.end(init?.body);

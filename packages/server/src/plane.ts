@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -18,7 +19,7 @@ import {
 	RemoteCallError,
 } from "./nodes.ts";
 import { SessionProjection } from "./projection.ts";
-import { CATALOG_VERSION } from "./schema.ts";
+import { CATALOG_VERSION, type device } from "./schema.ts";
 
 const PROJECTION_IDLE_MS = 10 * 60_000;
 
@@ -27,6 +28,7 @@ export interface ControlPlaneOptions {
 	catalogPath: string;
 	eventTailSize: number;
 	projectionIdleMs?: number;
+	publicUrl?: URL;
 	nodes?: NodeRegistry;
 	localIdentity?: { id: Protocol.NodeId; name: string; createdAt: string };
 }
@@ -49,10 +51,14 @@ export class WorkspaceNotFoundError extends Error {}
 
 export class LocalNodeError extends Error {}
 
+export class AuthLocalError extends Error {}
+
 export class ControlPlane {
 	readonly nodes: NodeRegistry;
 	readonly #store: SessionStore;
 	readonly #catalogPath: string;
+	readonly #publicUrl?: URL;
+	readonly #deviceTouches = new Map<Protocol.DeviceId, number>();
 	readonly #eventTailSize: number;
 	readonly #projectionIdleMs: number;
 	readonly #localIdentity?: { id: Protocol.NodeId; name: string; createdAt: string };
@@ -67,6 +73,7 @@ export class ControlPlane {
 	constructor(options: ControlPlaneOptions) {
 		this.#store = options.store;
 		this.#catalogPath = options.catalogPath;
+		this.#publicUrl = options.publicUrl;
 		this.#eventTailSize = options.eventTailSize;
 		this.#projectionIdleMs = options.projectionIdleMs ?? PROJECTION_IDLE_MS;
 		this.#localIdentity = options.localIdentity;
@@ -75,6 +82,8 @@ export class ControlPlane {
 
 	async initialize(): Promise<void> {
 		this.#catalog = Catalog.open(this.#catalogPath);
+		if (this.#publicUrl) this.#catalog.setSetting("public_url", this.#publicUrl.origin);
+		if (!this.#publicUrl) this.#catalog.deleteSetting("public_url");
 		if (this.#localIdentity) this.#catalog.upsertNode(this.#localIdentity);
 		const scan = await this.#store.scanCatalog();
 		for (const entry of scan.sessions) {
@@ -452,6 +461,51 @@ export class ControlPlane {
 		return this.#route(sessionId, (node) => node.cancel(sessionId, turnId));
 	}
 
+	authMode(): Protocol.AuthMode {
+		return this.#publicUrl ? "device" : "local";
+	}
+
+	createPairing(): Protocol.Pairing {
+		if (!this.#publicUrl) throw new AuthLocalError();
+		const { token: code, expiresAt } = this.#catalog.createOneTimeToken("device");
+		return { code, expiresAt, url: `${this.#publicUrl.origin}/#/pair/${code}` };
+	}
+
+	claimPairing(
+		code: string,
+		name: string,
+	): { device: Protocol.Device; token: string } | "invalid" | "expired" | "used" {
+		if (!this.#publicUrl) throw new AuthLocalError();
+		const consumed = this.#catalog.consumeOneTimeToken("device", code);
+		if (consumed !== "ok") return consumed;
+		const token = randomBytes(32).toString("hex");
+		return { device: toDevice(this.#catalog.createDevice(name, hashSecret(token)), true), token };
+	}
+
+	authenticateDevice(token: string): Protocol.Device | undefined {
+		const row = this.#catalog.findDeviceByTokenHash(hashSecret(token));
+		if (!row) return undefined;
+		const now = Date.now();
+		const lastTouch = this.#deviceTouches.get(row.id);
+		if (lastTouch === undefined || now - lastTouch >= 60_000) {
+			const at = new Date(now).toISOString();
+			this.#catalog.touchDevice(row.id, at);
+			this.#deviceTouches.set(row.id, now);
+			return toDevice({ ...row, last_seen_at: at }, true);
+		}
+		return toDevice(row, true);
+	}
+
+	listDevices(currentId?: Protocol.DeviceId): Protocol.Device[] {
+		return this.#catalog.listDevices().map((row) => toDevice(row, row.id === currentId));
+	}
+
+	revokeDevice(id: Protocol.DeviceId): Protocol.Device | undefined {
+		const row = this.#catalog.deleteDevice(id);
+		this.#deviceTouches.delete(id);
+		return row ? toDevice(row, false) : undefined;
+	}
+
 	listNodes(): Protocol.Node[] {
 		return this.#catalog.listNodes().map((node) => ({
 			id: node.id,
@@ -470,9 +524,12 @@ export class ControlPlane {
 		return `${name} is offline`;
 	}
 
-	createEnrollment(origin: string): Protocol.Enrollment {
-		const enrollment = this.#catalog.createEnrollmentToken();
-		return { ...enrollment, command: `ker node --server ${origin} --token ${enrollment.token}` };
+	createEnrollment(fallbackOrigin: string): Protocol.Enrollment {
+		const enrollment = this.#catalog.createOneTimeToken("node");
+		return {
+			...enrollment,
+			command: `ker node --server ${this.#publicUrl?.origin ?? fallbackOrigin} --token ${enrollment.token}`,
+		};
 	}
 
 	revokeNode(nodeId: Protocol.NodeId): Protocol.Node | undefined {
@@ -495,7 +552,7 @@ export class ControlPlane {
 	}
 
 	consumeEnrollmentToken(token: string): "ok" | "expired" | "used" | "invalid" {
-		return this.#catalog.consumeEnrollmentToken(token);
+		return this.#catalog.consumeOneTimeToken("node", token);
 	}
 
 	enrollNode(identity: { id: string; name: string; createdAt: string }, secret: string): void {
@@ -706,6 +763,10 @@ export class ControlPlane {
 			console.error(`catalog update failed for session ${sessionId}:`, error);
 		}
 	}
+}
+
+function toDevice(row: typeof device.$inferSelect, current: boolean): Protocol.Device {
+	return { id: row.id, name: row.name, createdAt: row.created_at, lastSeenAt: row.last_seen_at, current };
 }
 
 function toCatalogSession(row: CatalogListRow): Protocol.CatalogSession {

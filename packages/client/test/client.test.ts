@@ -22,7 +22,16 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 
 	const health = await client.health();
 	assert(health.ok);
-	assert.deepEqual(health.value, { name: "ker", protocol: PROTOCOL_VERSION });
+	assert.deepEqual(health.value, { name: "ker", protocol: PROTOCOL_VERSION, auth: "local" });
+	const devices = await client.listDevices();
+	assert(devices.ok);
+	assert.deepEqual(devices.value.devices, []);
+	const pairing = await client.createPairing();
+	assert(!pairing.ok && pairing.status === 409 && pairing.error.code === "auth_local");
+	const claim = await client.claimPairing({ code: "unknown", name: "Phone" });
+	assert(!claim.ok && claim.status === 409 && claim.error.code === "auth_local");
+	const revoke = await client.revokeDevice("missing");
+	assert(!revoke.ok && revoke.status === 404 && revoke.error.code === "device_not_found");
 	const nodes = await client.listNodes();
 	assert(nodes.ok);
 	assert.equal(nodes.value.nodes[0]?.local, true);
@@ -174,6 +183,34 @@ test("the client calls every route and parses a streamed turn", async (t) => {
 	assert.equal(nodesAfterRevoke.value.nodes[0]?.revokedAt, null);
 });
 
+test("device methods work with a bearer credential injected by a non-browser client", async (t) => {
+	const running = await startServer(t, "https://ker.test");
+	const bootstrap = running.server.plane.createPairing();
+	const claimed = running.server.plane.claimPairing(bootstrap.code, "CLI");
+	if (typeof claimed === "string") throw new Error(claimed);
+	t.mock.method(globalThis, "fetch", (input: string | URL | globalThis.Request, init?: RequestInit) => {
+		const headers = new Headers(init?.headers);
+		headers.set("host", "ker.test");
+		headers.set("authorization", `Bearer ${claimed.token}`);
+		return localFetch(input, { ...init, headers });
+	});
+	const client = createClient({ baseUrl: running.url });
+	const health = await client.health();
+	assert(health.ok && health.value.auth === "device");
+	const listed = await client.listDevices();
+	assert(listed.ok && listed.value.devices[0]?.current);
+	const pairing = await client.createPairing();
+	assert(pairing.ok);
+	const next = await client.claimPairing({ code: pairing.value.code, name: "Phone" });
+	assert(next.ok && next.value.name === "Phone");
+	const revoked = await client.revokeDevice(next.value.id);
+	assert(revoked.ok);
+	const self = await client.revokeDevice(claimed.device.id);
+	assert(self.ok && self.value.current);
+	const unauthorized = await client.listDevices();
+	assert(!unauthorized.ok && unauthorized.status === 401);
+});
+
 test("attach yields a snapshot and a live streamed turn", async (t) => {
 	const running = await startServer(t);
 	t.mock.method(globalThis, "fetch", localFetch);
@@ -282,9 +319,10 @@ test("project session creation posts without a body or content type", async (t) 
 	assert.equal(result.ok, true);
 });
 
-async function startServer(t: TestContext): Promise<{ url: string }> {
+async function startServer(t: TestContext, publicUrl?: string) {
 	const sessionDir = await mkdtemp(join(tmpdir(), "ker-client-"));
 	const server = createDaemon({
+		publicUrl,
 		sessionDir,
 		catalogPath: join(sessionDir, "catalog.db"),
 		nodePath: join(sessionDir, "node.json"),
@@ -313,7 +351,8 @@ async function startServer(t: TestContext): Promise<{ url: string }> {
 	});
 	const address = server.address();
 	assert(address && typeof address !== "string");
-	return { url: `http://127.0.0.1:${(address as AddressInfo).port}` };
+	await server.ready;
+	return { url: `http://127.0.0.1:${(address as AddressInfo).port}`, server };
 }
 
 function immediateFactory(): NonNullable<DaemonOptions["harnessFactory"]> {
@@ -372,7 +411,7 @@ async function localFetch(input: string | URL | globalThis.Request, init?: Reque
 	const url = new URL(input instanceof Request ? input.url : input);
 	const headers = new Headers(input instanceof Request ? input.headers : undefined);
 	for (const [name, value] of new Headers(init?.headers)) headers.set(name, value);
-	headers.set("host", `127.0.0.1:${DEFAULT_PORT}`);
+	if (!headers.has("host")) headers.set("host", `127.0.0.1:${DEFAULT_PORT}`);
 	const body = init?.body instanceof Blob ? new Uint8Array(await init.body.arrayBuffer()) : init?.body;
 	return new Promise((resolve, reject) => {
 		const req = request(

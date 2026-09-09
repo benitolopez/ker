@@ -9,18 +9,29 @@ import { drizzle } from "drizzle-orm/node-sqlite";
 import {
 	CATALOG_VERSION,
 	DDL,
+	device,
 	document,
-	enrollment_token,
 	MIGRATIONS,
 	node,
+	one_time_token,
 	project,
 	session,
+	setting,
 	workspace,
 } from "./schema.ts";
 
 const SQLITE_CORRUPT = 11;
 const SQLITE_NOTADB = 26;
-const SALVAGE_TABLES = ["node", "project", "workspace", "session", "document", "enrollment_token"] as const;
+const SALVAGE_TABLES = [
+	"node",
+	"project",
+	"workspace",
+	"session",
+	"document",
+	"one_time_token",
+	"device",
+	"setting",
+] as const;
 
 export interface CatalogRow {
 	id: Protocol.SessionId;
@@ -143,36 +154,81 @@ export class Catalog {
 			.run();
 	}
 
-	createEnrollmentToken(): { token: string; expiresAt: string } {
+	createOneTimeToken(kind: "node" | "device"): { token: string; expiresAt: string } {
 		const token = randomBytes(32).toString("hex");
 		const now = new Date();
 		const expiresAt = new Date(now.getTime() + 15 * 60_000).toISOString();
 		this.#db
-			.insert(enrollment_token)
+			.insert(one_time_token)
 			.values({
 				id: randomUUID(),
 				token_hash: hashSecret(token),
 				created_at: now.toISOString(),
 				expires_at: expiresAt,
+				kind,
 			})
 			.run();
 		return { token, expiresAt };
 	}
 
-	consumeEnrollmentToken(token: string): "ok" | "expired" | "used" | "invalid" {
-		return this.#db.transaction((tx) => {
-			const row = tx
-				.select()
-				.from(enrollment_token)
-				.where(eq(enrollment_token.token_hash, hashSecret(token)))
-				.get();
-			if (!row) return "invalid";
-			if (row.used_at !== null) return "used";
-			const now = new Date().toISOString();
-			if (row.expires_at <= now) return "expired";
-			tx.update(enrollment_token).set({ used_at: now }).where(eq(enrollment_token.id, row.id)).run();
-			return "ok";
-		});
+	consumeOneTimeToken(kind: "node" | "device", token: string): "ok" | "expired" | "used" | "invalid" {
+		return this.#db.transaction(
+			(tx) => {
+				const row = tx
+					.select()
+					.from(one_time_token)
+					.where(eq(one_time_token.token_hash, hashSecret(token)))
+					.get();
+				if (!row || row.kind !== kind) return "invalid";
+				if (row.used_at !== null) return "used";
+				const now = new Date().toISOString();
+				if (row.expires_at <= now) return "expired";
+				tx.update(one_time_token).set({ used_at: now }).where(eq(one_time_token.id, row.id)).run();
+				return "ok";
+			},
+			{ behavior: "immediate" },
+		);
+	}
+
+	createDevice(name: string, tokenHash: string): typeof device.$inferSelect {
+		return this.#db
+			.insert(device)
+			.values({
+				id: randomUUID(),
+				name,
+				token_hash: tokenHash,
+				created_at: new Date().toISOString(),
+			})
+			.returning()
+			.get();
+	}
+
+	findDeviceByTokenHash(hash: string): typeof device.$inferSelect | undefined {
+		return this.#db.select().from(device).where(eq(device.token_hash, hash)).get();
+	}
+
+	touchDevice(id: Protocol.DeviceId, at: string): void {
+		this.#db.update(device).set({ last_seen_at: at }).where(eq(device.id, id)).run();
+	}
+
+	listDevices(): Array<typeof device.$inferSelect> {
+		return this.#db.select().from(device).orderBy(asc(device.created_at)).all();
+	}
+
+	deleteDevice(id: Protocol.DeviceId): typeof device.$inferSelect | undefined {
+		return this.#db.delete(device).where(eq(device.id, id)).returning().get();
+	}
+
+	getSetting(key: string): string | undefined {
+		return this.#db.select().from(setting).where(eq(setting.key, key)).get()?.value;
+	}
+
+	setSetting(key: string, value: string): void {
+		this.#db.insert(setting).values({ key, value }).onConflictDoUpdate({ target: setting.key, set: { value } }).run();
+	}
+
+	deleteSetting(key: string): void {
+		this.#db.delete(setting).where(eq(setting.key, key)).run();
 	}
 
 	enrollNode(identity: { id: Protocol.NodeId; name: string; createdAt: string }, secretHash: string): void {
@@ -936,6 +992,7 @@ function openDatabase(path: string): { client: DatabaseSync; version: number } {
 	const client = new DatabaseSync(path);
 	try {
 		chmodSync(path, 0o600);
+		client.exec("PRAGMA busy_timeout = 5000");
 		client.exec("PRAGMA journal_mode = WAL");
 		client.exec("PRAGMA synchronous = NORMAL");
 		client.exec("PRAGMA foreign_keys = ON");

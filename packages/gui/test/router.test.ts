@@ -44,3 +44,14 @@ test("formats routes with encoded opaque identifiers", () => {
 		"#/projects/project%2Fone/documents/document%20two",
 	);
 });
+
+test("device and pairing routes round-trip opaque codes", () => {
+	assert.deepEqual(parseHash("#/devices"), { screen: "devices" });
+	assert.equal(formatRoute({ screen: "devices" }), "#/devices");
+	assert.deepEqual(parseHash(formatRoute({ screen: "pair", code: "opaque/code?#" })), {
+		screen: "pair",
+		code: "opaque/code?#",
+	});
+	assert.deepEqual(parseHash("#/pair/%ZZ"), { screen: "projects" });
+	assert.deepEqual(parseHash("#/pair/"), { screen: "projects" });
+});

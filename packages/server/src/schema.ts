@@ -10,12 +10,28 @@ export const node = sqliteTable("node", {
 	last_seen_at: text(),
 });
 
-export const enrollment_token = sqliteTable("enrollment_token", {
+export const device = sqliteTable("device", {
+	id: text().primaryKey(),
+	name: text().notNull(),
+	token_hash: text().notNull().unique(),
+	created_at: text().notNull(),
+	last_seen_at: text(),
+});
+
+export const setting = sqliteTable("setting", {
+	key: text().primaryKey(),
+	value: text().notNull(),
+});
+
+export const one_time_token = sqliteTable("one_time_token", {
 	id: text().primaryKey(),
 	token_hash: text().notNull().unique(),
 	created_at: text().notNull(),
 	expires_at: text().notNull(),
 	used_at: text(),
+	kind: text({ enum: ["node", "device"] })
+		.notNull()
+		.default("node"),
 });
 
 export const project = sqliteTable("project", {
@@ -66,7 +82,7 @@ export const document = sqliteTable("document", {
 	updated_at: text().notNull(),
 });
 
-export const CATALOG_VERSION = 4;
+export const CATALOG_VERSION = 5;
 
 export const DDL = `
 CREATE TABLE node (
@@ -78,12 +94,24 @@ CREATE TABLE node (
 	revoked_at TEXT,
 	last_seen_at TEXT
 ) STRICT;
-CREATE TABLE enrollment_token (
+CREATE TABLE device (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	token_hash TEXT NOT NULL UNIQUE,
+	created_at TEXT NOT NULL,
+	last_seen_at TEXT
+) STRICT;
+CREATE TABLE setting (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+) STRICT;
+CREATE TABLE one_time_token (
 	id TEXT PRIMARY KEY,
 	token_hash TEXT NOT NULL UNIQUE,
 	created_at TEXT NOT NULL,
 	expires_at TEXT NOT NULL,
-	used_at TEXT
+	used_at TEXT,
+	kind TEXT NOT NULL DEFAULT 'node'
 ) STRICT;
 CREATE TABLE project (
 	id TEXT PRIMARY KEY,
@@ -170,5 +198,20 @@ CREATE TABLE enrollment_token (
 	expires_at TEXT NOT NULL,
 	used_at TEXT
 ) STRICT;
+`,
+	5: `
+CREATE TABLE device (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	token_hash TEXT NOT NULL UNIQUE,
+	created_at TEXT NOT NULL,
+	last_seen_at TEXT
+) STRICT;
+CREATE TABLE setting (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+) STRICT;
+ALTER TABLE enrollment_token RENAME TO one_time_token;
+ALTER TABLE one_time_token ADD COLUMN kind TEXT NOT NULL DEFAULT 'node';
 `,
 };

@@ -11,7 +11,7 @@ import { Value } from "@sinclair/typebox/value";
 import type { DaemonOptions } from "../src/index.ts";
 import { startTestRuntime } from "./runtime.ts";
 
-const LOCAL_HOST = `127.0.0.1:${Protocol.DEFAULT_PORT}`;
+const runtimeHeaders = new Map<string, Record<string, string>>();
 
 test("daemon responses conform to the route table", async (t) => {
 	const running = await startServer(t);
@@ -254,6 +254,7 @@ async function startServer(t: TestContext): Promise<{ url: string }> {
 		recoveryWindowMinutes: Number.MAX_SAFE_INTEGER,
 		compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 20, prune: false },
 	});
+	runtimeHeaders.set(running.url, running.headers);
 	t.after(async () => {
 		await running.stop();
 		await rm(sessionDir, { recursive: true, force: true });
@@ -319,8 +320,10 @@ function localFetch(
 	init?: { method?: string; headers?: Record<string, string>; body?: string | Uint8Array },
 ): Promise<TestResponse> {
 	return new Promise((resolve, reject) => {
-		const req = request(url, { method: init?.method, headers: { ...init?.headers, host: LOCAL_HOST } }, (res) =>
-			resolve({ status: res.statusCode ?? 0, body: res }),
+		const req = request(
+			url,
+			{ method: init?.method, headers: { ...runtimeHeaders.get(new URL(url).origin), ...init?.headers } },
+			(res) => resolve({ status: res.statusCode ?? 0, body: res }),
 		);
 		req.on("error", reject);
 		req.end(init?.body);

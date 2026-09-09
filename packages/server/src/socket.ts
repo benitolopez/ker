@@ -5,7 +5,7 @@ import type { StoredRecord } from "@ker-ai/store";
 import { STORE_VERSION } from "@ker-ai/store";
 import { Value } from "@sinclair/typebox/value";
 import WebSocket, { WebSocketServer } from "ws";
-import { isLocalRequest } from "./local.ts";
+import { type Access, acceptsUpgrade } from "./access.ts";
 import { RemoteNode } from "./nodes.ts";
 import type { ControlPlane } from "./plane.ts";
 
@@ -20,6 +20,7 @@ export function attachNodeSocket(
 	server: Server,
 	plane: ControlPlane,
 	ready: Promise<void>,
+	access: Access,
 	heartbeatMs = HEARTBEAT_MS,
 ): () => Promise<void> {
 	const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
@@ -32,7 +33,7 @@ export function attachNodeSocket(
 	};
 	server.on("upgrade", (request, socket, head) => {
 		const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
-		if (url.pathname !== "/nodes/socket" || !isLocalRequest(request)) {
+		if (url.pathname !== "/nodes/socket" || !acceptsUpgrade(access, request)) {
 			socket.destroy();
 			return;
 		}

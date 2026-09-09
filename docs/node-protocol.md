@@ -1,16 +1,24 @@
 # Node protocol
 
-ker nodes connect to the control plane at `ws://<server>/nodes/socket`. The node opens the
+ker nodes connect to the control plane at `wss://<public-host>/nodes/socket` through the TLS proxy,
+or `ws://<loopback-host>:<port>/nodes/socket` in local mode. The node opens the
 connection; the server never dials a node. The current node protocol version is `1`, the current
 session-store version is `6`, and every frame is UTF-8 JSON sent as a WebSocket text frame.
 
-The server is loopback-only in this release. Use an SSH tunnel for a node on another machine; TLS,
-client authentication, and a public bind address belong to the next protocol version.
+Remote mode is enabled by `--public-url https://<public-host>`. ker speaks HTTP behind a
+TLS-terminating proxy; see [the deployment guide](deploy.md). The socket upgrade must preserve
+the configured public `Host`. An absent `Origin` is accepted for native nodes; if supplied, it
+must match the public origin. The upgrade does not require a browser device credential: the
+first socket frame authenticates the node. The node protocol remains version `1`.
+
+Publicly trusted certificates need no node configuration. For a private CA, start the node with
+`NODE_EXTRA_CA_CERTS=/absolute/path/to/ca.pem`; keep TLS certificate verification enabled.
 
 ## Enrollment and authentication
 
 `POST /nodes/enrollments` creates a random, single-use token that expires after 15 minutes. The
-response includes the exact `ker node --server <url> --token <token>` command. On its first
+response includes the exact `ker node --server <url> --token <token>` command, using the public
+HTTPS origin in remote mode. Creating an enrollment requires a paired device there. On its first
 connection, the node sends `enroll` with that token and its stable identity. The server stores only
 a SHA-256 hash of the token, consumes it transactionally, creates a random per-node secret, stores
 only that secret's hash, and returns the secret once in `welcome`.

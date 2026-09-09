@@ -297,7 +297,7 @@ test("the node socket refuses invalid credentials, spent tokens, revoked nodes, 
 	const expiredEnrollment = await client.createEnrollment();
 	if (!expiredEnrollment.ok) throw new Error(expiredEnrollment.error.code);
 	const database = new DatabaseSync(catalogPath);
-	database.prepare("UPDATE enrollment_token SET expires_at = ? WHERE used_at IS NULL").run("2020-01-01T00:00:00.000Z");
+	database.prepare("UPDATE one_time_token SET expires_at = ? WHERE used_at IS NULL").run("2020-01-01T00:00:00.000Z");
 	database.close();
 	const expired = await openSocket(baseUrl);
 	const expiredRefusal = await exchange(expired, {
