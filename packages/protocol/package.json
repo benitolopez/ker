@@ -11,6 +11,7 @@
     ".": "./src/index.ts",
     "./node": "./src/node.ts",
     "./openapi": "./src/openapi.ts",
+    "./project-key": "./src/project-key.ts",
     "./routes": "./src/routes.ts"
   },
   "engines": {

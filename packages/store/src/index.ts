@@ -4,6 +4,7 @@ import { appendFile, mkdir, open, opendir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as Protocol from "@ker-ai/protocol";
+import { projectKey } from "@ker-ai/protocol/project-key";
 
 export const STORE_VERSION = 6 as const;
 export const SESSION_FILE = "session.jsonl";
@@ -280,7 +281,7 @@ export class SessionStore {
 	}
 
 	async createLog(projectRoot: string, sessionId: Protocol.SessionId): Promise<SessionLog> {
-		const directory = join(this.baseDir, Protocol.projectKey(projectRoot), sessionId);
+		const directory = join(this.baseDir, projectKey(projectRoot), sessionId);
 		await mkdir(directory, { recursive: true, mode: 0o700 });
 		return new SessionLog(join(directory, SESSION_FILE), null);
 	}

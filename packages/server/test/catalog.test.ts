@@ -4,7 +4,8 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import * as Protocol from "@ker-ai/protocol";
+import type * as Protocol from "@ker-ai/protocol";
+import { projectKey } from "@ker-ai/protocol/project-key";
 import type { CatalogedSession } from "@ker-ai/store";
 import { drizzle } from "drizzle-orm/node-sqlite";
 import { Catalog, defaultCatalogPath, hashSecret } from "../src/catalog.ts";
@@ -473,7 +474,7 @@ test("catalog queries preserve order and use project-anchored scope", async (t) 
 		sessions: [third, second, first],
 		unreadable: [
 			{ id: "unreadable-a", projectKey: first.projectKey, error: "broken" },
-			{ id: "unreadable-missing", projectKey: Protocol.projectKey("/missing"), error: "missing" },
+			{ id: "unreadable-missing", projectKey: projectKey("/missing"), error: "missing" },
 		],
 	});
 	catalog.setTitleIfEmpty(first.session.id, "Original");
@@ -679,7 +680,7 @@ function importManifest(sessionId: string, archiveNode: Protocol.ArchiveNode): P
 		sessions: [
 			{
 				id: sessionId,
-				projectKey: Protocol.projectKey(`/work/${sessionId}`),
+				projectKey: projectKey(`/work/${sessionId}`),
 				workspaceId: `workspace-${sessionId}`,
 				nodeId: archiveNode.id,
 				cwd: `/work/${sessionId}`,
@@ -743,7 +744,7 @@ function sessionDescriptor(id: string, projectRoot: string, cwd: string): Protoc
 }
 
 function catalogedSession(id: string, projectRoot: string, cwd: string, idle: boolean): CatalogedSession {
-	const key = Protocol.projectKey(projectRoot);
+	const key = projectKey(projectRoot);
 	return {
 		session: sessionDescriptor(id, projectRoot, cwd),
 		path: join("/sessions", key, id, "session.jsonl"),

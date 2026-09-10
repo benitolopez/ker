@@ -3,7 +3,8 @@ import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import * as Protocol from "@ker-ai/protocol";
+import type * as Protocol from "@ker-ai/protocol";
+import { projectKey } from "@ker-ai/protocol/project-key";
 import { and, asc, count, desc, eq, getTableColumns, inArray, isNull, max, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-sqlite";
 import {
@@ -440,7 +441,7 @@ export class Catalog {
 				.all();
 			for (const binding of existingBindings) {
 				bindingsByRoot.set(`${binding.nodeId}\0${binding.rootPath}`, binding);
-				bindingsByKey.set(`${binding.nodeId}\0${Protocol.projectKey(binding.rootPath)}`, binding);
+				bindingsByKey.set(`${binding.nodeId}\0${projectKey(binding.rootPath)}`, binding);
 				bindingsById.set(binding.workspaceId, binding);
 			}
 
@@ -560,7 +561,7 @@ export class Catalog {
 	}
 
 	upsertCreated(descriptor: Protocol.SessionDescriptor, binding: WorkspaceBinding): void {
-		const key = Protocol.projectKey(descriptor.projectRoot);
+		const key = projectKey(descriptor.projectRoot);
 		this.#db
 			.insert(session)
 			.values({
@@ -647,10 +648,7 @@ export class Catalog {
 				.all();
 		}
 		const binding = this.findWorkspaceByRoot(scope.nodeId, scope.rootPath);
-		const unreadableMatch = and(
-			eq(session.status, "unreadable"),
-			eq(session.project_key, Protocol.projectKey(scope.rootPath)),
-		);
+		const unreadableMatch = and(eq(session.status, "unreadable"), eq(session.project_key, projectKey(scope.rootPath)));
 		return this.#db
 			.select(selection)
 			.from(session)

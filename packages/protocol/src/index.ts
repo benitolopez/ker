@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { type Static, Type } from "@sinclair/typebox";
 
 // Wire contract between the daemon and its clients.
@@ -20,10 +19,6 @@ export type NodeId = string;
 export type DeviceId = string;
 
 export const PROJECT_KEY_PATTERN = /^[a-f0-9]{64}$/;
-
-export function projectKey(projectRoot: string): string {
-	return createHash("sha256").update(projectRoot).digest("hex");
-}
 
 export const AdmissionStatus = Type.Union([Type.Literal("running"), Type.Literal("waiting")]);
 export type AdmissionStatus = Static<typeof AdmissionStatus>;
