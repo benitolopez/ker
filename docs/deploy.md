@@ -1,12 +1,16 @@
 # Deploy ker for one user
 
+> **Nothing here has been tested.** No part of this runbook has been run on a real machine:
+> not the VPS setup, not Tailscale, not Docker or nginx. It was written from how ker behaves in
+> code and in its automated tests, which cover authentication and both execution modes but never
+> touch a server, a proxy, or a phone. Package names, paths, flags, and versions may be wrong,
+> and steps may be missing. Treat it as a description of how the deployment is meant to work and
+> expect to debug it. The checklist at the end is what would make it verified.
+
 This setup puts the control plane on a VPS, Caddy in front of it, the execution node on your
 laptop, and the GUI in your laptop and phone browsers. ker listens on loopback; Caddy handles
 certificates and TLS. It is one machine without a WAF or a DDoS shield. Every paired device has
 full access to this single-user deployment.
-
-The automated suites cover ker's authentication and both execution modes. The real VPS,
-Tailscale, and physical phone checks at the end still need to be completed.
 
 ## 1. Prepare the VPS
 
